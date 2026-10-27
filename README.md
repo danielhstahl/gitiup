@@ -21,9 +21,9 @@ Two goals, one tool:
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
+| `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, per-seat attestation storage and the verdict (`verified` / `failed` / `insufficient`) — ADR-0002 as code, and nothing else |
 
-Later work adds the runner, quorum and CLI crates under `crates/`; the
-workspace globs `crates/*`, so a new crate is just `members`-free.
+The workspace globs `crates/*`, so a new crate is just `members`-free.
 
 * [ADR-0001 — attestation encoding, hash and signature format](docs/adr/0001-attestation-encoding-hash-and-signature.md) —
   the format every attestation ticket codes against (canonical JSON, SHA-256, Ed25519
@@ -38,6 +38,9 @@ workspace globs `crates/*`, so a new crate is just `members`-free.
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy file may insist on.
+* [The quorum verification network](docs/quorum.md) — how the five are picked and
+  audited, what the store holds, what a verdict means, and which parts are still open
+  tickets. Implementation: [`gitiup-quorum`](crates/gitiup-quorum/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
 * [Reproducibility — the contract](docs/reproducibility.md) — what a workflow must do

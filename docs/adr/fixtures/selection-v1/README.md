@@ -47,3 +47,24 @@ Edit `generate.py` (and the ADR in the same commit — the domain strings, the f
 order and the caps are quoted there), then run `python3 generate.py` and commit the
 three files with it. Changing a domain string is a new `round_kind`, not a fix:
 see ADR-0002 "How we change our minds".
+
+## Reproduced in Rust
+
+`crates/gitiup-quorum` reproduces these files exactly:
+`crates/gitiup-quorum/tests/selection_vectors.rs` loads `roster.json` and `round.json`,
+runs the selection, and compares the whole document — seed, scores, greedy reasons,
+seats, reserves, both promotion cases and the policy digest — against `selection.json`.
+The uniform case (`--uniform`) is
+`crates/gitiup-quorum/tests/selection_properties.rs`, which runs 200 rounds and checks
+χ² over the wins rather than one published number.
+
+Two things the Rust discovered while reproducing this set, both recorded so a later
+reader does not rediscover them:
+
+* the roster's `sha256:` digest is over the **re-encoded** document, and the round pins
+  that; a signature list is part of the body, so signing a roster changes its digest —
+  the ADR's `roster_digest` is the *unsigned* fixture's digest.
+* the fixture keys are well-formed SSH blobs but not curve points, so `key_id`
+  re-derivation from the blob is a shape check, not a `VerifyingKey` parse. Rosters that
+  actually authorise votes additionally require a curve-valid key, because a key that
+  cannot verify a signature is not an identity.

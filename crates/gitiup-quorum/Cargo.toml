@@ -1,0 +1,42 @@
+[package]
+name = "gitiup-quorum"
+description = "The optional quorum network: roster, verifiable verifier selection, rounds and verdicts, exactly as decided in ADR-0002"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate is the quorum: who may verify (roster), who *this* change picks
+# (selection), what the pick committed to (round), and what the owner may
+# believe as a result (verdict). Three rules, both ADRs:
+#
+# * **Every decision is a pure function.** Selection takes a roster, a round and
+#   a seed and returns an ordering; a stranger with those three numbers audits a
+#   quorum they were not invited to (ADR-0002 D3). No clock, no randomness, no
+#   network inside `select`.
+# * **The store is the only broker.** Roster, rounds, submissions and verdicts
+#   are records in a `gitiup_host::Host`, written with compare-and-swap. There
+#   is no coordinator to bribe, and no live lookup inside signature checking.
+# * **Nothing is required.** Every entry point here is opt-in: running a verifier
+#   is a choice a participant makes (`participate`), requiring a quorum is a
+#   choice an owner makes (`policy`), and neither changes what a plain local run
+#   produces.
+#
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+# Storage: refs and CAS objects, never a database of our own. The trait is the
+# dependency, not any transport.
+gitiup-host = { path = "../gitiup-host" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# HMAC-SHA-256 is the round-seed derivation (ADR-0002 D2: HKDF-Extract is an
+# HMAC). Pure Rust, same family as `sha2`, no new C dependency.
+hmac = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -983,6 +983,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitiup-quorum"
+version = "0.1.0"
+dependencies = [
+ "gitiup-attest",
+ "gitiup-host",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "gitiup-run"
 version = "0.1.0"
 dependencies = [
