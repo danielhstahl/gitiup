@@ -340,6 +340,7 @@ fn simulated_environment(job: &PlannedJob) -> EnvironmentReport {
     EnvironmentReport {
         provider: Some(SIMULATED_PROVIDER.into()),
         os: os_from_runs_on(job.runs_on.as_deref()),
+        os_version: None,
         arch: std::env::consts::ARCH.to_string(),
         image: None,
         toolchain: Vec::new(),

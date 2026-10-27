@@ -273,6 +273,7 @@ fn matrix_build() -> RunReport {
         environment: EnvironmentReport {
             provider: Some("docker".into()),
             os: Some("linux".into()),
+            os_version: None,
             arch: "x86_64".into(),
             image: Some(ImageRef {
                 reference: Some("ghcr.io/gitiup/ci:ubuntu-24.04".into()),
@@ -377,6 +378,7 @@ fn image_build_skipped() -> RunReport {
         environment: EnvironmentReport {
             provider: Some("docker".into()),
             os: Some("linux".into()),
+            os_version: None,
             arch: "aarch64".into(),
             image: Some(ImageRef {
                 reference: Some("docker.io/library/debian:trixie".into()),
@@ -444,6 +446,7 @@ fn test_failure() -> RunReport {
         environment: EnvironmentReport {
             provider: Some("shell".into()),
             os: Some("macos".into()),
+            os_version: None,
             arch: "aarch64".into(),
             image: None,
             toolchain: vec![ToolchainEntry {
@@ -519,6 +522,7 @@ fn dispatch_release() -> RunReport {
         environment: EnvironmentReport {
             provider: Some("podman".into()),
             os: Some("linux".into()),
+            os_version: None,
             arch: "x86_64".into(),
             image: Some(ImageRef {
                 reference: None,

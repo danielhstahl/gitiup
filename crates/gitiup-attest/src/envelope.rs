@@ -26,6 +26,7 @@ use serde_json::{Map, Value};
 
 use crate::canon;
 use crate::digest::Digest;
+use crate::envreq::EnvMatch;
 use crate::error::{Error, ErrorKind, Result};
 use crate::key::{SignatureEntry, Signer};
 use crate::manifest::{ResultDigest, RunManifest};
@@ -93,6 +94,11 @@ pub struct Verdict {
     pub freshness: Freshness,
     /// The environment fingerprint that was accepted.
     pub environment_fingerprint: Digest,
+    /// The environment requirement that was applied, if any, and how strictly
+    /// (giti-1rs.4). `Off` when the policy compared nothing.
+    pub environment_match: EnvMatch,
+    /// The requirement the environment was judged against, as published.
+    pub environment_requirement: Option<crate::envreq::EnvironmentRequirement>,
 }
 
 impl AttestationDoc {
@@ -255,7 +261,8 @@ impl AttestationDoc {
         Ok(Digest::sha256(&self.canonical_bytes()?))
     }
 
-    /// Verify against a policy: signature, digest, freshness, tier, bindings.
+    /// Verify against a policy: signature, digest, freshness, tier, environment
+    /// match, bindings.
     ///
     /// The order is deliberate — cheap integrity checks first, then integrity of
     /// the signer claim, then policy — so the exit code a caller sees describes
@@ -330,6 +337,13 @@ impl AttestationDoc {
                 ));
             }
         }
+        // The machine class (giti-1rs.4), alongside the other bindings: an
+        // attestation from the wrong architecture is refused with a sentence about
+        // architectures, and only then does anything else get a turn to complain.
+        policy.check_environment(
+            &self.manifest.result.environment,
+            &self.manifest.result.provenance,
+        )?;
 
         // Signatures. Every entry must be self-consistent (key id derived from the
         // key offered) before the trust list is consulted at all.
@@ -385,6 +399,8 @@ impl AttestationDoc {
             tier,
             freshness,
             environment_fingerprint: self.manifest.result.environment.fingerprint.clone(),
+            environment_match: policy.require_env_match,
+            environment_requirement: policy.environment_requirement().cloned(),
         })
     }
 

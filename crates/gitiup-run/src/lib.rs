@@ -51,6 +51,9 @@
 //! * **no file paths in the API** beyond the workspace directory the steps run in —
 //!   reading the workflow and writing the attestation are the CLI's job, so this
 //!   crate stays testable in-process;
+//! * **no environment probe on the default path** — [`env`] reads `/etc/os-release`,
+//!   the container env file and five `--version` calls, and is called by `--execute`
+//!   and by `gitiup env`, never by simulation (see `tests/no_side_effects.rs`);
 //! * **no signing** — keys are giti-1rs.6, and `gitiup_attest::SigningKey` plugs in
 //!   where a caller wants a signature;
 //! * **no expression engine** — `if:` and `${{ … }}` are recorded as written and
@@ -86,6 +89,7 @@
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
+pub mod env;
 pub mod exec;
 pub mod plan;
 pub mod sandbox;

@@ -20,14 +20,25 @@
 //! say so without accepting a bare `shell` run. [`PolicyFile`] is the JSON a repo
 //! writes that down (`gitiup-policy.json`), including the one-line spelling
 //! `"allow_simulated": false`.
+//!
+//! # The machine class is policy too
+//!
+//! [`Policy::require_environment`] plus [`Policy::require_env_match`] are the
+//! environment gate of giti-1rs.4: the repo publishes the machine class its
+//! attestation was made on — "amd64, `rustc 1.99`, this image digest" — and
+//! verification refuses a run that does not match it, at the setting the repo
+//! chose (`strict`, `major`, or `off`). See [`crate::envreq`] for what each setting
+//! promises and why a refusal reads like a sentence rather than like two digests
+//! that failed to agree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{Algorithm, Digest};
+use crate::envreq::{EnvMatch, EnvironmentRequirement};
 use crate::error::{Error, ErrorKind, Result};
-use crate::manifest::{Provenance, ResultDigest, Tier};
+use crate::manifest::{Environment, Provenance, ResultDigest, Tier};
 use crate::oid::GitOid;
 use crate::time::TimeUs;
 
@@ -113,6 +124,16 @@ pub struct Policy {
     /// Require the producer's normalisation rules to be exactly this version;
     /// two normalisations that differ cannot produce comparable digests.
     pub normalisation_version: Option<u32>,
+    /// How strictly the run's environment must match [`Self::require_environment`]
+    /// (giti-1rs.4). `Off` compares nothing.
+    ///
+    /// Defaults to [`EnvMatch::Strict`]: a requirement that is published is a
+    /// promise, and reading a promise generously is how an arm64 attestation ends
+    /// up satisfying an amd64 change.
+    pub require_env_match: EnvMatch,
+    /// What the run's environment must be: architecture, OS and version, image
+    /// digest, toolchain, runner, backend. `None` requires nothing.
+    pub require_environment: Option<EnvironmentRequirement>,
     /// The clock. `None` means "now"; tests and replayed runs pin it.
     pub now: Option<TimeUs>,
 }
@@ -131,6 +152,8 @@ impl Default for Policy {
             expected_result_digest: None,
             expected_challenge: None,
             normalisation_version: None,
+            require_env_match: EnvMatch::Strict,
+            require_environment: None,
             now: None,
         }
     }
@@ -235,6 +258,39 @@ impl Policy {
         Ok(())
     }
 
+    /// The environment question, answered: is a requirement enforced here?
+    ///
+    /// `None` when the knob is `off` or no requirement was published, so a caller
+    /// printing "what does this policy demand of the machine?" can say "nothing" in
+    /// one branch instead of two.
+    pub fn environment_requirement(&self) -> Option<&EnvironmentRequirement> {
+        if self.require_env_match.is_enforced() {
+            self.require_environment.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Check a run's environment against this policy's requirement (giti-1rs.4).
+    ///
+    /// This is the check that turns "the digests differ and nobody knows why" into
+    /// a sentence: an arm64 attestation offered for a change that requires amd64 is
+    /// refused as a *policy* decision (exit 6) naming both architectures, not
+    /// reported as a mystery digest difference.
+    ///
+    /// `provenance` comes along because the runner version — part of the machine
+    /// class a fingerprint stands for — is recorded there.
+    pub fn check_environment(
+        &self,
+        environment: &Environment,
+        provenance: &Provenance,
+    ) -> Result<()> {
+        let Some(requirement) = self.environment_requirement() else {
+            return Ok(());
+        };
+        requirement.check(environment, provenance, self.require_env_match)
+    }
+
     /// The clock this policy verifies against.
     pub fn now(&self) -> TimeUs {
         self.now.unwrap_or_else(TimeUs::now)
@@ -276,6 +332,9 @@ impl Policy {
 ///   "schema_version": 1,
 ///   "allow_simulated": false,
 ///   "allowed_sandboxes": ["docker", "podman", "unshare"],
+///   "require_env_match": "major",
+///   "require_arch": "amd64",
+///   "require_toolchain": {"rustc": "1.99"},
 ///   "trust_key_ids": ["SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w"],
 ///   "min_signatures": 1,
 ///   "max_age_us": 86400000000
@@ -323,6 +382,75 @@ pub struct PolicyFile {
     /// Require the producer's normalisation rules to be this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_normalisation_version: Option<u32>,
+    /// How strictly the environment requirement is enforced: `strict`, `major` or
+    /// `off` (giti-1rs.4). Also accepted spelled `require-env-match`, because that
+    /// is how people type it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-env-match"
+    )]
+    pub require_env_match: Option<String>,
+    /// Required architecture, any spelling (`amd64`, `x86_64`, `arm64`, …).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-arch"
+    )]
+    pub require_arch: Option<String>,
+    /// Required OS id (`linux`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "require-os")]
+    pub require_os: Option<String>,
+    /// Required OS version (`24.04`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-os-version"
+    )]
+    pub require_os_version: Option<String>,
+    /// Required container image digest (`sha256:…`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-image-digest"
+    )]
+    pub require_image_digest: Option<String>,
+    /// Required image reference as written (`ubuntu:24.04`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-image-reference"
+    )]
+    pub require_image_reference: Option<String>,
+    /// Required runner backend (`docker`, `unshare`, …).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-provider"
+    )]
+    pub require_provider: Option<String>,
+    /// Required runner implementation and version (`gitiup 0.1.0`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-runner"
+    )]
+    pub require_runner: Option<String>,
+    /// Required toolchain entries: tool name → version.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-toolchain"
+    )]
+    pub require_toolchain: Option<BTreeMap<String, String>>,
+    /// Required environment fingerprint, for a repo with exactly one blessed
+    /// machine class.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "require-env-fingerprint"
+    )]
+    pub require_env_fingerprint: Option<String>,
 }
 
 impl PolicyFile {
@@ -339,6 +467,16 @@ impl PolicyFile {
         "expected_commit",
         "expected_result_digest",
         "require_normalisation_version",
+        "require_env_match",
+        "require_arch",
+        "require_os",
+        "require_os_version",
+        "require_image_digest",
+        "require_image_reference",
+        "require_provider",
+        "require_runner",
+        "require_toolchain",
+        "require_env_fingerprint",
     ];
 
     /// Parse policy JSON. Unknown keys are refused: a typo in a gate is a gate
@@ -379,6 +517,11 @@ impl PolicyFile {
                 )
                 .with_hint("say it once: drop allow_simulated, or make the two agree"));
             }
+        }
+        if let Some(version) = &file.require_env_match {
+            // Parsed at read time, like the tier names, so a typo is reported
+            // against the file that contains it rather than as a mystery refusal.
+            EnvMatch::parse(version)?;
         }
         Ok(file)
     }
@@ -438,7 +581,63 @@ impl PolicyFile {
         if let Some(version) = self.require_normalisation_version {
             policy.normalisation_version = Some(version);
         }
+        if let Some(mode) = &self.require_env_match {
+            policy.require_env_match = EnvMatch::parse(mode)?;
+        }
+        policy.require_environment = self.environment_requirement()?;
+        // A policy that publishes a requirement while switching the comparison off
+        // has argued with itself: say so instead of quietly ignoring the half the
+        // reader spent their review time on (same rule as `allow_simulated`).
+        if let Some(published) = &policy.require_environment
+            && !policy.require_env_match.is_enforced()
+        {
+            // A policy that publishes a requirement while switching the
+            // comparison off has argued with itself: say so instead of quietly
+            // ignoring the half the reader spent their review time on (same rule
+            // as `allow_simulated`).
+            return Err(Error::new(
+                ErrorKind::Policy,
+                "policy",
+                format!(
+                    "require-env-match is 'off' but an environment requirement is published ({published})",
+                ),
+            )
+            .with_hint(
+                "say it once: set require-env-match to strict or major, or drop the \
+                 require_* keys you no longer want enforced",
+            ));
+        }
         Ok(policy)
+    }
+
+    /// The environment requirement this file publishes, if it names any field.
+    ///
+    /// One place so `to_policy` and any later reader agree on what "the repo
+    /// requires amd64" is spelled.
+    pub fn environment_requirement(&self) -> Result<Option<EnvironmentRequirement>> {
+        let mut requirement = EnvironmentRequirement::empty();
+        for (field, value) in [
+            ("arch", self.require_arch.clone()),
+            ("os", self.require_os.clone()),
+            ("os_version", self.require_os_version.clone()),
+            ("image_digest", self.require_image_digest.clone()),
+            ("image_reference", self.require_image_reference.clone()),
+            ("provider", self.require_provider.clone()),
+            ("runner", self.require_runner.clone()),
+            ("fingerprint", self.require_env_fingerprint.clone()),
+        ] {
+            if let Some(value) = value {
+                requirement.set(field, &value)?;
+            }
+        }
+        for (tool, version) in self.require_toolchain.iter().flatten() {
+            requirement.set(&format!("toolchain:{tool}"), version)?;
+        }
+        if requirement.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(requirement))
+        }
     }
 
     /// The policy a document describes, in one step.

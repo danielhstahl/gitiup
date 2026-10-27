@@ -247,6 +247,13 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
     let dir = workspace(CI);
     let before = listing(dir.path());
 
+    // The inventory probe (giti-1rs.4) runs `--version` on a few tools, and a tool
+    // may create its own state dir doing that — rustup's shim makes `$HOME/.rustup`,
+    // and `HOME` is this very workspace in this harness. The probe is switched off
+    // here because this test's contract is sharper: *execution*, whichever way it
+    // went, wrote nothing. The probe's own output is covered in `environment_cli.rs`.
+    let probe = [("GITIUP_ENV_PROBE", "off")];
+
     // The most important refusal in the command: "no sandbox" is not a tier.
     let output = gitiup(dir.path(), &["run", "--execute", "--sandbox", "none"], &[]);
     assert_eq!(code(&output), 6, "{}", out_text(&output));
@@ -265,7 +272,7 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
     let output = gitiup(
         dir.path(),
         &["run", "--execute", "--sandbox", "docker"],
-        &[],
+        &probe,
     );
     match code(&output) {
         0 => assert!(
@@ -286,14 +293,18 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
     }
 
     // A backend nobody heard of, ditto.
-    let output = gitiup(dir.path(), &["run", "--execute", "--sandbox", "kvm"], &[]);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--execute", "--sandbox", "kvm"],
+        &probe,
+    );
     assert_eq!(code(&output), 6);
     assert!(err_text(&output).contains("kvm"), "{}", err_text(&output));
 
     // The one real backend: either this machine can do it — and then the run is
     // `local` — or it says so and offers the plan instead. Both are correct answers;
     // silently claiming `local` without running anything is the only wrong one.
-    let output = gitiup(dir.path(), &["run", "--execute"], &[]);
+    let output = gitiup(dir.path(), &["run", "--execute"], &probe);
     match code(&output) {
         0 => {
             assert!(

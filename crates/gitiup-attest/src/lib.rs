@@ -26,6 +26,7 @@
 //!| the volatile-field register | D5 | [`manifest::Claims`], [`run::StepReport::timing`] |
 //!| claimed time + policy freshness window | D6 | [`policy`], [`time`] |
 //!| provenance tiers, and what each may claim | giti-1rs.7 | [`Tier`], [`Provenance::check`] |
+//!| the environment fingerprint and its match enforcement | giti-1rs.4 | [`Environment`], [`EnvMatch`], [`EnvironmentRequirement`], [`Policy::check_environment`] |
 //!| the policy file a repo writes (`gitiup-policy.json`) | giti-1rs.7 | [`PolicyFile`] |
 //!| limits, and what a verifier may refuse | D7 | [`canon::MAX_ENCODED_BYTES`], [`RunManifest::validate`] |
 //!| versioning and migration | D8 | [`schema`], [`error::ErrorKind::UnsupportedSchema`] |
@@ -85,6 +86,7 @@ pub mod canon;
 pub mod digest;
 pub mod encoding;
 pub mod envelope;
+pub mod envreq;
 pub mod error;
 pub mod key;
 pub mod manifest;
@@ -103,6 +105,7 @@ pub use digest::{Algorithm, Digest};
 pub use envelope::{
     AttestationDoc, DOC_SCHEMA_VERSION, MAX_SIGNATURES, PAYLOAD_TYPE, Verdict, doc_from_dsse, pae,
 };
+pub use envreq::{Arch, EnvMatch, EnvironmentRequirement, REQUIREMENT_FIELDS};
 pub use error::{Error, ErrorKind, Result};
 pub use key::{PublicKey, Signature, SignatureAlgorithm, SignatureEntry, Signer, SigningKey};
 pub use manifest::{

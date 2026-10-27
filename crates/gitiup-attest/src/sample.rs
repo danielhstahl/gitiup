@@ -91,6 +91,7 @@ pub fn local() -> RunManifest {
     manifest.result.environment = Environment {
         provider: Some("docker".into()),
         os: Some("linux".into()),
+        os_version: None,
         arch: "x86_64".into(),
         image: Some(ImageRef {
             reference: Some("ghcr.io/gitiup/ci:ubuntu-24.04".into()),
@@ -195,7 +196,10 @@ pub fn full() -> RunManifest {
     let mut manifest = quorum_member();
     manifest.claims.not_before_us = Some(claimed_at_us() - 60_000_000);
     manifest.claims.not_after_us = Some(claimed_at_us() + 60_000_000);
-    manifest
+    // Only `full` carries an OS version: the pinned fixtures (giti-1rs.2's golden
+    // digests) must not move, and the environment version is a giti-1rs.4 field.
+    manifest.result.environment.os_version = Some("24.04".into());
+    manifest.finish()
 }
 
 /// Only the required fields, and nothing else.
@@ -207,6 +211,7 @@ pub fn minimal() -> RunManifest {
     manifest.result.environment = Environment {
         provider: None,
         os: None,
+        os_version: None,
         arch: "x86_64".into(),
         image: None,
         toolchain: Vec::new(),
@@ -247,6 +252,7 @@ fn base_manifest(tier: Tier) -> RunManifest {
     let environment = Environment {
         provider: Some("simulated".into()),
         os: Some("linux".into()),
+        os_version: None,
         arch: "x86_64".into(),
         image: None,
         toolchain: Vec::new(),

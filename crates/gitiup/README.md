@@ -24,6 +24,8 @@ workflow       .github/workflows/hello.yml sha256:cc8c24530e48…
 event          push
 job            hi
 environment    x86_64 · fingerprint sha256:b3bad75a23bc…
+image          none
+toolchain      no toolchain inventory
 steps          1 (1 succeeded, 0 failed, 0 skipped)
 normalisation  v0
 ```
@@ -36,6 +38,9 @@ gitiup digest [OPTIONS] [REPORT]
     -q, --quiet            print the RunDigest and nothing else
     --expect <digest>      exit 8 unless the RunDigest equals this
     --expect-result <d>    exit 8 unless the ResultDigest equals this
+    --policy <path>        gate the run's environment against a policy file
+    --require <field=value>  require one environment field (repeatable)
+    --require-env-match <m>  strict | major | off (default: strict)
 ```
 
 The input is a **run report** — the runner's record of a finished job; the format
@@ -49,6 +54,43 @@ runs of the same change are supposed to agree on.
 # Re-run a job and prove it converged:
 gitiup digest --expect "$(cat expected-digest)" run.json || echo "rerun disagrees (exit 8)"
 ```
+
+`--require` is the other question you ask of a run you already have — not *did it
+converge* but *is this the machine we asked for* — and it gets its own exit code, 6,
+because the fix is different too. The requirement, the `strict|major|off` knob and what
+the refusal says are [documented here](../../docs/environment.md):
+
+```sh
+gitiup digest --require arch=amd64 --require toolchain:rustc=1.99 \
+        --require-env-match major run.json || echo "wrong machine (exit 6)"
+```
+
+## `gitiup env`
+
+What a run *here* would attest as, and whether a policy would accept it — the same
+`Policy::check_environment` a verifier runs, before any run exists:
+
+```console
+$ gitiup env
+os             linux 24.04
+arch           x86_64
+image          none (no container image digest was discoverable)
+toolchain      git 2.43.0, make 4.3, python 3.12.3, rustc 1.88.0
+runner         gitiup 0.1.0
+fingerprint    sha256:9c0a…
+note           distribution: ubuntu
+note           no version reported by node (absent from this machine, so absent from the inventory)
+requirement    none published
+
+$ gitiup env --policy gitiup-policy.json ; echo $?
+gitiup: environment: this run's arch is 'x86_64', which does not match what this change requires: arm64
+6
+```
+
+`--json` for scripts, `-q` for the fingerprint alone, `--no-inventory` to answer
+without spawning a single tool. The inventory itself is probed by
+[`gitiup_run::env`](../gitiup-run/src/env.rs) and can be declared instead of guessed
+with `GITIUP_TOOLCHAIN` / `GITIUP_IMAGE_DIGEST`.
 
 ## `gitiup normalise`
 

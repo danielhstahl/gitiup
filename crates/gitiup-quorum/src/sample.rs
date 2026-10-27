@@ -192,6 +192,7 @@ pub fn manifest_for(round: &Round, index: u8, now_us: i64, diverge: Option<&str>
         environment: EnvironmentReport {
             provider: Some("docker".into()),
             os: Some("linux".into()),
+            os_version: None,
             arch: round.inputs.required_capabilities.arch.clone(),
             image: Some(gitiup_attest::manifest::ImageRef {
                 reference: Some("ghcr.io/example/rust:1.83".to_string()),

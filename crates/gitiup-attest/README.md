@@ -65,7 +65,8 @@ ADR-0001 D4/D5 for the register of what may never enter `result`.
 | [`digest`](src/digest.rs), [`oid`](src/oid.rs) | `sha256:<hex>` digests and `sha1:<hex>` / `sha256:<hex>` git object ids — algorithm in the string, so a new digest is a policy change, not a format break |
 | [`key`](src/key.rs) | Ed25519 keys in SSH wire form, `SHA256:…` fingerprints as key ids, `SignatureEntry`, and the `Signer` trait ssh-agent/keystore backends plug into |
 | [`envelope`](src/envelope.rs) | `AttestationDoc`, PAE framing, signing, co-signing (`merge_signatures`), `verify`, DSSE import/export |
-| [`policy`](src/policy.rs) | what a verifier is willing to accept: trust list, freshness window, allowed tiers, expected commit / result digest / challenge |
+| [`policy`](src/policy.rs) | what a verifier is willing to accept: trust list, freshness window, allowed tiers, expected commit / result digest / challenge, and the environment requirement with its `strict|major|off` knob (`check_environment`) |
+| [`envreq`](src/envreq.rs) | the environment half of giti-1rs.4: `EnvMatch` (`strict`/`major`/`off`), `Arch` (alias-aware: `amd64` ≡ `x86_64`), `EnvironmentRequirement` and the version-rounding rule `major` stands for — the reason a wrong-machine refusal is a sentence and not a diff of two hashes |
 | [`error`](src/error.rs) | the taxonomy behind `gitiup verify attestation`'s exit codes: 6 policy, 7 bad signature, 8 digest mismatch |
 | [`time`](src/time.rs) | microsecond timestamps, RFC 3339 for display only |
 | [`schema`](src/schema.rs) | the committed JSON Schemas, embedded |

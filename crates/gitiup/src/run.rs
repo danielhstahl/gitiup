@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 
 use gitiup_attest::run::{RunReport, WorkflowSource};
 use gitiup_attest::{
-    Digest, ErrorKind, GitOid, InputValue, POLICY_PATH_ENV, Policy, PolicyFile, RunManifest, Tier,
-    TimeUs,
+    Digest, EnvironmentRequirement, ErrorKind, GitOid, InputValue, POLICY_PATH_ENV, Policy,
+    PolicyFile, RunManifest, Tier, TimeUs,
 };
 use gitiup_run::sandbox;
 use gitiup_run::{Execution, Plan, PlannedJob, Replay, Selector, Simulation, Workflow};
@@ -477,6 +477,31 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     {
         let policy = load_policy(options.policy.as_deref())?;
         policy.check_provenance(&outcome.manifest.result.provenance)?;
+        // The machine class the change requires (giti-1rs.4). A plan is held to less
+        // of it, because a plan honestly claims no image digest and no toolchain
+        // inventory — refusing a plan for the fields it refuses to invent would teach
+        // everyone to stop reading the notes.
+        if let Some(requirement) = policy.environment_requirement() {
+            let (asked, skipped) = if outcome.executed {
+                (requirement.clone(), Vec::new())
+            } else {
+                plan_view(requirement)
+            };
+            if !skipped.is_empty() {
+                eprintln!(
+                    "note    a plan claims no {}; those parts of the environment requirement \
+                     were not checked",
+                    skipped.join(", ")
+                );
+            }
+            if !asked.is_empty() {
+                asked.check(
+                    &outcome.manifest.result.environment,
+                    &outcome.manifest.result.provenance,
+                    policy.require_env_match,
+                )?;
+            }
+        }
     }
 
     if options.json {
@@ -543,6 +568,31 @@ fn load_policy(explicit: Option<&str>) -> Result<Policy, CliError> {
     PolicyFile::from_json(&text)
         .and_then(|file| file.to_policy())
         .map_err(CliError::from)
+}
+
+/// The part of an environment requirement a *plan* can be judged against, and the
+/// names of what had to be dropped to get there.
+///
+/// A simulated run executes nothing, so it claims no image digest and inventories no
+/// toolchain (see `gitiup_run::simulate`). Holding a plan to those fields would
+/// refuse every plan a policy with an image pin ever sees, which is not a gate but a
+/// bug; what a plan *does* claim — architecture, OS, runner, provider, and the
+/// fingerprint of exactly those — is still checked, and the dropped fields are said
+/// out loud rather than quietly excused.
+fn plan_view(requirement: &EnvironmentRequirement) -> (EnvironmentRequirement, Vec<String>) {
+    let mut asked = requirement.clone();
+    let mut skipped = Vec::new();
+    if asked.image_digest.take().is_some() {
+        skipped.push("image digest".to_string());
+    }
+    if asked.image_reference.take().is_some() {
+        skipped.push("image reference".to_string());
+    }
+    if !asked.toolchain.is_empty() {
+        asked.toolchain.clear();
+        skipped.push("toolchain inventory".to_string());
+    }
+    (asked, skipped)
 }
 
 /// One file per attestation, and never by accident.

@@ -72,6 +72,7 @@ fn environment() -> EnvironmentReport {
     EnvironmentReport {
         provider: Some("docker".into()),
         os: Some("linux".into()),
+        os_version: None,
         arch: "x86_64".into(),
         image: Some(ImageRef {
             reference: Some("ghcr.io/gitiup/ci:2026-10".into()),

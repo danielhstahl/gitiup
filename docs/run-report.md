@@ -142,6 +142,23 @@ so `steps[].timing` is copied into `claims.timing` and is *absent from the resul
 digest*. Two honest reruns disagree about how long a step took and must agree
 about what it produced.
 
+### The environment block, and its fingerprint
+
+`environment` is the machine *class*, and the one part of the report whose value no
+caller may assert: `environment.fingerprint` is derived by
+`Environment::fix_fingerprint` inside `from_run`, over the fields above with the
+fingerprint cleared, and `RunManifest::validate` re-derives it — so a report cannot
+describe one machine and claim another's digest. Every manifest therefore carries one.
+
+Optional fields there are omitted, not null: `os_version` (`VERSION_ID`, the field a
+policy rounds under `require-env-match = major`), `image` (absent whenever no runtime
+published a digest — a runner never resolves a tag into a digest it cannot check) and
+`toolchain` (the local inventory a bare host has instead of an image digest). What the
+runner probes, what it refuses to guess, and how a *requirement* published in
+`gitiup-policy.json` is enforced against it — including the `strict|major|off` knob and
+the sentence a mismatch produces — is
+[the environment fingerprint](environment.md).
+
 ## `Material`: bytes or their digest
 
 Anything hashable may arrive either pre-hashed or in the clear, tagged explicitly:

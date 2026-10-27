@@ -16,6 +16,9 @@
 //!     --quiet, -q            the RunDigest and nothing else
 //!     --expect <digest>      exit 8 unless the RunDigest is exactly this
 //!     --expect-result <d>    exit 8 unless the ResultDigest is exactly this
+//!     --policy <path>        gate the run's environment against a policy file
+//!     --require <field=v>    require one environment field (repeatable)
+//!     --require-env-match <m>  strict | major | off (default: strict)
 //!     --help, -h             this text
 //! ```
 //!
@@ -23,13 +26,22 @@
 //! two machines, and compare digests without eyeballing hex. A refusal with exit
 //! 8 is the same verdict `gitiup verify attestation` will give later
 //! ([ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)).
+//!
+//! `--policy` / `--require` are the environment gate of giti-1rs.4: the requirement
+//! a repo publishes next to the change, applied to the run in front of you. That is
+//! a different question from "did the rerun converge?" and gets a different exit
+//! code — 6, refused, naming the field that differs — because an arm64 run is not a
+//! nondeterministic amd64 run.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
 
 use gitiup_attest::run::RunReport;
-use gitiup_attest::{Digest, Error as AttestError, ErrorKind, RunManifest, StepOutcome};
+use gitiup_attest::{
+    Digest, EnvMatch, EnvironmentRequirement, Error as AttestError, ErrorKind, RunManifest,
+    StepOutcome,
+};
 use serde_json::Value;
 
 use crate::CliError;
@@ -48,12 +60,22 @@ OPTIONS:
     -q, --quiet            print the RunDigest and nothing else
     --expect <digest>      exit 8 unless the RunDigest equals this
     --expect-result <d>    exit 8 unless the ResultDigest equals this
+    --policy <path>        gate the run's environment against a policy file's
+                           requirement (require_arch, require-env-match, …)
+    --require <field=value>  require one environment field (repeatable), e.g.
+                           --require arch=amd64 --require toolchain:rustc=1.99
+    --require-env-match <m>  strict | major | off (default: strict)
     -h, --help             print this text
 
 The report is ordinary JSON (see docs/run-report.md): field order and whitespace
 do not change the digest, which is the point of a canonical manifest.
 
-Exit codes: 0 ok · 2 usage · 3 I/O · 6 invalid run report · 8 digest mismatch
+An environment requirement is a separate question from \"did the rerun converge?\"
+and a separate exit code: 6 refused (\"this run is not the machine the change
+asked for\"), 8 mismatch (\"this rerun disagrees with that one\").
+
+Exit codes: 0 ok · 2 usage · 3 I/O · 6 invalid run report or refused environment ·
+8 digest mismatch
 ";
 
 /// What to print. Three shapes because three readers exist: a human, a script,
@@ -72,6 +94,9 @@ struct Options {
     format: Format,
     expect_run: Option<Digest>,
     expect_result: Option<Digest>,
+    policy: Option<String>,
+    require: Vec<String>,
+    env_match: Option<String>,
     help: bool,
 }
 
@@ -116,6 +141,18 @@ impl Options {
                     let value = flag_value("--expect-result", args, &mut index, inline)?;
                     options.expect_result = Some(value.parse()?);
                 }
+                "--policy" => {
+                    options.policy = Some(flag_value("--policy", args, &mut index, inline)?)
+                }
+                "--require" => {
+                    options
+                        .require
+                        .push(flag_value("--require", args, &mut index, inline)?)
+                }
+                "--require-env-match" => {
+                    options.env_match =
+                        Some(flag_value("--require-env-match", args, &mut index, inline)?);
+                }
                 // A lone `-` is "stdin", the usual convention; anything else that
                 // starts with a dash is a flag we do not have.
                 _ if name.starts_with('-') && name != "-" => {
@@ -149,23 +186,27 @@ pub(crate) struct Summary {
     event: String,
     job: Option<String>,
     arch: String,
+    image: String,
+    toolchain: String,
     fingerprint: Digest,
     steps: usize,
     succeeded: usize,
     failed: usize,
     skipped: usize,
+    /// The environment requirement that was applied, if any (giti-1rs.4), as one
+    /// line: `arch=amd64 toolchain:rustc=1.99 (major)`.
+    requirement: Option<String>,
 }
 
 impl Summary {
-    /// The whole point: a report's bytes in, the two digests (plus enough context
-    /// to recognise which run they describe) out.
-    pub(crate) fn compute(report_bytes: &[u8]) -> Result<Summary, AttestError> {
-        // Lenient by design: a run report is a transport, not a signed document.
-        // Only the manifest it computes to has one legal encoding.
-        let report: RunReport = serde_json::from_slice(report_bytes)
-            .map_err(|e| AttestError::invalid("run report", e.to_string()))?;
-        let manifest = RunManifest::from_run(&report)?;
-        Ok(Summary::from(&manifest))
+    /// The environment line, so the CLI can gate a manifest and report the same
+    /// facts about it.
+    pub(crate) fn with_requirement(
+        mut self,
+        requirement: Option<&(EnvironmentRequirement, EnvMatch)>,
+    ) -> Summary {
+        self.requirement = requirement.map(|(requirement, mode)| format!("{requirement} ({mode})"));
+        self
     }
 
     fn to_text(&self) -> String {
@@ -189,6 +230,11 @@ impl Summary {
             "environment    {} · fingerprint {}",
             self.arch, self.fingerprint
         );
+        let _ = writeln!(out, "image          {}", self.image);
+        let _ = writeln!(out, "toolchain      {}", self.toolchain);
+        if let Some(requirement) = &self.requirement {
+            let _ = writeln!(out, "requirement    {requirement} · matched");
+        }
         let _ = writeln!(
             out,
             "steps          {} ({} succeeded, {} failed, {} skipped)",
@@ -221,6 +267,11 @@ impl Summary {
             map.insert("job", Value::String(job.clone()));
         }
         map.insert("arch", Value::String(self.arch.clone()));
+        map.insert("image", Value::String(self.image.clone()));
+        map.insert("toolchain", Value::String(self.toolchain.clone()));
+        if let Some(requirement) = &self.requirement {
+            map.insert("requirement", Value::String(requirement.clone()));
+        }
         map.insert(
             "environment_fingerprint",
             Value::String(self.fingerprint.to_string()),
@@ -300,13 +351,33 @@ impl From<&RunManifest> for Summary {
             },
             job: manifest.result.source.job.clone(),
             arch: manifest.result.environment.arch.clone(),
+            image: match &manifest.result.environment.image {
+                Some(image) => match &image.reference {
+                    Some(reference) => format!("{} ({reference})", image.digest),
+                    None => image.digest.to_string(),
+                },
+                None => "none".to_string(),
+            },
+            toolchain: manifest.result.environment.describe_toolchain(),
             fingerprint: manifest.result.environment.fingerprint.clone(),
             steps: manifest.result.steps.len(),
             succeeded: count(StepOutcome::Success),
             failed: count(StepOutcome::Failure),
             skipped: count(StepOutcome::Skipped),
+            requirement: None,
         }
     }
+}
+
+/// The manifest a report computes to — the one sanctioned pipeline
+/// ([`RunManifest::from_run`]), shared by the summary and by the environment gate so
+/// neither can be reading a different document.
+fn manifest_from_report(report_bytes: &[u8]) -> Result<RunManifest, AttestError> {
+    // Lenient by design: a run report is a transport, not a signed document.
+    // Only the manifest it computes to has one legal encoding.
+    let report: RunReport = serde_json::from_slice(report_bytes)
+        .map_err(|e| AttestError::invalid("run report", e.to_string()))?;
+    RunManifest::from_run(&report)
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
@@ -316,7 +387,24 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
     let report = read_report(options.source.as_deref())?;
-    let summary = Summary::compute(&report)?;
+    let manifest = manifest_from_report(&report)?;
+    let mut summary = Summary::from(&manifest);
+    // The machine-class gate (giti-1rs.4) before the digest comparison: "wrong
+    // machine" and "rerun disagreed" are different failures with different exit
+    // codes, and the first is the one a human can act on.
+    let applied = crate::env::resolve_requirement(
+        options.policy.as_deref(),
+        &options.require,
+        options.env_match.as_deref(),
+    )?;
+    if let Some((requirement, mode)) = &applied {
+        requirement.check(
+            &manifest.result.environment,
+            &manifest.result.provenance,
+            *mode,
+        )?;
+        summary = summary.with_requirement(Some(applied.as_ref().unwrap()));
+    }
     summary.check_against(&options)?;
     match options.format {
         Format::Text => print!("{}", summary.to_text()),
@@ -380,7 +468,7 @@ mod tests {
 
     #[test]
     fn a_report_computes_both_digests() {
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         assert_eq!(summary.steps, 3);
         assert_eq!(
             (summary.succeeded, summary.failed, summary.skipped),
@@ -401,7 +489,7 @@ mod tests {
 
     #[test]
     fn text_output_names_both_digests_and_the_run() {
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         let text = summary.to_text();
         assert!(text.contains(&format!("run            {}", summary.run_digest)));
         assert!(text.contains(&format!("result         {}", summary.result_digest)));
@@ -411,7 +499,7 @@ mod tests {
 
     #[test]
     fn json_output_is_sorted_and_complete() {
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         let json = summary.to_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["steps"], 3);
@@ -438,7 +526,7 @@ mod tests {
         // (Re-pinned when the fixture grew `provenance.sandbox`: a `local` run that
         // does not name where it ran is no longer a well-formed manifest, so the
         // bytes — and therefore the digest — of a fixture that omitted it moved.)
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         assert_eq!(
             summary.run_digest.to_string(),
             "sha256:9461381cbf27127102a64b69090ff7c18ea186f82dade68b4d1c283c7c91ff5e"
@@ -447,7 +535,7 @@ mod tests {
 
     #[test]
     fn an_expected_digest_mismatch_is_exit_8() {
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         let options = Options {
             expect_run: Some(zero()),
             ..Default::default()
@@ -465,7 +553,7 @@ mod tests {
 
     #[test]
     fn matching_expectations_pass() {
-        let summary = Summary::compute(report_json().as_bytes()).unwrap();
+        let summary = Summary::from(&manifest_from_report(report_json().as_bytes()).unwrap());
         let options = Options {
             expect_run: Some(summary.run_digest.clone()),
             expect_result: Some(summary.result_digest.clone()),
@@ -521,10 +609,10 @@ mod tests {
 
     #[test]
     fn a_broken_report_says_what_is_wrong() {
-        let missing = Summary::compute(br#"{"commit":"sha1:00"}"#).unwrap_err();
+        let missing = manifest_from_report(br#"{"commit":"sha1:00"}"#).unwrap_err();
         assert_eq!(missing.kind(), ErrorKind::Invalid);
         let typo = report_json().replace("\"run_id\"", "\"runid\"");
-        let err = Summary::compute(typo.as_bytes()).unwrap_err();
+        let err = manifest_from_report(typo.as_bytes()).unwrap_err();
         assert!(
             err.to_string().contains("runid"),
             "the error should name the unknown field, got {err}"

@@ -233,7 +233,18 @@ pub struct Environment {
     /// OS id (`linux`, `macos`), lowercase.
     #[serde(default, skip_serializing_if = "with_opt")]
     pub os: Option<String>,
+    /// OS version as the OS reports it (`24.04` from `/etc/os-release`).
+    ///
+    /// Separate from [`Self::os`] because a policy asks the two questions
+    /// separately: "is this Linux?" and "how much may it move?" — the version is
+    /// the field `require-env-match = major` rounds, the id never moves.
+    #[serde(default, skip_serializing_if = "with_opt")]
+    pub os_version: Option<String>,
     /// CPU architecture as Rust reports it (`x86_64`, `aarch64`).
+    ///
+    /// Stored in Rust's spelling and compared through [`crate::Arch`], so a policy
+    /// that says `amd64` is not refused for spelling it the Debian way
+    /// (giti-1rs.4).
     pub arch: String,
     /// Image the job ran in, digest-pinned.
     #[serde(default, skip_serializing_if = "with_opt")]
@@ -267,6 +278,52 @@ pub struct ToolchainEntry {
 }
 
 impl Environment {
+    /// The version recorded for `tool`, if the run reported that tool at all.
+    pub fn find_tool(&self, tool: &str) -> Option<&str> {
+        self.toolchain
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(tool.trim()))
+            .map(|entry| entry.version.as_str())
+    }
+
+    /// The machine class in one line, for a refusal or a status print.
+    ///
+    /// Deliberately the fields a human compares by eye: a fingerprint mismatch with
+    /// this beside it is a diagnosis instead of a puzzle (giti-1rs.4).
+    pub fn describe(&self) -> String {
+        let image = self.image.as_ref().map(|image| {
+            image
+                .reference
+                .clone()
+                .unwrap_or_else(|| image.digest.to_string())
+        });
+        let mut parts = Vec::new();
+        for (label, value) in [
+            ("os", self.os.as_deref()),
+            ("version", self.os_version.as_deref()),
+            ("arch", Some(self.arch.as_str())),
+            ("image", image.as_deref()),
+            ("provider", self.provider.as_deref()),
+        ] {
+            if let Some(value) = value {
+                parts.push(format!("{label} {value}"));
+            }
+        }
+        parts.join(" · ")
+    }
+
+    /// The toolchain inventory as `name version` pairs.
+    pub fn describe_toolchain(&self) -> String {
+        if self.toolchain.is_empty() {
+            return "no toolchain inventory".to_string();
+        }
+        self.toolchain
+            .iter()
+            .map(|entry| format!("{} {}", entry.name, entry.version))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The fingerprint of the fields above, computed the one sanctioned way:
     /// SHA-256 over the canonical bytes of this environment with `fingerprint`
     /// cleared.
@@ -690,6 +747,17 @@ impl RunManifest {
         self.result.digest()
     }
 
+    /// The environment fingerprint this manifest carries — giti-1rs.4's
+    /// `EnvFingerprint`, the digest that identifies the machine class the run
+    /// happened in.
+    ///
+    /// Every valid manifest carries one: it is a required field and
+    /// [`Self::validate`] re-derives it, so there is no such thing as a manifest
+    /// whose environment is unidentified.
+    pub fn env_fingerprint(&self) -> &Digest {
+        &self.result.environment.fingerprint
+    }
+
     /// Sort every list the spec mandates a sort order for, including the claim-side
     /// ones. Producers (giti-1rs.2) call this once, after building the manifest:
     /// it is what makes two honest runs hash the same bytes.
@@ -807,6 +875,16 @@ impl RunManifest {
         }
         if result.environment.arch.is_empty() {
             return Err(Error::invalid("manifest", "environment.arch is required"));
+        }
+        if let Some(os) = &result.environment.os {
+            check_string("environment.os", os)?;
+        }
+        if let Some(version) = &result.environment.os_version {
+            check_string("environment.os_version", version)?;
+        }
+        for entry in &result.environment.toolchain {
+            check_string("toolchain name", &entry.name)?;
+            check_string("toolchain version", &entry.version)?;
         }
 
         for (name, pin) in &result.pins {

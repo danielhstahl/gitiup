@@ -9,6 +9,8 @@
 //! ```text
 //! gitiup run [OPTIONS] [JOB]            plan a workflow job (nothing is run)
 //! gitiup run --execute --sandbox <name> run it for real, and attest as `local`
+//! gitiup env [OPTIONS]                  this machine's environment fingerprint, and
+//!                                      whether a policy would accept it
 //! gitiup doctor --sandbox               what this machine can confine, and whether it
 //!                                      may serve a stranger's job at all
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
@@ -35,6 +37,7 @@ use std::process::ExitCode;
 
 mod digest;
 mod doctor;
+mod env;
 mod normalise;
 mod remotes;
 mod run;
@@ -48,6 +51,8 @@ USAGE:
 
 COMMANDS:
     run [OPTIONS] [JOB]            plan a workflow job; --execute to run it
+    env [OPTIONS]                  this machine's environment fingerprint, and whether
+                                   a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
@@ -55,11 +60,13 @@ COMMANDS:
     version                     print the version of this build
 
 REPORT is a run-report JSON file (see docs/run-report.md), or `-` for stdin.
+`env` probes the machine (a handful of `--version` calls) and gates it against
+`require_arch` / `require-env-match` in a policy file; see docs/environment.md.
 
-Exit codes for `run`, `digest` and `normalise`: 0 ok · 2 usage · 3 I/O · 6 refused
-(bad run report, disallowed tier, no sandbox) · 8 digest mismatch or divergence
-(ADR-0001 D7: 6 refused/unsupported, 8 digest mismatch — the same codes
-`gitiup verify attestation` will use).
+Exit codes for `run`, `digest`, `env` and `normalise`: 0 ok · 2 usage · 3 I/O ·
+6 refused (bad run report, disallowed tier, no sandbox, wrong machine class) ·
+8 digest mismatch or divergence (ADR-0001 D7: 6 refused/unsupported, 8 digest
+mismatch — the same codes `gitiup verify attestation` will use).
 
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
@@ -68,6 +75,8 @@ cannot earn it.
 
 Try:
     gitiup doctor --sandbox                  # what confines a job here, if anything
+    gitiup env                                 # what a run here would attest as
+    gitiup env --require arch=amd64            # …and whether that satisfies the change
     gitiup run                                 # plan the only job in the workflow
     gitiup run --execute --sandbox unshare     # run it for real: tier `local`
     gitiup digest run.json
@@ -174,6 +183,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "run" => run::run(&args[1..]),
         "doctor" => doctor::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
+        "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }

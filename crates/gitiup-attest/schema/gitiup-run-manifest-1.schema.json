@@ -180,7 +180,8 @@
       "properties": {
         "provider": { "$ref": "#/$defs/text", "description": "Backend that ran the job: docker, podman, containerd, shell, simulated." },
         "os": { "$ref": "#/$defs/text", "description": "OS id, lower case." },
-        "arch": { "$ref": "#/$defs/text", "description": "CPU architecture (x86_64, aarch64)." },
+        "os_version": { "$ref": "#/$defs/text", "description": "OS version as the OS reports it (24.04). Kept apart from os because a policy rounds the version and never the id: require-env-match = major rounds this field only (giti-1rs.4)." },
+        "arch": { "$ref": "#/$defs/text", "description": "CPU architecture (x86_64, aarch64). Stored in the spelling std::env::consts::ARCH produces; a policy may name it in any spelling because Arch::new canonicalises amd64/arm64 onto it." },
         "image": { "$ref": "#/$defs/ImageRef" },
         "toolchain": {
           "type": "array",

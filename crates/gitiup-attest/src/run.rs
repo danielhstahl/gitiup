@@ -427,6 +427,9 @@ pub struct EnvironmentReport {
     /// OS id (`linux`, `macos`), lowercase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// OS version as the OS reports it (`24.04`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
     /// CPU architecture (`x86_64`, `aarch64`). Required: an arm64 attestation
     /// must not be accepted against an amd64 requirement (giti-1rs.4).
     pub arch: String,
@@ -444,6 +447,7 @@ impl EnvironmentReport {
         EnvironmentReport {
             provider: None,
             os: None,
+            os_version: None,
             arch: arch.into(),
             image: None,
             toolchain: Vec::new(),
@@ -456,11 +460,30 @@ impl EnvironmentReport {
         Environment {
             provider: self.provider.clone(),
             os: self.os.clone(),
+            os_version: self.os_version.clone(),
             arch: self.arch.clone(),
             image: self.image.clone(),
             toolchain: self.toolchain.clone(),
             fingerprint: Digest::sha256(b""),
         }
+    }
+
+    /// The version recorded for `tool`, if the report mentioned it at all.
+    pub fn find_tool(&self, tool: &str) -> Option<&str> {
+        self.toolchain
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(tool.trim()))
+            .map(|entry| entry.version.as_str())
+    }
+
+    /// The machine class in one line, exactly as the manifest would describe it.
+    pub fn describe(&self) -> String {
+        self.to_environment().describe()
+    }
+
+    /// The toolchain inventory as `name version` pairs.
+    pub fn describe_toolchain(&self) -> String {
+        self.to_environment().describe_toolchain()
     }
 }
 
@@ -993,6 +1016,7 @@ mod tests {
             environment: EnvironmentReport {
                 provider: Some("docker".into()),
                 os: Some("linux".into()),
+                os_version: None,
                 arch: "x86_64".into(),
                 image: Some(ImageRef {
                     reference: Some("ubuntu:24.04".into()),

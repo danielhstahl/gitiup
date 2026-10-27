@@ -269,6 +269,14 @@ pub fn execute(
     if !notes.is_empty() {
         annotations.insert("x_run_notes".to_string(), notes.join(" · "));
     }
+    // The machine class this ran on (giti-1rs.4), probed here rather than declared:
+    // an executed run that reported no architecture and no inventory would carry a
+    // fingerprint that identifies nothing, and the policy that later asks "was this
+    // the machine we promised?" would have nothing to read.
+    let probe = crate::env::Probe::collect().with_provider(sandbox.name());
+    for (key, value) in probe.annotations() {
+        annotations.insert(key, value);
+    }
     let commit_text = execution.commit.to_string();
     let clock = now_us.to_string();
     let parts: Vec<&[u8]> = vec![
@@ -302,10 +310,7 @@ pub fn execute(
             // saying the same thing is a feature, not a redundancy — a verifier that
             // filters on provider cannot be fooled by a `local` tier alone.
             provider: Some(sandbox.name().to_string()),
-            os: Some(std::env::consts::OS.to_string()),
-            arch: std::env::consts::ARCH.to_string(),
-            image: None,
-            toolchain: Vec::new(),
+            ..probe.environment
         },
         steps,
         provenance: Provenance {

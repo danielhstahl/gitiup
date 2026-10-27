@@ -51,6 +51,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   tickets. Implementation: [`gitiup-quorum`](crates/gitiup-quorum/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
+* [The environment fingerprint](docs/environment.md) — what a run says about the
+  machine it ran on (OS and version, architecture, image digest *or* local toolchain
+  inventory, runner, sandbox backend), how it is derived, and how `require-env-match =
+  strict|major|off` turns a difference into a sentence instead of a mystery.
 * [Reproducibility — the contract](docs/reproducibility.md) — what a workflow must do
   so its products are the same bytes twice (pin by SHA, images by digest, sorted
   manifests, `SOURCE_DATE_EPOCH`), what the runner rewrites instead (the twelve
