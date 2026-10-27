@@ -18,7 +18,7 @@ Two goals, one tool:
 |-----------------|------------------------------------------------------------------|
 | `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
-| `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
+| `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
@@ -91,8 +91,14 @@ cargo run -p gitiup -- normalise --compare \
     crates/gitiup-normalise/tests/fixtures/corpus/machine-b/run.json
 cargo run -p gitiup-host --example fs_tour        # refs, CAS, packs on a temp dir
 cargo run -p gitiup-host --example s3_tour        # the same against an in-process S3 bucket
+cargo run -p gitiup-host --example git_tour       # the same against a bare repo, with plain git seeing it all
 cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml
 ```
+
+The plain-git host drives the `git` binary, so `tests/host_git.rs` and
+`tests/host_git_http.rs` need git installed (they skip themselves when it is
+missing) and the HTTP ones need `python3` for `git-http-backend` and for the
+static server that stands in for "a repo on a web server".
 
 `gitiup run` plans a job by default — no process, no network, no secrets, and an
 attestation that says `tier: simulated` — and only runs the steps when given

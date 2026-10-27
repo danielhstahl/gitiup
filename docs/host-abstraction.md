@@ -83,6 +83,23 @@ refs/gitiup/**           roster, job/lease records, quorum state
 no empty components) so a bad name fails at parse time rather than as a weird
 key in a bucket.
 
+Each namespace is written by somebody specific, and each host stores the same name
+in its own idiom:
+
+| namespace | who writes it | on a git host | on a bucket / directory host |
+|-----------|---------------|---------------|------------------------------|
+| `refs/heads/**` | the owner, with plain `git push` | a branch, left exactly as git made it | one ref object, `refs/heads/main` |
+| `refs/changes/<id>/head` | gitiup, for a contributor | a ref pointing at the change record (via a pointer commit, so the bytes travel with it) | a ref object plus `kv/change/<hash>` |
+| `refs/attestations/<oid>` | gitiup, after a run verifies | a ref pointing at the attestation, named by the digest it attests to | a ref object plus `kv/attestation/<hash>` |
+| `refs/gitiup/**` | gitiup only | the store manifest and the record chains; never listed | `host.json` and `kv/**` |
+
+Two things follow from that table and both are load-bearing. `refs/attestations/<oid>`
+is named by the digest of the thing *attested*, so "give me the proof about this
+object" is a ref lookup, on every host, and on a git host it is a `git fetch` that
+arrives with the proof in the same packfile. And `refs/gitiup/**` is reserved: a
+host keeps its bookkeeping there and hides it from an ordinary ref listing, so
+`gitiup change list` never has to know which host it is talking to.
+
 ## Store layout
 
 Derived in one place — `RemoteConfig` — and mirrored by every host:
@@ -208,6 +225,104 @@ code, as `tests/no_forge_deps.rs` checks. `tests/host_s3_live.rs` runs the same
 bodies against a real endpoint and is `#[ignore]`d so the default suite stays
 hermetic.
 
+## The plain-git host (`git`)
+
+`GitHost` makes an ordinary bare repository the forge: a directory on a box you
+ssh into, a repo nginx serves with `git-http-backend`, or a pile of files a
+static web server exposes. There is no API and no server-side code to trust —
+only the four namespaces above and the transport git already speaks. The
+implementation shells out to the `git` binary (floor: 1.8, because that is where
+`--force-with-lease` and `--atomic` appear), so whatever git can reach, gitiup
+can host on:
+
+```text
+file:///srv/git/repo.git          a directory (tests, a shared mount, a USB stick)
+ssh://git@host/srv/git/repo.git   the colocation box; scp-style git@host:path too
+https://host/repo.git             smart HTTP (git-http-backend behind a web server)
+http://127.0.0.1:8080/repo.git    plain HTTP, accepted for a loopback server only
+```
+
+Plain `http://` is accepted only for a loopback host (an ephemeral server in a
+test, a local mirror). Anywhere else it is refused with a hint to use `https://`,
+so a credential never goes out unencrypted by accident.
+
+**A ref that names a gitiup record points at a pointer commit.** A git ref can
+only name a git object, but a change or an attestation is addressed by the
+SHA-256 of its record bytes. So `refs/changes/c1/head` points at a small commit
+holding `gitiup-ref.json` (the digest promised, the actor, the time) and the
+record bytes as `record`. That is what makes *`git fetch` carries proof* true in
+the literal sense: fetching the ref brings the attestation in the same packfile,
+with no second protocol and nothing to download afterwards. Refs whose value is
+already a git commit — branches, a change head that is a real commit — stay
+exactly what they look like: plain git, untouched.
+
+**The CAS is emulated the only way git allows**, and the sequence matters, so it
+is written out in [`hosts/git.rs`](../crates/gitiup-host/src/hosts/git.rs) and
+followed to the letter: fresh `ls-remote` of the one ref → compare with
+`Expect` → `--dry-run` probe → `git push --force-with-lease=<ref>:<what we just
+read>` → `ls-remote` again to check the server did what it said. Two details are
+what make it a real lease rather than a gesture: `--force` is *never* passed
+alongside a named lease (git ignores the lease then, which would silently disable
+the safety net), and `Expect::Absent` is spelled as the all-zero expected value,
+which is git's own "this ref must not exist". Batches go out as one
+`git push --atomic`, which the receiving side applies as a transaction, so
+`atomic_multi_write` is true here for real. Record appends — two contributors
+publishing into the same namespace at once — retry with a jittered backoff
+(`cas-attempts`, `cas-backoff`) because the loser's commit has to be rebuilt on
+the winner's tip.
+
+**The store's own machinery is refs too**, under `refs/gitiup/**`, and stays out
+of every listing: `refs/gitiup/host` is the store manifest (schema, kind, url,
+store-prefix) and `refs/gitiup/kv/<namespace>` is one append-only commit chain
+per namespace whose tree holds one file per record, named by its SHA-256. That
+chain is the content-addressed store: `put_cas` appends to it with a lease, so an
+append either lands or reports that someone else appended first. A repository can
+therefore be inspected, mirrored, backed up and `git fsck`'d with no gitiup
+anywhere in sight.
+
+**Reads go through a local mirror** (`work-dir`, default
+`~/.cache/gitiup/host/<remote>-<hash>`): one `git fetch --prune +refs/*:refs/*`
+populates it and everything after that is local object reads. The ref
+advertisement is cached for `ref-cache-ttl` (default 2 s) the way the bucket host
+caches its ref listing — a stale advertisement can be wrong but can never lose an
+update, because a write re-reads the ref it is about to move. Blob *listings* are
+not cached: "what records are in this store" has to include the one that landed a
+second ago. Transport calls on one handle are serialised, so threads sharing a
+handle cannot make each other's fetch fail with a lock error.
+
+**Smart HTTP and dumb HTTP are different promises.** Smart HTTP
+(`git-http-backend`) is a full host — pushes, leases, atomic batches — and needs
+what any git server needs for an anonymous push (`http.receivepack = true` in the
+repository, a user that may push otherwise). Dumb HTTP — a static file server and
+`git update-server-info` — answers reads only, and gitiup says so: either you set
+`read-only = "true"` in `[remote.options]` and it refuses writes up front, or it
+tries, the transport refuses the push, and that comes back as
+`HostError::UnsupportedCas` (never `Unreachable`), with `cas = false` from then
+on. A static web server is thus a legitimate release mirror: anyone can clone a
+change and its attestation from it, nobody can move a ref.
+
+| `[remote.options]` | meaning (default) |
+|--------------------|-------------------|
+| `git-binary` | which `git` to run (`git` on `PATH`) |
+| `work-dir` | where the local mirror lives (`~/.cache/gitiup/host`) |
+| `ref-cache-ttl` | how long an advertisement is trusted (`2s`) |
+| `cas-attempts` | retries when another writer wins a record append (`6`) |
+| `cas-backoff`, `cas-backoff-cap` | first pause before that retry, and its ceiling (`10ms`, `500ms`) |
+| `push-probe` | `on`/`off`: the `--dry-run` before the real push (`on`) |
+| `read-only` | refuse writes up front, for a dumb-HTTP or anonymous-fetch endpoint (`false`) |
+| `ssh-command`, `key-path` | `GIT_SSH_COMMAND`, and a key for git to use |
+| `pack-threads` | `-c pack.threads`, for cold mirrors of big repositories |
+| `git-config.<key>` | passed as `git -c <key>=<value>` to every call |
+
+An option none of these reads is not ignored: it comes back as config advice
+("the plain-git host does not read `region`"), because a silently unused setting
+is how a CI job ends up pushing somewhere nobody meant.
+
+What this host cannot do is server-side policy: it cannot tell you a branch is
+protected until the push is refused, cannot revoke a key, and cannot make a
+reviewer's `+1` mean anything. Those stay owner-side, which is the same answer the
+bucket host gives.
+
 ## Pack format
 
 `PackFormat::Raw` ("gitiup pack") is the transport for CAS-style hosts:
@@ -224,8 +339,10 @@ u32  object count (big endian)
 Limits (200 000 objects, 64 MiB per object, 512 MiB per pack) are enforced on
 both encode and decode. The trailer is verified, so a truncated or tampered pack
 is rejected instead of half-imported. `PackFormat::GitPackfile` bytes are opaque
-here: git-backed hosts (giti-xdw.3) accept them, everything else answers
-`UnsupportedCas` with `capability = "pack-format:git-packfile"`.
+here: the plain-git host accepts them — it hands them to `git index-pack` and they
+become ordinary git objects, so a pack from a clone and a pack from gitiup are the
+same thing — and every other host answers `UnsupportedCas` with
+`capability = "pack-format:git-packfile"`.
 
 ## Error taxonomy
 

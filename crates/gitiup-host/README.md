@@ -104,6 +104,7 @@ truncated or edited pack is rejected rather than half-imported.
 |------|------------|------------|
 | `FsHost` | `file:///srv/git/my-repo` | the reference host: refs, packs and a CAS blob store on a directory |
 | `S3Host` | `s3://bucket/prefix` | bucket-as-forge: refs are JSON objects, merges are conditional writes |
+| `GitHost` | `file://`, `ssh://`, `https://`, loopback `http://` | the repo is just a git repo: a bare repository driven with the `git` binary |
 
 `S3Host` stores `refs/<name>`, `kv/<kind>/<hash>` and `packs/<oid>.pack` under the
 store root and moves a ref with `If-None-Match` / `If-Match`, so two clones
@@ -134,6 +135,28 @@ The `s3` cargo feature links the `aws-sdk-s3` transport used by
 build has no S3 transport, feature `s3`"*), which keeps the default build free of
 HTTP and AWS code.
 
+`GitHost` needs no transport crate at all — it runs the `git` binary, so whatever
+git can reach is a host: a directory (`file://`), a box you ssh into (`ssh://`, or
+the scp-style `git@host:path`), `git-http-backend` over `https://`, or a static
+web server over plain `http://`, read-only.
+
+```rust,ignore
+let remote = RemoteConfig::new("origin", "ssh://git@box/srv/git/repo.git")?;
+let host = GitHost::open_or_init(&remote)?;              // writes refs/gitiup/host
+let oid = host.put_cas(&Namespace::CHANGE, record)?;
+host.update_ref_cas(&RefUpdate::create(RefName::change_head("c1")?, oid))?;
+```
+
+A ref whose value is a gitiup record points at a small *pointer commit* carrying
+`gitiup-ref.json` and the record bytes, which is what makes *`git fetch` carries
+proof* literal: the attestation arrives in the same packfile as the ref. Records
+themselves live in append-only chains at `refs/gitiup/kv/<namespace>`, the CAS is
+`git push --force-with-lease` plus a `--dry-run` probe, a batch is one
+`git push --atomic`, and a reviewer with nothing but plain `git` can fetch
+`refs/changes/**` and read the whole story. `cargo run -p gitiup-host --example
+git_tour` walks through all of it against a throwaway bare repository. Design
+notes: [`docs/host-abstraction.md`](../../docs/host-abstraction.md#the-plain-git-host-git).
+
 ## `gitiup.toml`
 
 Schema-versioned config, discovered by walking up from the working directory
@@ -145,7 +168,8 @@ default-remote = "origin"
 
 [[remote]]
 name = "origin"
-url = "s3://gitiup-forge/my-repo"   # s3:// https:// ssh:// file:// or git@host:owner/repo.git
+url = "s3://gitiup-forge/my-repo"   # s3:// https:// ssh:// file://, git@host:owner/repo.git,
+                     # and http:// for a server on this machine only
 store-prefix = "store"              # optional, default "gitiup"
 credentials-profile = "owner"       # optional, names a [credentials.*] block
 timeout = "45s"                     # optional, 250ms/30s/5m/1h or bare seconds, max 1h
@@ -195,12 +219,22 @@ cargo clippy -p gitiup-host --all-targets
 cargo test -p gitiup-host --features s3          # same, with the AWS transport linked
 ```
 
-`tests/host_fs.rs` and `tests/host_s3.rs` drive the traits through `&dyn Host`
-(shared bodies in `tests/support/`), so the same bodies are the starting point
-for the conformance suite (giti-xdw.5). `tests/host_s3.rs` covers the bucket
-promises on `MemoryBucket`: conditional writes on the wire, 412 retry with
-backoff, two clones converging, tombstones instead of deletes, the degraded
-`cas = false` path, multipart packs and the ref cache.
+`tests/host_fs.rs`, `tests/host_s3.rs` and `tests/host_git.rs` drive the traits
+through `&dyn Host` (shared bodies in `tests/support/`), so the same bodies are
+the starting point for the conformance suite (giti-xdw.5). `tests/host_s3.rs`
+covers the bucket promises on `MemoryBucket`: conditional writes on the wire, 412
+retry with backoff, two clones converging, tombstones instead of deletes, the
+degraded `cas = false` path, multipart packs and the ref cache.
+
+`tests/host_git.rs` runs against a real bare repository and checks what only a
+git-backed host can be asked: that a reviewer with plain `git` sees the change and
+the attestation in one packfile, that a stale lease is actually refused (twice —
+client-side and, when the race is too close for the advertisement, by the server),
+that a record chain survives two concurrent appenders, and that `refs/gitiup/**`
+stays out of the listing. `tests/host_git_http.rs` runs the same store through
+`git-http-backend` (a CGI shim in `tests/fixtures/`, no web server installed) and
+through a static file server, which is where the read-only promise gets tested.
+Both skip themselves if `python3` or `git-http-backend` is missing.
 
 `tests/host_s3_live.rs` runs the same bodies against a real endpoint. It is
 `#[ignore]`d so the default suite needs no network:

@@ -72,7 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let host_kind = match remote.scheme() {
-            RemoteScheme::File => "fs host can serve this remote directly",
+            RemoteScheme::File => {
+                "fs host (FsHost) or plain-git host (GitHost) can serve this remote"
+            }
             RemoteScheme::S3 if cfg!(feature = "s3") => {
                 "s3 host (S3Host) serves this remote, AWS transport linked"
             }
@@ -80,7 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "s3 host (S3Host) serves this remote; build with --features s3 to link the AWS \
                  transport"
             }
-            RemoteScheme::Https | RemoteScheme::Ssh => "needs the plain-git host (giti-xdw.3)",
+            RemoteScheme::Https | RemoteScheme::Http | RemoteScheme::Ssh => {
+                "plain-git host (GitHost) serves this remote: refs, packs and records over the \
+                 git transport"
+            }
         };
         println!("  host           {host_kind}");
     }

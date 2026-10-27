@@ -23,10 +23,12 @@
 //!
 //! Accepted URL schemes are [`RemoteScheme::S3`] (`s3://bucket/prefix`),
 //! [`RemoteScheme::Https`] (`https://host/path/repo.git`), [`RemoteScheme::Ssh`]
-//! (`ssh://git@host/srv/git/repo.git`, plus the `git@host:path` scp form) and
-//! [`RemoteScheme::File`] (`file:///srv/git/repo.git`). Anything else fails with
-//! [`HostError::SchemeUnknown`] listing what is
-//! supported.
+//! (`ssh://git@host/srv/git/repo.git`, plus the `git@host:path` scp form),
+//! [`RemoteScheme::File`] (`file:///srv/git/repo.git`) and — on loopback only —
+//! [`RemoteScheme::Http`] (`http://127.0.0.1:8080/git/repo.git`, the usual shape
+//! of a `git-http-backend` or static server on the same box). Plain HTTP to any
+//! other host fails with [`HostError::SchemeUnknown`], as does every scheme that
+//! is not a transport gitiup can drive.
 //!
 //! Every key is validated: unknown fields, duplicate remote names, a
 //! `default-remote` that does not exist, out-of-range timeouts and newer schema
@@ -135,6 +137,13 @@ pub enum RemoteScheme {
     S3,
     /// `https://host/repo` — smart-HTTP or dumb-HTTP static hosting.
     Https,
+    /// `http://127.0.0.1/repo` — plain HTTP, accepted on loopback only.
+    ///
+    /// A local `git-http-backend` or static server is the normal way to try a
+    /// git-over-HTTP remote, and the wire never leaves the machine. Anywhere else
+    /// the same URL is refused: pack data and credentials do not belong on a
+    /// cleartext link.
+    Http,
     /// `ssh://git@host/repo` (and `git@host:repo`) — a bare repo over ssh.
     Ssh,
     /// `file:///path` — a local directory (tests, air-gapped setups).
@@ -143,9 +152,10 @@ pub enum RemoteScheme {
 
 impl RemoteScheme {
     /// All supported schemes, in the order they are advertised.
-    pub const ALL: [RemoteScheme; 4] = [
+    pub const ALL: [RemoteScheme; 5] = [
         RemoteScheme::S3,
         RemoteScheme::Https,
+        RemoteScheme::Http,
         RemoteScheme::Ssh,
         RemoteScheme::File,
     ];
@@ -155,6 +165,7 @@ impl RemoteScheme {
         match self {
             RemoteScheme::S3 => "s3",
             RemoteScheme::Https => "https",
+            RemoteScheme::Http => "http",
             RemoteScheme::Ssh => "ssh",
             RemoteScheme::File => "file",
         }
@@ -178,7 +189,7 @@ impl RemoteScheme {
     fn rejection(scheme: &str) -> Option<HostError> {
         let (why, fix) = match scheme {
             "http" => (
-                "plain http is not supported",
+                "plain http is only accepted on loopback",
                 "use https:// (or ssh://) so credentials and pack data are not sent in the clear",
             ),
             "git" => (
@@ -228,6 +239,10 @@ impl FromStr for RemoteScheme {
             "s3" => Ok(RemoteScheme::S3),
             "https" => Ok(RemoteScheme::Https),
             "ssh" => Ok(RemoteScheme::Ssh),
+            // `http` is accepted here and refused by `RemoteUrl::validate` unless
+            // the host is loopback, so the deliberate-rejection wording still
+            // applies to the real-world case of a remote across the internet.
+            "http" => Ok(RemoteScheme::Http),
             "file" => Ok(RemoteScheme::File),
             other => Err(RemoteScheme::rejection(other).unwrap_or_else(|| {
                 HostError::SchemeUnknown(Box::new(crate::error::SchemeUnknown {
@@ -361,7 +376,7 @@ impl RemoteUrl {
                 validate_bucket(&self.host)?;
                 validate_segments(&self.path, "bucket prefix")?;
             }
-            RemoteScheme::Https | RemoteScheme::Ssh => {
+            RemoteScheme::Https | RemoteScheme::Ssh | RemoteScheme::Http => {
                 validate_host(&self.host)?;
                 if self.path.is_empty() {
                     return Err(HostError::invalid(
@@ -371,6 +386,23 @@ impl RemoteUrl {
                     .with_hint("expected e.g. https://host/owner/repo.git"));
                 }
                 validate_segments(&self.path, "repository path")?;
+                if self.scheme == RemoteScheme::Http && !self.is_loopback() {
+                    return Err(HostError::SchemeUnknown(Box::new(
+                        crate::error::SchemeUnknown {
+                            scheme: "http".to_string(),
+                            supported: RemoteScheme::ALL
+                                .iter()
+                                .map(|s| s.as_str().to_string())
+                                .collect(),
+                            hint: Some(format!(
+                                "plain http is accepted for a server on this machine only \
+                                 (localhost, 127.0.0.0/8, ::1) and '{}' is not that: serve it \
+                                 over https://, use ssh://, or name the path with file://",
+                                self.host
+                            )),
+                        },
+                    )));
+                }
             }
             RemoteScheme::File => {
                 if self.path.is_empty() {
@@ -389,6 +421,32 @@ impl RemoteUrl {
     /// The absolute local path for a `file://` remote.
     pub fn file_path(&self) -> PathBuf {
         PathBuf::from(format!("/{}", self.path))
+    }
+
+    /// Whether the host is this machine.
+    ///
+    /// The one place that decides it, because it is the difference between
+    /// accepting `http://127.0.0.1:8080/repo.git` (a local git-http-backend, a
+    /// static server in a test) and accepting cleartext to a server across a
+    /// network.
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.to_ascii_lowercase();
+        if matches!(
+            host.as_str(),
+            "localhost" | "localhost.localdomain" | "ip6-localhost" | "ip6-loopback"
+        ) {
+            return true;
+        }
+        // An IPv6 literal arrives in a URL as `[::1]`; brackets are not part of
+        // the address.
+        let literal = host.strip_prefix('[').unwrap_or(&host);
+        let literal = literal.strip_suffix(']').unwrap_or(literal);
+        // `is_loopback` on the parsed address is the whole rule: 127.0.0.0/8 and
+        // ::1. Anything that does not parse is a name, and a name we cannot
+        // resolve from here is not "this machine".
+        literal
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
     }
 
     /// The URL with any userinfo/secret removed, safe for logs.
@@ -448,6 +506,31 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 }
 
 fn split_host_port(text: &str) -> HostResult<(String, Option<u16>)> {
+    // An IPv6 address is the one place a `:` in a host means part of the address,
+    // and RFC 3986 says it arrives in brackets: `http://[::1]:8080/repo`. The
+    // brackets stay on the stored host so `redacted()` puts out a URL that parses
+    // again.
+    if let Some(rest) = text.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return Err(HostError::invalid(
+                "remote url",
+                format!("'{text}' opens a '[' around the host and never closes it"),
+            ));
+        };
+        let port = match after.strip_prefix(':') {
+            Some(port) => Some(port.parse::<u16>().map_err(|_| {
+                HostError::invalid("remote url", format!("'{port}' is not a valid port"))
+            })?),
+            None if after.is_empty() => None,
+            None => {
+                return Err(HostError::invalid(
+                    "remote url",
+                    format!("'{text}' has trailing text after the address in brackets"),
+                ));
+            }
+        };
+        return Ok((format!("[{address}]"), port));
+    }
     if let Some((host, port)) = text.rsplit_once(':') {
         let port: u16 = port.parse().map_err(|_| {
             HostError::invalid("remote url", format!("'{port}' is not a valid port"))
@@ -470,6 +553,15 @@ fn validate_host(host: &str) -> HostResult<()> {
     }
     if host.len() > 253 {
         return bad("is longer than 253 characters");
+    }
+    // An address literal is not a name and does not have labels: `[::1]` (the
+    // bracketed form a URL carries) or a bare IPv6 in a config field.
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if literal.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
     }
     for label in host.split('.') {
         if label.is_empty() {
@@ -914,6 +1006,13 @@ impl Config {
                     format_timeout(SLOW_TIMEOUT)
                 ));
             }
+            if remote.scheme() == RemoteScheme::Http {
+                warnings.push(format!(
+                    "remote '{}' uses plain http; allowed because it is loopback, but anything \
+                     written to it is unauthenticated and unencrypted",
+                    remote.name
+                ));
+            }
             if remote.url.user.is_some() && matches!(remote.scheme(), RemoteScheme::Https) {
                 warnings.push(format!(
                     "remote '{}' embeds credentials in the URL: move them to a credentials-profile with token-env",
@@ -1267,6 +1366,7 @@ impl Config {
                 RemoteScheme::S3 => AuthModel::CloudRole,
                 RemoteScheme::Ssh => AuthModel::SshKey,
                 RemoteScheme::Https => AuthModel::Token,
+                RemoteScheme::Http => AuthModel::Anonymous,
                 RemoteScheme::File => AuthModel::Filesystem,
             };
         }
@@ -1353,6 +1453,42 @@ mod tests {
         assert_eq!(format_timeout(Duration::from_millis(900)), "900ms");
         assert_eq!(format_timeout(Duration::from_secs(120)), "2m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn plain_http_is_only_allowed_on_this_machine() {
+        // The rule is about where the server *is*, not about the scheme: a test
+        // harness serving git on a port is fine, an unencrypted hop to a host on
+        // the internet is a credential leak waiting to happen.
+        for ok in [
+            "http://127.0.0.1:8080/repo.git",
+            "http://127.5.6.7/repo.git",
+            "http://localhost/repo.git",
+            "http://[::1]/repo.git",
+        ] {
+            let remote = RemoteConfig::new("origin", ok).expect(ok);
+            assert_eq!(remote.scheme(), RemoteScheme::Http, "{ok}");
+            assert!(remote.url.is_loopback(), "{ok} should count as loopback");
+        }
+        for refused in [
+            "http://example.com/repo.git",
+            "http://10.0.0.4/repo.git",
+            "http://0.0.0.0/repo.git",
+            "http://localhost.evil.example/repo.git",
+        ] {
+            let error = RemoteConfig::new("origin", refused).expect_err(refused);
+            assert_eq!(
+                error.kind(),
+                crate::HostErrorKind::SchemeUnknown,
+                "{refused}"
+            );
+            assert!(
+                error.hint().is_some_and(|hint| hint.contains("https://")),
+                "{refused}: {error}"
+            );
+        }
+        // The same host over https is whatever the operator wants it to be.
+        assert!(RemoteConfig::new("origin", "https://example.com/repo.git").is_ok());
     }
 
     #[test]
