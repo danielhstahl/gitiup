@@ -43,6 +43,12 @@ gitiup-host = { path = "../gitiup-host" }
 # `--no-default-features` has no forge code in it at all: the remote is then refused
 # by name, with the flag to turn on in the message.
 gitiup-host-github = { path = "../gitiup-host-github", optional = true }
+# `gitiup key` and `gitiup identity`: who is signing, and with what. Not a second
+# opinion about signatures — `gitiup-keys` builds on `gitiup-attest`'s `Signer`, so a
+# keystore key, an ssh-agent identity and a gpg subkey all produce the same
+# `SignatureEntry` bytes. The CLI is where a passphrase and a key name get typed, so
+# it is the only crate that needs the keystore at all.
+gitiup-keys = { path = "../gitiup-keys" }
 serde_json = "1"
 
 [features]

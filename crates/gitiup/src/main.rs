@@ -15,6 +15,8 @@
 //!                                      may serve a stranger's job at all
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
+//! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
+//! gitiup identity …                     who this machine signs as: publish, use, whoami
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -38,6 +40,7 @@ use std::process::ExitCode;
 mod digest;
 mod doctor;
 mod env;
+mod keys;
 mod normalise;
 mod remotes;
 mod run;
@@ -56,6 +59,10 @@ COMMANDS:
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
+    key [COMMAND] [OPTIONS]        the signing keys this machine can use (gen, import,
+                                   list, show, delete, probe)
+    identity [COMMAND] [OPTIONS]   who this machine signs as (publish, list, show,
+                                   verify, endorse, use, whoami, import)
     help                        print this text
     version                     print the version of this build
 
@@ -67,6 +74,12 @@ Exit codes for `run`, `digest`, `env` and `normalise`: 0 ok · 2 usage · 3 I/O 
 6 refused (bad run report, disallowed tier, no sandbox, wrong machine class) ·
 8 digest mismatch or divergence (ADR-0001 D7: 6 refused/unsupported, 8 digest
 mismatch — the same codes `gitiup verify attestation` will use).
+
+`key` and `identity` keep the same table and add one code: 7, a signature that does
+not verify — a claim whose self-signature is broken is a different event from a
+claim you merely cannot parse. `gitiup key help` and `gitiup identity help` list
+their flags; both are scriptable end to end, with `--passphrase-file -` for a
+passphrase and `--json` on anything a script reads.
 
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
@@ -84,6 +97,9 @@ Try:
     gitiup digest --expect sha256:… run.json   # exit 8 if the rerun disagrees
     gitiup normalise run.json                  # what was rewritten, and why
     gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
+    gitiup key gen --comment ada@laptop         # a new key, in the age-encrypted keystore
+    gitiup identity publish ada --email ada@example.com
+    gitiup identity whoami --check              # proves this machine can still sign
 ";
 
 fn main() -> ExitCode {
@@ -185,6 +201,8 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "digest" => digest::run(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
+        "key" => keys::key(&args[1..]),
+        "identity" => keys::identity(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }

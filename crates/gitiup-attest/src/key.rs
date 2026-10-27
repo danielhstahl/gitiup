@@ -100,7 +100,18 @@ impl PublicKey {
             .with_hint("ed25519 only; convert or generate one with `gitiup keygen` (giti-1rs.6)"));
         }
         let blob = base64_decode(body)?;
-        let key = ssh_ed25519_key_bytes(&blob)?;
+        PublicKey::from_ssh_blob(&blob)
+    }
+
+    /// Parse an OpenSSH public-key **wire blob** — the same bytes as
+    /// [`PublicKey::ssh_blob`], without the base64 and the comment.
+    ///
+    /// Public because that is the form the things people already have hand over:
+    /// an `ssh-agent` identity list and `gpg --export-ssh-key` both speak in blobs,
+    /// and a second parser somewhere else would be a second opinion on what a key
+    /// id is.
+    pub fn from_ssh_blob(blob: &[u8]) -> Result<PublicKey> {
+        let key = ssh_ed25519_key_bytes(blob)?;
         PublicKey::from_bytes(&key)
     }
 

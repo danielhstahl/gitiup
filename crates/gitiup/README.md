@@ -153,9 +153,46 @@ where they overlap, because gates branch on the numbers:
 | 6 | the report is not a valid run report, or this build cannot read it |
 | 8 | digest mismatch: the rerun disagreed with `--expect`, or two runs did not converge |
 
+## `gitiup key` and `gitiup identity`
+
+```console
+$ gitiup key gen --comment ada@laptop
+created ada-laptop
+  key id  SHA256:jNV4N28TJ7ytCrDmXBu8snKgGktlHRmyR0TbXq5gHsQ
+  public  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwrkrGZ+b40H+pDMpSvxdldmwJeXj9YS/bF9U9DoFUQ
+  secret  encrypted with age (scrypt) in /home/ada/.config/gitiup/keys
+
+$ gitiup identity publish ada --email ada@example.com
+published ada
+  key id  SHA256:jNV4N28TJ7ytCrDmXBu8snKgGktlHRmyR0TbXq5gHsQ
+  signed  by ada-laptop (keystore)
+  file    /home/ada/.config/gitiup/identities/ada.identity.json
+  this is now the current identity
+
+$ gitiup identity whoami --check
+ada — ada
+  key id  SHA256:jNV4N28TJ7ytCrDmXBu8snKgGktlHRmyR0TbXq5gHsQ
+  key     ada-laptop (keystore)
+  where   keystore, age-encrypted at ada-laptop.secret.age
+  check   signs and verifies
+```
+
+The commands, the passphrase rules and the claim format are
+[documented here](../../docs/signing-keys.md); the decisions behind them are
+[`gitiup-keys`](../gitiup-keys/README.md). Everything works from a script —
+`--passphrase-file -`, `--key`, `--json` — and nothing here requires a terminal.
+
+| exit | `key` and `identity` |
+|------|----------------------|
+| 0 | done |
+| 2 | usage |
+| 3 | I/O, no such key or identity, or an agent that cannot be reached |
+| 6 | refused: wrong passphrase, name taken, a claim that is unsigned or malformed |
+| 7 | a signature does not verify (a tampered claim, a broken endorsement) |
+
 ## What is deliberately *not* here yet
 
-signing and key management (giti-1rs.6), storing or fetching attestations
+storing or fetching attestations
 (giti-1rs.5), `gitiup verify attestation` (giti-1rs.8), and the runner that
 writes these reports in the first place. `digest` is the slice that exists once
 the format does, which is the point: the computation is checkable from the command
@@ -169,6 +206,12 @@ line before any of the machinery around it is built.
 * `tests/normalise_cli.rs` — the same for `normalise`: the rewrite record, `--json`
   agreeing with the library, two machines converging, a real divergence as exit `8`
   naming step, field and both sides, `--rules`, and every exit code.
+* `tests/keys_cli.rs` — `gitiup key` and `gitiup identity` as command lines, with a
+  temp `GITIUP_CONFIG_HOME` each: generate, import a real OpenSSH file, publish,
+  endorse, use, whoami, verify, move a claim between two config homes — all driven
+  through stdin and `--json`, no terminal; exit `3` for a missing agent, `6` for a
+  wrong passphrase or a duplicate name, `7` for a tampered claim; and nothing on disk
+  but the age container.
 * `tests/doc_examples.rs` — the worked report in `docs/run-report.md`, parsed and
   digested: the documentation example is the pinned example.
 * `tests/cli_hygiene.rs` — the dependency list stays at three crates, no network or
@@ -182,5 +225,5 @@ cargo build -p gitiup
 cargo test -p gitiup
 ```
 
-Dependencies: `gitiup-attest`, `gitiup-normalise`, `serde_json`. No argument
-parser, no HTTP client, no C toolchain.
+Dependencies: `gitiup-attest`, `gitiup-normalise`, `gitiup-keys`, `serde_json`. No
+argument parser, no HTTP client, no C toolchain.

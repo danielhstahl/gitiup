@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// What the binary may depend on directly.
 // `gitiup-run` is the planning and tier-choosing crate behind `gitiup run`; it is
 // itself kept network-free by its own `tests/no_side_effects.rs`.
-const ALLOWED_DEPENDENCIES: [&str; 7] = [
+const ALLOWED_DEPENDENCIES: [&str; 8] = [
     "gitiup-attest",
     "gitiup-normalise",
     "gitiup-run",
@@ -42,6 +42,12 @@ const ALLOWED_DEPENDENCIES: [&str; 7] = [
     // Optional is the point: `--no-default-features` produces a binary with no forge
     // code in it, which is what makes the feature gate mean something.
     "gitiup-host-github",
+    // `gitiup key` / `gitiup identity`. Signing cannot be kept out of the CLI: the
+    // passphrase is typed here, and a key is chosen here. It is not a second digest
+    // implementation either — `gitiup-keys` has no digest logic and builds every key
+    // as a `gitiup_attest::Signer`, so the signature bytes come from the format crate
+    // whoever holds the key.
+    "gitiup-keys",
     "serde_json",
 ];
 

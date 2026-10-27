@@ -22,6 +22,7 @@ Two goals, one tool:
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
 | `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, `cas = false`), run against the `fs`, plain-git, bucket and forge hosts — in CI, against real backends |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
+| `gitiup-keys` | signing keys and identities: an age-encrypted keystore, ssh-agent and gpg-agent backends, and the signed identity claim that says "this key is mine" — every one of them a `gitiup_attest::Signer`, so a key's origin never changes the signature it produces |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
 | `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, per-seat attestation storage and the verdict (`verified` / `failed` / `insufficient`) — ADR-0002 as code, and nothing else |
@@ -51,6 +52,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   tickets. Implementation: [`gitiup-quorum`](crates/gitiup-quorum/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
+* [Signing keys and identities](docs/signing-keys.md) — where a private key lives
+  (`gitiup key gen`, an age + scrypt container), how an existing ssh or gpg key is
+  imported without ever being copied, what an identity claim signs and why, and which
+  exit code each failure gets.
 * [The environment fingerprint](docs/environment.md) — what a run says about the
   machine it ran on (OS and version, architecture, image digest *or* local toolchain
   inventory, runner, sandbox backend), how it is derived, and how `require-env-match =
@@ -72,6 +77,9 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   against MinIO and a real `git-http-backend`.
 * [`gitiup-normalise` README](crates/gitiup-normalise/README.md) — the normalisation
   profile and its version story.
+* [`gitiup-keys` README](crates/gitiup-keys/README.md) — the keystore, the agent
+  backends and the identity claim: what is on disk, what is never written, and which
+  backend produced which signature.
 * [ADR index](docs/adr/README.md) — where the decisions that several tickets depend on
   are kept.
 
@@ -98,6 +106,9 @@ cargo run -p gitiup -- run                  # the same in your own repo (.github
 cargo run -p gitiup -- run --help           # the tiers, and what it takes to earn each
 cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
 cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
+cargo run -p gitiup -- key gen --comment ada@laptop          # a new signing key, age-encrypted
+cargo run -p gitiup -- identity publish ada --email ada@example.com --passphrase-file -
+cargo run -p gitiup -- identity whoami --check              # "can this machine still sign?"
 cargo run -p gitiup -- normalise crates/gitiup-normalise/tests/fixtures/corpus/machine-a/run.json
 cargo run -p gitiup -- normalise --compare \
     crates/gitiup-normalise/tests/fixtures/corpus/machine-a/run.json \

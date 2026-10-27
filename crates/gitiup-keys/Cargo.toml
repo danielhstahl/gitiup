@@ -1,0 +1,45 @@
+[package]
+name = "gitiup-keys"
+description = "Signing key management: an age-encrypted keystore, ssh-agent and gpg-agent signers, and signed identity claims — one Signer API behind all three"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# giti-1rs.6: everyone in gitiup's trust story already owns a key, so this crate
+# never asks for a second one. What it owns is *where secrets live* and *how a
+# signature gets made*, and nothing else:
+#
+# * the format (what bytes are signed, what a key id means) is `gitiup-attest`'s
+#   and ADR-0001's; every signer here implements `gitiup_attest::Signer`, so a
+#   signature from a hardware agent is byte-identical in shape to one from a
+#   generated key;
+# * *storage of records* (attestations, rosters, changes) is `gitiup-host`'s;
+# * *who is trusted* is a policy, in the caller's hands (`gitiup_attest::Trust`).
+#
+# No network, ever: the ssh-agent protocol is a unix socket and gpg is a child
+# process. A signer that needed the network would make `gitiup change submit`
+# fail on a plane, and would be a second place an out-of-band trust decision
+# could be smuggled in.
+
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+# Encrypted-at-rest keystore. `age` with a passphrase (scrypt) is the format, and
+# `armor` is what makes a keystore file self-describing instead of a blob.
+# Default features are off deliberately: no plugin recipients, no CLI helpers,
+# no request/HTTP code — a passphrase and an armour, nothing more.
+age = { version = "0.11", default-features = false, features = ["armor"] }
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The user-editable `config.toml` (which identity is current). Signed records are
+# canonical JSON, never TOML: a signed document has to be re-encodable byte for
+# byte, and TOML has no canonical form.
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
