@@ -17,14 +17,22 @@ Two goals, one tool:
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
+| `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 
-Later work adds the runner, attestation and quorum crates under `crates/`; the
+Later work adds the runner, quorum and CLI crates under `crates/`; the
 workspace globs `crates/*`, so a new crate is just `members`-free.
 
+* [ADR-0001 — attestation encoding, hash and signature format](docs/adr/0001-attestation-encoding-hash-and-signature.md) —
+  the format every attestation ticket codes against (canonical JSON, SHA-256, Ed25519
+  over DSSE PAE, `result`/`claims` split, freshness as policy).
+  The decisions are in the ADR, the implementation is
+  [`gitiup-attest`](crates/gitiup-attest/README.md).
 * [Host abstraction design notes](docs/host-abstraction.md) — the contracts every
   host owes, including the ref namespaces, store layout, pack format and error
   taxonomy.
 * [`gitiup-host` README](crates/gitiup-host/README.md) — the API surface.
+* [ADR index](docs/adr/README.md) — where the decisions that several tickets depend on
+  are kept.
 
 ## Building
 
@@ -53,4 +61,5 @@ cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml
 
 Decisions that several tickets depend on are written down in `docs/` (or as an
 ADR next to the crate they concern), so a ticket can be implemented without
-re-deciding the foundations.
+re-deciding the foundations. Cross-cutting decisions live in
+[`docs/adr/`](docs/adr/README.md); one-off rationale belongs in the code it explains.

@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitiup.dev/schema/run-manifest-1.json",
+  "title": "gitiup run manifest (v1)",
+  "description": "The signed payload of a gitiup attestation: what ran, on what change, in what environment, with what outcome. Normative alongside ADR-0001 (docs/adr/0001-attestation-encoding-hash-and-signature.md); the ADR decides the encoding of these bytes (canonical JSON, ADR-0001 D1) and what each field means, this schema says which fields exist.\n\nA few rules are enforced by the Rust reader rather than by JSON Schema and are noted with x-gitiup-note: no nulls anywhere (an absent field is an omitted key), integers only (i64, no floats), object keys in ascending order and duplicate-free, lists marked x-gitiup-sorted required sorted and unique, and every string free of control characters and at most 16384 bytes.",
+  "type": "object",
+  "required": ["schema_version", "type", "result", "claims"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Manifest format version. Inside the signed payload so a v2 document cannot be checked with v1 rules."
+    },
+    "type": {
+      "const": "https://gitiup.dev/attestation/run/1",
+      "description": "Discriminator, in-toto style."
+    },
+    "result": {
+      "$ref": "#/$defs/RunResult",
+      "description": "Everything a faithful re-run reproduces. Its digest is what independent verifiers compare."
+    },
+    "claims": {
+      "$ref": "#/$defs/Claims",
+      "description": "Who claimed it and when. Signed and policy-checked, never compared for equality between runs."
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Algorithm-tagged digest, lower-case hex (ADR-0001 D2)."
+    },
+    "gitOid": {
+      "type": "string",
+      "pattern": "^(sha1:[0-9a-f]{40}|sha256:[0-9a-f]{64})$",
+      "description": "A git object name. The algorithm is part of the string so a sha256-object-format repository can be bound without a format change."
+    },
+    "microseconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807,
+      "description": "Microseconds since the Unix epoch, UTC. An integer, not an RFC 3339 string, so there is exactly one encoding (ADR-0001 D6)."
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "A short human-readable string. Never raw control characters; never binary (binary content is referred to by digest)."
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16,64}$",
+      "description": "Per-run identifier: 8-32 random bytes as hex."
+    },
+    "sorted": {
+      "x-gitiup-note": "Lists carrying x-gitiup-sorted must be sorted ascending and duplicate-free, so two honest producers hash the same bytes. JSON Schema cannot express this; RunResult::normalize() and RunManifest::validate() do.",
+      "description": "Documentation-only placeholder, never referenced."
+    },
+    "RunManifest": {
+      "$comment": "Alias of the root document, listed so tooling can address it by name.",
+      "$ref": "#"
+    },
+    "RunResult": {
+      "type": "object",
+      "required": ["source", "environment", "steps", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/Source" },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/InputValue" },
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "maxProperties": 4096,
+          "description": "Declared job inputs, by value.",
+          "x-gitiup-note": "Absent when empty: an empty map is omitted, never null."
+        },
+        "secret_names": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" },
+          "uniqueItems": true,
+          "maxItems": 4096,
+          "description": "Names of secrets made available. Never their values.",
+          "x-gitiup-sorted": true
+        },
+        "pins": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ActionPin" },
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "maxProperties": 4096,
+          "description": "Resolved pin for every uses: in the run."
+        },
+        "reusable_workflows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WorkflowRef" },
+          "maxItems": 4096,
+          "description": "The reusable-workflow closure.",
+          "x-gitiup-sorted": "path"
+        },
+        "environment": { "$ref": "#/$defs/Environment" },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Step" },
+          "minItems": 1,
+          "maxItems": 4096,
+          "description": "Steps in execution order. This is the one order that is meaningful, so it is not sorted."
+        },
+        "provenance": { "$ref": "#/$defs/Provenance" }
+      }
+    },
+    "Source": {
+      "type": "object",
+      "required": ["commit", "workflow", "event"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "$ref": "#/$defs/text",
+          "description": "Human-facing repository identity. Not trusted for anything."
+        },
+        "commit": {
+          "$ref": "#/$defs/gitOid",
+          "description": "The commit this run is bound to. An attestation offered against a different commit is refused."
+        },
+        "workflow": { "$ref": "#/$defs/WorkflowRef" },
+        "event": { "$ref": "#/$defs/EventContext" },
+        "job": { "$ref": "#/$defs/text", "description": "Job id, when the workflow has more than one." },
+        "matrix": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/text" },
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "maxProperties": 4096,
+          "description": "Matrix vector for this job."
+        }
+      }
+    },
+    "WorkflowRef": {
+      "type": "object",
+      "required": ["path", "oid"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/text", "description": "Repository-relative path of the workflow file." },
+        "oid": {
+          "$ref": "#/$defs/gitOid",
+          "description": "The source that was executed: a git blob id, or sha256:<hex> of the file bytes when the file is not committed."
+        }
+      }
+    },
+    "EventContext": {
+      "type": "object",
+      "required": ["name", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/text", "description": "pull_request, push, workflow_dispatch, ..." },
+        "action": { "$ref": "#/$defs/text", "description": "Event action qualifier, if any." },
+        "payload": {
+          "$ref": "#/$defs/digest",
+          "description": "Digest of the event payload as received. The payload itself stays out of the manifest."
+        }
+      }
+    },
+    "ActionPin": {
+      "type": "object",
+      "required": ["repo", "commit"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "$ref": "#/$defs/text", "description": "owner/name or full URL of the action repository." },
+        "commit": {
+          "$ref": "#/$defs/gitOid",
+          "description": "The immutable commit checked out. A floating ref is not a pin."
+        },
+        "ref": {
+          "$ref": "#/$defs/text",
+          "description": "The ref the user wrote (v4, main). Evidence of what the pin resolved from; never trusted."
+        }
+      }
+    },
+    "Environment": {
+      "type": "object",
+      "required": ["arch", "fingerprint"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "$ref": "#/$defs/text", "description": "Backend that ran the job: docker, podman, containerd, shell, simulated." },
+        "os": { "$ref": "#/$defs/text", "description": "OS id, lower case." },
+        "arch": { "$ref": "#/$defs/text", "description": "CPU architecture (x86_64, aarch64)." },
+        "image": { "$ref": "#/$defs/ImageRef" },
+        "toolchain": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ToolchainEntry" },
+          "maxItems": 4096,
+          "description": "Toolchain inventory.",
+          "x-gitiup-sorted": "[name, version]"
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/digest",
+          "description": "Derived, not asserted: sha256 of the canonical encoding of this object with fingerprint set to sha256 of the empty string. A fingerprint that does not match the environment described is a validation error.",
+          "x-gitiup-note": "Must not carry per-machine identity (hostname, uid, build paths): the fingerprint identifies a machine class, and per-machine values would make independent runs incomparable."
+        }
+      }
+    },
+    "ImageRef": {
+      "type": "object",
+      "required": ["digest"],
+      "additionalProperties": false,
+      "properties": {
+        "reference": { "$ref": "#/$defs/text", "description": "What was asked for (ubuntu:24.04). Evidence only." },
+        "digest": { "$ref": "#/$defs/digest", "description": "What was actually pulled, pinned by digest." }
+      }
+    },
+    "ToolchainEntry": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/text", "description": "Tool name, lower case." },
+        "version": { "$ref": "#/$defs/text", "description": "Version as the tool reports it." }
+      }
+    },
+    "Step": {
+      "type": "object",
+      "required": ["name", "exit_code", "outcome", "stdout", "stderr"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/text", "description": "Step id as written in the workflow, if it had one. Unique when present." },
+        "name": { "$ref": "#/$defs/text", "description": "Step name, or the uses: string." },
+        "uses": { "$ref": "#/$defs/text", "description": "The uses: value as written." },
+        "exit_code": { "type": "integer", "minimum": -128, "maximum": 255, "description": "Process exit code (0 when skipped)." },
+        "outcome": { "$ref": "#/$defs/stepOutcome" },
+        "stdout": {
+          "$ref": "#/$defs/digest",
+          "description": "Digest of the NORMALISED stdout. Raw logs are not part of an attestation (giti-1rs.3)."
+        },
+        "stderr": { "$ref": "#/$defs/digest", "description": "Digest of the normalised stderr." },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/text" },
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "maxProperties": 4096,
+          "description": "Step outputs, by value."
+        },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Artifact" },
+          "maxItems": 4096,
+          "x-gitiup-sorted": "[name, digest]"
+        }
+      }
+    },
+    "stepOutcome": {
+      "enum": ["success", "failure", "skipped"],
+      "description": "How the runner classified the step."
+    },
+    "Artifact": {
+      "type": "object",
+      "required": ["name", "digest", "size_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/text" },
+        "digest": { "$ref": "#/$defs/digest", "description": "Digest of the artifact content, or of the manifest for a directory." },
+        "size_bytes": { "type": "integer", "minimum": 0, "description": "Uncompressed size." }
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "required": ["tier", "runner", "normalisation_version"],
+      "additionalProperties": false,
+      "properties": {
+        "tier": { "$ref": "#/$defs/tier" },
+        "runner": { "$ref": "#/$defs/text", "description": "Runner implementation and version, e.g. gitiup 0.1.0." },
+        "normalisation_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Which normalisation rules produced the digests. Results from different versions are not comparable."
+        },
+        "sandbox": { "$ref": "#/$defs/text", "description": "Confinement backend, if any (docker, landlock, none)." }
+      }
+    },
+    "tier": {
+      "enum": ["simulated", "local", "quorum"],
+      "description": "Provenance tier. In a run manifest the value is simulated or local: quorum is a verdict over several attestations, recorded separately and never self-asserted by one run."
+    },
+    "InputValue": {
+      "oneOf": [
+        { "$ref": "#/$defs/text" },
+        { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
+        { "type": "boolean" }
+      ],
+      "description": "A scalar input value. Scalars only: a composite value would mean two ways to encode one input."
+    },
+    "Claims": {
+      "type": "object",
+      "required": ["run_id", "claimed_at_us"],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": { "$ref": "#/$defs/runId" },
+        "claimed_at_us": { "$ref": "#/$defs/microseconds" },
+        "not_before_us": { "$ref": "#/$defs/microseconds", "description": "Optional validity lower bound; must not be after claimed_at_us." },
+        "not_after_us": { "$ref": "#/$defs/microseconds", "description": "Optional validity upper bound; must be after claimed_at_us." },
+        "verifier_challenge": {
+          "$ref": "#/$defs/digest",
+          "description": "Commit-reveal challenge this submission is bound to (giti-msi.6)."
+        },
+        "timing": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/StepTiming" },
+          "propertyNames": { "$ref": "#/$defs/text" },
+          "maxProperties": 4096,
+          "description": "Per-step wall-clock evidence, keyed by step id. Outside result on purpose: durations never agree between machines.",
+          "x-gitiup-note": "Keys should match a steps[].id; they are not constrained to, because a step may be unnamed."
+        },
+        "normalisation_diffs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NormalisationDiff" },
+          "maxItems": 4096,
+          "description": "What normalisation had to rewrite. Evidence for a dispute; the before side is machine-specific by definition, so it must stay out of result.",
+          "x-gitiup-sorted": "[step, kind]"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/text" },
+          "propertyNames": { "type": "string", "pattern": "^[a-z0-9_][a-z0-9_.]{0,63}$" },
+          "maxProperties": 4096,
+          "description": "Extension point for third-party fields, by convention named x_<producer>_<name>. Strings only, so an extension can never be richer than a typed field."
+        }
+      }
+    },
+    "StepTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "started_us": { "$ref": "#/$defs/microseconds" },
+        "duration_us": { "$ref": "#/$defs/microseconds" }
+      }
+    },
+    "NormalisationDiff": {
+      "type": "object",
+      "required": ["step", "kind", "before", "after"],
+      "additionalProperties": false,
+      "properties": {
+        "step": { "$ref": "#/$defs/text" },
+        "kind": { "$ref": "#/$defs/text", "description": "timestamp, path, hostname, locale, ansi, line-ending, ..." },
+        "before": { "type": "string", "maxLength": 16384, "description": "Text before rewriting (may be empty)." },
+        "after": { "type": "string", "maxLength": 16384, "description": "Text after rewriting (may be a placeholder)." }
+      }
+    }
+  }
+}

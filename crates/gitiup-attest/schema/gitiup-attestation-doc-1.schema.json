@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitiup.dev/schema/attestation-doc-1.json",
+  "title": "gitiup attestation document (v1)",
+  "description": "A run manifest plus the signatures over it. The signed payload is the canonical encoding of the `manifest` member, wrapped in DSSE PAE: signature over \"DSSEv1\" SP len(payload_type) SP payload_type SP len(payload) SP payload. See ADR-0001 (docs/adr/0001-attestation-encoding-hash-and-signature.md).\n\nStored as kv/attestation/<hex of sha256(canonical(this document))> and pointed at by refs/attestations/<commit oid>, so an ordinary git fetch carries proof.",
+  "type": "object",
+  "required": ["schema_version", "payload_type", "manifest", "signatures"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1, "description": "Envelope format version." },
+    "payload_type": {
+      "const": "application/vnd.gitiup.run-manifest+json",
+      "description": "DSSE payload type of the signed bytes; recorded so a future payload type cannot be checked with these rules."
+    },
+    "manifest": { "$ref": "gitiup-run-manifest-1.schema.json" },
+    "signatures": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/SignatureEntry" },
+      "maxItems": 64,
+      "description": "One entry per signer; a quorum appends entries without changing the RunDigest. May be empty only for an unsigned record staged before signing.",
+      "x-gitiup-sorted": "key_id",
+      "x-gitiup-note": "One entry per key_id: an identity casts one vote (giti-msi.9)."
+    }
+  },
+  "$defs": {
+    "SignatureEntry": {
+      "type": "object",
+      "required": ["key_id", "algorithm", "public_key", "sig"],
+      "additionalProperties": false,
+      "properties": {
+        "key_id": {
+          "type": "string",
+          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$",
+          "description": "Unpadded base64 of sha256 over the SSH public-key blob: exactly what `ssh-keygen -lf` prints. Derived from public_key at verification time, never taken on trust."
+        },
+        "algorithm": {
+          "const": "ed25519",
+          "description": "Raw Ed25519 (RFC 8032), verified strictly (no weak keys, no malleable encodings)."
+        },
+        "public_key": {
+          "type": "string",
+          "pattern": "^ssh-ed25519 [A-Za-z0-9+/]{68}$",
+          "description": "OpenSSH public-key line, without a comment: base64 of string \"ssh-ed25519\" + string <32-byte key>."
+        },
+        "sig": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{86}==$",
+          "description": "Base64 (standard alphabet, padded) of the 64-byte signature over the PAE bytes."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "name": "minimal",
+      "record_digest": "sha256:0452135b54de1607f8182dc2a56f8b024ac605202303f7f0d156bcc1dbd50705",
+      "result_digest": "sha256:21c1cc5f3e3a45c38c08e5344473a31dbefe75ca71b9f17b3fdfb93cc1dffa37",
+      "run_digest": "sha256:0b0845f81d8baed9bfe0204dd574d7bc1f30acb8d13c166be4b72a1769ee2a47",
+      "signatures": [
+        {
+          "key_id": "SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w",
+          "sig": "kvUc7+2+be680QPQj7Y8NX8PzOzSP8qsp81kJ7vmluS9WvWhAcC0py2VJJcUkT4EMLvcuv3bj1zGnIJ+ZWMlBQ=="
+        }
+      ]
+    },
+    {
+      "name": "simulated",
+      "record_digest": "sha256:6976c25743356b8abb536154cf05255e6fd45d23149c9ab26ecfe9a5cc5bc845",
+      "result_digest": "sha256:73ae3320b53a059af6f486d687b044e456c776e83a489b60f878d0d933862f69",
+      "run_digest": "sha256:b519820160193ebfe71e828df52bc65c551bf7d12ef1baf7d564fa4403576f45",
+      "signatures": [
+        {
+          "key_id": "SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w",
+          "sig": "9eEAYZHiVuDYZoFAA4XhUxImhcuPHX8jjWQ5vJQmN64Yk6PfqKNqKZHaAa2ooz2ahhx7HH5OELs3SC2dHfaxAw=="
+        }
+      ]
+    },
+    {
+      "name": "local",
+      "record_digest": "sha256:0a78ce2d1053bc69ab2afa9aecd67c96ac359c9fef59e3d7c7dae55ed55e7477",
+      "result_digest": "sha256:b630053d5ea03f1b462cacd8ef0e94d48ab050aeddd2846852ba03eb3e5bb9a1",
+      "run_digest": "sha256:35576b32c45b127322b291cea890f408820ef86e96f6391b3160379727fcc5bc",
+      "signatures": [
+        {
+          "key_id": "SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w",
+          "sig": "LQcJk3aVYOeohXIgkYg3+vhhpiAk9PtMLvdRgxWE37ZVIPIpJ5+FNbOIfk+/ht3iZczSXhJaY/hW/zRbX6RvDg=="
+        }
+      ]
+    },
+    {
+      "name": "quorum-member",
+      "record_digest": "sha256:5f397ca894141adaef663e4309dd009ca283df6bc4b00ad5d1c090c8f5bb0fc1",
+      "result_digest": "sha256:54eb2b187896e37f8e09f2a0ce16b04cd5cff00581811f60574e5fc1f694a295",
+      "run_digest": "sha256:d248cf05260ef51ead9fc1838fbc802f0d9b093ad21b5b7ecf72dca7141b220b",
+      "signatures": [
+        {
+          "key_id": "SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w",
+          "sig": "A4B3DPZ0HenGYghYSJw4WmNn9C6HaWqjQohYC3BrTNjnIoDtNErsw+knIb3VWtcxVb6BgkAv4f5+Y7q9jMO2BQ=="
+        }
+      ]
+    }
+  ],
+  "comment": "Golden attestation vectors, v1. Generated with:\n  GITIUP_UPDATE_FIXTURES=1 cargo run -p gitiup-attest --example make_fixtures\nmanifest.json and doc.json are canonical bytes (no trailing newline); this index is pretty-printed for humans and is not signed.",
+  "signing_key": {
+    "comment": "Derived from the public TEST_SEED in gitiup-attest::sample; no private key material is committed, and no production trust policy may trust this key.",
+    "key_id": "SHA256:nlTU572wrqEfZGpFZmv3xmlgh82RqlvoDhNfxWFbS/w",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdsIckgW08AT6JAIpQlCL53Vku/sjLOx+SMwZZgIMf+"
+  }
+}

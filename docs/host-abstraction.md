@@ -110,6 +110,14 @@ this crate overwrites or deletes an object, and the `fs` host verifies a blob
 re-hashes to its name on read. Retention and tombstoning are host policy and
 belong to the attestation ticket (giti-1rs.5), not to this trait.
 
+For signed records the bytes are not chosen by the host: [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md)
+decides that `kv/attestation/<hex>` holds the *canonical* encoding of an
+attestation document, and that the hex is SHA-256 of exactly those bytes. A host
+that re-serializes a record on the way to storage — pretty-printing it, reordering
+keys, adding a trailing newline — has silently broken the signature, so hosts store
+and return blobs verbatim and `gitiup-attest` refuses bytes that are not canonical
+(`gitiup verify attestation` exits 8).
+
 ## The bucket-as-forge host (`s3`)
 
 `S3Host` makes a plain bucket — S3, MinIO, anything that speaks the S3 API — the
