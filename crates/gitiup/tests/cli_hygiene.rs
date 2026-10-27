@@ -19,10 +19,13 @@ use std::path::PathBuf;
 /// What the binary may depend on directly.
 // `gitiup-run` is the planning and tier-choosing crate behind `gitiup run`; it is
 // itself kept network-free by its own `tests/no_side_effects.rs`.
-const ALLOWED_DEPENDENCIES: [&str; 4] = [
+const ALLOWED_DEPENDENCIES: [&str; 5] = [
     "gitiup-attest",
     "gitiup-normalise",
     "gitiup-run",
+    // `gitiup doctor --sandbox` asks it what this machine can confine; it produces no
+    // digest and reads no report, so it cannot disagree with the format crate.
+    "gitiup-sandbox",
     "serde_json",
 ];
 

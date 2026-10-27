@@ -7,7 +7,8 @@
 //!   secret is read, nothing is written. What you get is the plan and the digest of
 //!   the plan, and the attestation says `tier: simulated`.
 //! * **`--execute` is the opt-in** to running for real, and it needs a sandbox this
-//!   machine actually provides (`--sandbox unshare`, the default). That is what earns
+//!   machine actually provides (`--sandbox <name>`; see `--sandboxes`, and
+//!   `gitiup doctor --sandbox` when one of them does not work). That is what earns
 //!   `tier: local`.
 //! * **`quorum` is not a flag.** There is no spelling of this command that produces
 //!   one, and the format refuses a single-run attestation that claims it
@@ -62,7 +63,8 @@ OPTIONS:
         --replay-from <f>   reuse the step outputs of a prior run report (simulated
                             runs only)
         --execute           really run it, inside --sandbox, and attest as `local`
-        --sandbox <name>    sandbox for --execute (default: unshare). `none` is
+        --sandbox <name>    sandbox for --execute; if exactly one works here it is
+                            used and named, otherwise this is required. `none` is
                             refused: an unconfined run earns no tier
         --sandboxes         list the sandboxes this build offers, then exit
         --workdir <path>    directory to run in (default: the current one)
@@ -251,7 +253,7 @@ impl Outcome {
         vec![
             format!("WARNING: {warning}"),
             "WARNING: do not merge, publish, or release on the strength of a simulated attestation.".to_string(),
-            "WARNING: to run it for real: gitiup run --execute --sandbox unshare (that is what attests as `local`; `quorum` is a verdict of independent verifiers, never of one run).".to_string(),
+            "WARNING: to run it for real: gitiup run --execute --sandbox <name>              (that is what attests as `local`; `quorum` is a verdict of independent              verifiers, never of one run). `--sandboxes` lists what this machine offers;              `gitiup doctor --sandbox` says why one of them does not work.".to_string(),
         ]
     }
 
@@ -365,7 +367,15 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                     .map(|backend| backend.name)
                     .collect();
                 match available.as_slice() {
-                    [] => "unshare".to_string(),
+                    // The ticket's other half: with nothing holding, nothing runs. A
+                    // default of "just pick one anyway" would be the unconfined
+                    // execution this command exists to refuse.
+                    [] => {
+                        return Err(CliError::refused(
+                            "no sandbox on this machine holds, so there is nothing to run the step in",
+                            "run `gitiup doctor --sandbox` to see which rung failed and what to                              install or set; until then `gitiup run` plans and attests as                              `simulated`, which is the safe default",
+                        ));
+                    }
                     [only] => {
                         println!(
                             "sandbox        {only} (the only one this machine offers; name it with --sandbox to be explicit)"

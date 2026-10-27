@@ -18,13 +18,17 @@ rust-version.workspace = true
 #   `tests/no_side_effects.rs` fails the build if they start.
 # * **A tier is earned.** The `local` tier requires a sandbox that was probed and
 #   found, because an attestation saying "this really ran" is only worth the
-#   confinement claim next to it. `sandbox` is the seam giti-bgy.1 fills in;
-#   nothing here invents a backend it has not verified.
+#   confinement claim next to it. The ladder (container, bubblewrap, Landlock,
+#   `unshare`, opt-in plain) lives in `gitiup-sandbox` and is probed on this machine
+#   before a step runs; `sandbox` is the seam that turns a name into a confined
+#   command. Nothing here invents a backend it has not verified.
 #
-# Dependencies: the format crate, and the normaliser the executed logs are run
-# through. No argument parser, no YAML library, no HTTP: a workflow file is read
-# by `yaml`, a deliberately small subset reader that refuses what it cannot parse
-# rather than guessing (see its module docs).
+# Dependencies: the format crate, the normaliser the executed logs are run through,
+# and the sandbox ladder that decides whether a step may run at all. No argument
+# parser, no YAML library, no HTTP: a workflow file is read by `yaml`, a deliberately
+# small subset reader that refuses what it cannot parse rather than guessing (see its
+# module docs). `gitiup-sandbox` opens no socket to the world — the proxy it may start
+# listens on loopback, and only when a job asked for egress.
 
 [dependencies]
 gitiup-attest = { path = "../gitiup-attest" }
@@ -34,6 +38,11 @@ gitiup-attest = { path = "../gitiup-attest" }
 # nothing machine-specific — but one crate carrying both paths means one set of
 # rules.
 gitiup-normalise = { path = "../gitiup-normalise" }
+# The isolation ladder: which backend this machine actually provides, and the confined
+# command a step runs as. `gitiup run --execute` is the only way to reach it, and it
+# is reached *before* anything is spawned, so "no sandbox" is a refusal rather than a
+# step that ran unconfined.
+gitiup-sandbox = { path = "../gitiup-sandbox" }
 
 [dev-dependencies]
 # Test-only: the fixtures in `tests/` hand over run reports as JSON, the same shape

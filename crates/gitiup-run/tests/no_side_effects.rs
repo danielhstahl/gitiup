@@ -55,7 +55,15 @@ const FORBIDDEN: &[&str] = &[
 
 /// What the crate may depend on: the format, and the normaliser executed logs go
 /// through. Anything else has to be argued for in review, not added quietly.
-const ALLOWED_DEPENDENCIES: &[&str] = &["gitiup-attest", "gitiup-normalise"];
+const ALLOWED_DEPENDENCIES: &[&str] = &[
+    "gitiup-attest",
+    "gitiup-normalise",
+    // The isolation ladder behind `--execute`. It is on the execution side of the
+    // module boundary below, so the simulated path still cannot reach it; it opens no
+    // socket to the world (its egress proxy is loopback-only and only exists when a
+    // job asked for egress) and it computes no digests.
+    "gitiup-sandbox",
+];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

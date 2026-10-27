@@ -98,7 +98,7 @@ use gitiup_attest::{Error, Result, RunManifest, Tier};
 
 pub use exec::{Execution, execute};
 pub use plan::{MAX_MATRIX_ARMS, Plan, PlannedJob, PlannedStep, Selector};
-pub use sandbox::{Backend, NOT_IMPLEMENTED, Sandbox, detect, implemented, open};
+pub use sandbox::{Backend, Sandbox, best, detect, implemented, open, require_one, spec_for};
 pub use simulate::{
     Replay, SIMULATED_PROVIDER, Simulation, report as simulate_report, result_digest,
 };

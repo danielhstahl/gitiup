@@ -26,6 +26,10 @@ gitiup-attest = { path = "../gitiup-attest" }
 # sandbox seam all live there, so the CLI is a front end and not a second
 # implementation of "what did this run do".
 gitiup-run = { path = "../gitiup-run" }
+# `gitiup doctor --sandbox`, and the gate behind `run --execute`: which isolation
+# this machine actually provides. Not a second opinion about digests — this crate
+# never touches a run report; it answers "may anything be executed here".
+gitiup-sandbox = { path = "../gitiup-sandbox" }
 # Not a second opinion about the digest: `gitiup-normalise` *is* the digest
 # computation for any run whose `normalisation_version` is 1, so a CLI that left it
 # out would be re-implementing the rules instead of calling them.

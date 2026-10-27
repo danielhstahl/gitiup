@@ -945,6 +945,7 @@ dependencies = [
  "gitiup-attest",
  "gitiup-normalise",
  "gitiup-run",
+ "gitiup-sandbox",
  "serde_json",
  "tempfile",
 ]
@@ -1001,7 +1002,19 @@ version = "0.1.0"
 dependencies = [
  "gitiup-attest",
  "gitiup-normalise",
+ "gitiup-sandbox",
  "serde_json",
+]
+
+[[package]]
+name = "gitiup-sandbox"
+version = "0.1.0"
+dependencies = [
+ "gitiup-attest",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

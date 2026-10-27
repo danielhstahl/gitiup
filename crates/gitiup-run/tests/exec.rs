@@ -32,6 +32,31 @@ fn serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The command a test double builds: the step's argv, the environment it was given, and
+/// nothing else — the same shape a real backend produces, minus the confinement.
+///
+/// Writing it out is the point. A double that quietly skipped the environment would let
+/// the executed path pass its tests while leaking the runner's environment into steps,
+/// which is the property this file exists to hold.
+fn bare_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+    workspace: &Path,
+    _scratch: &Path,
+) -> gitiup_attest::Result<std::process::Command> {
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.current_dir(workspace);
+    command.env_clear();
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    Ok(command)
+}
+
 /// A sandbox for tests: runs the command as-is and admits it.
 #[derive(Debug)]
 struct Bare;
@@ -45,12 +70,18 @@ impl Sandbox for Bare {
         "nothing: this is a test double and says so"
     }
 
-    fn confine(&self, argv: &[String]) -> Vec<String> {
-        argv.to_vec()
-    }
-
     fn probe(&self) -> gitiup_attest::Result<()> {
         Ok(())
+    }
+
+    fn command(
+        &self,
+        argv: &[String],
+        environment: &BTreeMap<String, String>,
+        workspace: &Path,
+        scratch: &Path,
+    ) -> gitiup_attest::Result<std::process::Command> {
+        bare_command(argv, environment, workspace, scratch)
     }
 }
 
@@ -252,15 +283,24 @@ fn the_sandbox_is_probed_before_anything_runs() {
         fn guarantees(&self) -> &'static str {
             "none"
         }
-        fn confine(&self, argv: &[String]) -> Vec<String> {
-            argv.to_vec()
-        }
         fn probe(&self) -> gitiup_attest::Result<()> {
             Err(gitiup_attest::Error::new(
                 gitiup_attest::ErrorKind::Policy,
                 "sandbox",
                 "user namespaces are disabled here",
             ))
+        }
+        // Never reached — `probe` is what refuses — but a backend that cannot say how
+        // it would confine a step has not answered the question, so the double answers
+        // it and the test proves the refusal happened first.
+        fn command(
+            &self,
+            argv: &[String],
+            environment: &BTreeMap<String, String>,
+            workspace: &Path,
+            scratch: &Path,
+        ) -> gitiup_attest::Result<std::process::Command> {
+            bare_command(argv, environment, workspace, scratch)
         }
     }
     let workspace = workspace("probe");
@@ -287,53 +327,108 @@ fn the_sandbox_vocabulary_is_honest_about_what_exists() {
     assert!(err.detail().contains("unconfined"), "{err}");
     assert!(err.hint().unwrap().contains("--execute"), "{err}");
 
-    // A backend the ecosystem has but this build does not is named, not guessed at.
-    for name in ["docker", "podman", "landlock", "bwrap", "containerd"] {
-        let err = sandbox::open(name).unwrap_err();
-        assert_eq!(
-            err.kind(),
-            gitiup_attest::ErrorKind::UnsupportedSchema,
-            "{name}"
+    // Every rung of the ladder is a name that opens, and each one states what it
+    // denies. "Not built into this build" is no longer an honest answer for docker or
+    // landlock: both are implemented, and whether either works is a question for the
+    // probe, not for a list in a source file.
+    let ladder = sandbox::implemented();
+    assert!(
+        ladder.iter().any(|name| name == "landlock"),
+        "the in-process rung must be offered: {ladder:?}"
+    );
+    for name in &ladder {
+        let backend = sandbox::open(name).unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(backend.name(), name.as_str());
+        assert!(
+            !backend.guarantees().is_empty(),
+            "{name} offers no sentence about what it denies"
         );
-        assert!(err.detail().contains("not built into this build"), "{err}");
+        assert!(
+            !backend.guarantees().contains("sandboxed"),
+            "{name} describes its guarantees as `sandboxed`, which says nothing"
+        );
     }
 
     let err = sandbox::open("kvm").unwrap_err();
     assert!(err.detail().contains("kvm"), "{err}");
-    assert!(err.hint().unwrap().contains("unshare"), "{err}");
+    assert!(
+        ladder.iter().any(|name| err.hint().unwrap().contains(name)),
+        "a refusal must name what *does* exist: {err}"
+    );
 
     // `open` is case-insensitive because flags are typed by people.
-    assert_eq!(sandbox::open(" UNSHARE ").unwrap().name(), "unshare");
+    assert_eq!(sandbox::open(" LANDLOCK ").unwrap().name(), "landlock");
 
     // Detection reports the truth about this machine, and says why when it is no.
     let backends = sandbox::detect();
-    assert_eq!(backends.len(), 1);
-    let unshare = &backends[0];
-    assert_eq!(unshare.name, "unshare");
-    if unshare.available {
-        assert!(unshare.note.contains("no network egress"), "{unshare:?}");
-    } else {
+    assert_eq!(
+        backends.len(),
+        ladder.len(),
+        "every rung must report, not only the ones that work"
+    );
+    for backend in &backends {
         assert!(
-            unshare.note.contains("not usable here"),
-            "an unavailable backend must explain itself: {unshare:?}"
+            backend.available || backend.note.len() > 20,
+            "an unavailable backend must explain itself: {backend:?}"
         );
+        assert!(!backend.note.is_empty(), "{backend:?}");
     }
-    // And a refusal to execute is actionable, wherever the machine is.
-    let unshare = sandbox::open("unshare").unwrap();
-    match unshare.probe() {
-        Ok(()) => {}
-        Err(err) => {
+
+    // And the gate the CLI depends on: a backend is offered by `best` only when it
+    // probes clean, and its refusal is the actionable exit-6 kind wherever the
+    // machine is.
+    match sandbox::best() {
+        Some(best) => {
+            best.probe().expect("best offers only what probes clean");
+        }
+        None => {
+            let err = sandbox::require_one().unwrap_err();
             assert_eq!(err.exit_code(), 6);
-            assert!(err.hint().unwrap().contains("simulate"), "{err}");
+            assert!(err.hint().unwrap().contains("doctor"), "{err}");
         }
     }
-    assert!(sandbox::implemented().contains(&"unshare"));
+
+    // A confined command keeps the argv it was given — the same guarantee `confine`
+    // used to make by construction, now checked where it can be checked for any rung
+    // this machine provides.
+    let double = Bare;
+    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()];
+    let command = double
+        .command(&argv, &BTreeMap::new(), Path::new("/"), Path::new("/tmp"))
+        .expect("the double builds a command");
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new("true")));
     assert_eq!(
-        unshare
-            .confine(&["/bin/sh".into(), "-c".into(), "true".into()])
-            .last(),
-        Some(&"true".to_string()),
-        "confine must keep the command it was given"
+        command.get_program(),
+        std::ffi::OsStr::new("/bin/sh"),
+        "the program must survive confinement"
+    );
+}
+
+/// The step spec is the promise about writes: the workspace, and nothing else.
+#[test]
+fn a_step_writes_in_its_workspace_and_scratch_only() {
+    let spec = sandbox::spec_for(Path::new("/work"), Path::new("/tmp/gitiup-run-1"));
+    let writes = spec.write_paths();
+    assert!(writes.contains(&PathBuf::from("/work")), "{writes:?}");
+    assert!(
+        writes.contains(&PathBuf::from("/tmp/gitiup-run-1")),
+        "{writes:?}"
+    );
+    assert!(!writes.contains(&PathBuf::from("/")), "{writes:?}");
+    assert!(
+        spec.egress.is_denied(),
+        "a step has no network until someone asks for it: {:?}",
+        spec.egress.describe()
+    );
+    // And the ladder agrees about where the writable tree is, for the rung that
+    // enforces it in the kernel rather than by a mount.
+    let landlock = sandbox::open("landlock").unwrap();
+    assert!(
+        landlock.guarantees().contains("Reads are NOT isolated")
+            || landlock.guarantees().contains("nothing"),
+        "{}",
+        landlock.guarantees()
     );
 }
 

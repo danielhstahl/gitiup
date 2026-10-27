@@ -94,21 +94,27 @@ offers"); if several work, the run is refused until `--sandbox` says which confi
 the attestation is claiming. Vagueness about confinement is the thing being avoided, not
 typing.
 
-A sandbox is opened and **probed** before any step runs. `unshare` (user + network
-namespaces, no egress) is the backend this build implements; `docker`, `podman`,
-`containerd`, `bwrap` and `landlock` are named as known-but-not-built-here rather than
-quietly emulated, and an unavailable backend explains itself and offers simulation:
+A sandbox is opened and **probed** before any step runs, and every rung of the ladder
+is a real implementation rather than a name: `docker`/`podman`, `bwrap`, Landlock plus
+seccomp applied in the child, `unshare(1)`, and — opt-in, and shouted about — `plain`,
+which isolates nothing. An unavailable backend explains itself and offers simulation,
+and `gitiup doctor --sandbox` reports the whole ladder with a fix per line. See
+[the sandbox](sandbox.md) for what each rung denies and what it does not.
 
 ```console
 $ gitiup run --execute
-gitiup: sandbox: the `unshare` sandbox is not usable here: unshare: unshare failed: Operation not permitted
-hint: user namespaces may be disabled (try `sysctl kernel.unprivileged_userns_clone`);
-      until a sandbox works, gitiup run will only simulate — which is the safe default
+gitiup: sandbox: the `landlock` sandbox is not usable here: fs-write-outside failed — a confined write to /tmp/… succeeded
+hint: until a sandbox holds up, gitiup run will only simulate — which is the safe
+      default, and gitiup doctor --sandbox says what to change about this machine
 $ gitiup run --execute --sandbox none
 gitiup: sandbox: `--sandbox none` asks for an unconfined execution
 hint: an unconfined run may not attest as `local`: pick a backend, or drop --execute and
       get a simulated attestation instead
 ```
+
+A `local` report is refused in the first place if the rung it would name enforces
+nothing: `--sandbox plain` needs `GITIUP_UNSANDBOXED=1` to be set at all, and even then
+it may never serve a job whose result is offered to someone else.
 
 ## What `--execute` refuses outright
 

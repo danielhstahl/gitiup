@@ -9,6 +9,8 @@
 //! ```text
 //! gitiup run [OPTIONS] [JOB]            plan a workflow job (nothing is run)
 //! gitiup run --execute --sandbox <name> run it for real, and attest as `local`
+//! gitiup doctor --sandbox               what this machine can confine, and whether it
+//!                                      may serve a stranger's job at all
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup help                           this text
@@ -32,6 +34,7 @@
 use std::process::ExitCode;
 
 mod digest;
+mod doctor;
 mod normalise;
 mod run;
 
@@ -44,6 +47,7 @@ USAGE:
 
 COMMANDS:
     run [OPTIONS] [JOB]            plan a workflow job; --execute to run it
+    doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     help                        print this text
@@ -62,6 +66,7 @@ default accepts `local` only. There is no way to ask for `quorum`: a single run
 cannot earn it.
 
 Try:
+    gitiup doctor --sandbox                  # what confines a job here, if anything
     gitiup run                                 # plan the only job in the workflow
     gitiup run --execute --sandbox unshare     # run it for real: tier `local`
     gitiup digest run.json
@@ -166,6 +171,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         "run" => run::run(&args[1..]),
+        "doctor" => doctor::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),

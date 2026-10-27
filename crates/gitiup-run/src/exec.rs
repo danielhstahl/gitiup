@@ -27,7 +27,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use gitiup_attest::run::{
@@ -206,20 +205,20 @@ pub fn execute(
         let outputs_path = scratch.join(format!("outputs-{}", step.index));
         let environment = step_environment(execution, sandbox, job, step, &outputs_path)?;
         let argv = shell_command(script, step, &scratch)?;
-        let confined = sandbox.confine(&argv);
         let started = Instant::now();
         let started_us = TimeUs::now().0;
-        let output = spawn(&confined, &environment, &execution.workspace).map_err(|why| {
-            Error::new(
-                ErrorKind::Invalid,
-                "exec",
-                format!(
-                    "step {} '{}' could not be run: {why}",
-                    step.index, step.name
-                ),
-            )
-            .with_hint("the first argument is the program to run; check the sandbox backend")
-        })?;
+        let output = confine_and_run(sandbox, &argv, &environment, &execution.workspace, &scratch)
+            .map_err(|why| {
+                Error::new(
+                    ErrorKind::Invalid,
+                    "exec",
+                    format!(
+                        "step {} '{}' could not be run: {why}",
+                        step.index, step.name
+                    ),
+                )
+                .with_hint("the first argument is the program to run; check the sandbox backend")
+            })?;
         let duration_us = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
         let exit_code = output.status.code().unwrap_or(-1) as i64;
         let stdout = clamp(captee(&output.stdout));
@@ -354,26 +353,22 @@ fn clamp(mut captured: Captured) -> Captured {
     captured
 }
 
-/// Spawn `argv` with `environment` in `workspace`, capturing both streams.
-fn spawn(
+/// Build the confined command and run it.
+///
+/// Two failures end up as one message — the confinement refusing to arm, and the
+/// confined process refusing to start — because from the step's point of view they are
+/// the same event (it did not run) and the reason is in the text either way.
+fn confine_and_run(
+    sandbox: &dyn Sandbox,
     argv: &[String],
     environment: &BTreeMap<String, String>,
     workspace: &Path,
-) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]);
-    command.current_dir(workspace);
-    // The whole point: nothing is inherited. A runner that forwards the parent's
-    // environment forwards whatever tokens happen to be exported in the shell that
-    // started it, and then attests a run nobody can reproduce.
-    command.env_clear();
-    for (key, value) in environment {
-        command.env(key, value);
-    }
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    command.output()
+    scratch: &Path,
+) -> gitiup_attest::Result<std::process::Output> {
+    let mut command = sandbox.command(argv, environment, workspace, scratch)?;
+    command
+        .output()
+        .map_err(|why| Error::new(ErrorKind::Invalid, "exec", why.to_string()))
 }
 
 /// The step's environment, built from nothing.

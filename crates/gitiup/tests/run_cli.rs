@@ -256,18 +256,34 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
         err_text(&output)
     );
 
-    // A backend the ecosystem has and this build does not is named, not faked.
+    // A backend that is implemented but that this machine cannot do is refused with
+    // the reason and the fix, not with a silent fallback to whatever else works. This
+    // is the case that used to say "not built into this build" and now says what is
+    // actually missing — the wording changed when the container runtimes were wired
+    // up, and the assertion follows the wording on purpose: if this machine *does*
+    // have docker, the run happens, and that too is a correct answer.
     let output = gitiup(
         dir.path(),
         &["run", "--execute", "--sandbox", "docker"],
         &[],
     );
-    assert_eq!(code(&output), 6);
-    assert!(
-        err_text(&output).contains("not built into this build"),
-        "{}",
-        err_text(&output)
-    );
+    match code(&output) {
+        0 => assert!(
+            out_text(&output).contains("ran job build"),
+            "{}",
+            out_text(&output)
+        ),
+        6 => {
+            let both = format!("{}{}", out_text(&output), err_text(&output));
+            assert!(
+                both.contains("docker")
+                    && (both.contains("not usable here") || both.contains("binary")),
+                "the refusal must say which backend and why: {both}"
+            );
+            assert!(both.contains("doctor"), "and where to read more: {both}");
+        }
+        other => panic!("unexpected exit {other}: {}", out_text(&output)),
+    }
 
     // A backend nobody heard of, ditto.
     let output = gitiup(dir.path(), &["run", "--execute", "--sandbox", "kvm"], &[]);

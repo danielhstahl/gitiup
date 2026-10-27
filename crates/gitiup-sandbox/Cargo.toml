@@ -1,0 +1,51 @@
+[package]
+name = "gitiup-sandbox"
+description = "The sandbox floor: container-first backends, default-deny egress through a local allowlist proxy, and a probe that says what this kernel really enforces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# giti-bgy.1: the security floor of the whole federation. A volunteer executes a
+# stranger's CI steps, so the question "what confined it?" has to be answered by a
+# probe and not by a config file. Three rules shape the crate:
+#
+# * **A confinement claim is observed, never assumed.** Every backend has a `probe`
+#   that asks the *kernel and the host* whether the isolation is really there, and
+#   records which properties it actually watched being denied. A backend that cannot
+#   say what it checked says so instead of claiming it works.
+# * **Isolation is a ladder, and each rung says how far it reaches.** Containers
+#   first (docker, podman), then bubblewrap, then Landlock + seccomp in-process, then
+#   `unshare`; a plain process is last, is opt-in only, prints a bright UNSANDBOXED
+#   warning, and is refused outright for quorum work.
+# * **Egress is default-deny.** A job gets no network unless it names what it needs;
+#   what it names goes through a local allowlist proxy (package registries and the
+#   repository store) with a per-job DNS policy and an audit log of every decision.
+#
+# Dependencies are deliberately microscopic: the format crate (for `Error`/`Result`,
+# so a refusal carries the same exit code everywhere) and `libc` for the syscalls.
+# No command-line parser, no async runtime, no container library — a backend is an
+# argv prefix and a set of `pre_exec` hooks, which is what keeps it auditable.
+
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+# Only for `gitiup doctor --sandbox --json`: the report is a value, and a script
+# reading it should not have to parse a text table.
+serde_json = "1"
+
+# The escape canary: a tiny program that *tries* to escape (write outside the
+# sandbox, connect out, ptrace a parent, exceed the pid limit) and reports whether
+# it got away with it. The probes and `tests/escape.rs` run it confined; any host
+# binary can embed the same logic through [`canary::dispatch`].
+[[bin]]
+name = "gitiup-sandbox-canary"
+path = "src/bin/canary.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

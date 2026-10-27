@@ -21,6 +21,7 @@ Two goals, one tool:
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
+| `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
 | `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, per-seat attestation storage and the verdict (`verified` / `failed` / `insufficient`) — ADR-0002 as code, and nothing else |
 
 The workspace globs `crates/*`, so a new crate is just `members`-free.
@@ -35,6 +36,11 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   what a key has to cost to get in. The selection algorithm there has a byte-for-byte
   reference implementation and golden vectors in
   [`docs/adr/fixtures/selection-v1/`](docs/adr/fixtures/selection-v1/).
+* [The sandbox](docs/sandbox.md) — what `provenance.sandbox` is allowed to claim, the
+  ladder (`docker`/`podman` → `bwrap` → Landlock → `unshare` → opt-in `plain`), what each
+  rung denies and what it does not, how egress is refused by default, and what the escape
+  suite actually checks. `gitiup doctor --sandbox` says which of it is true on your
+  machine.
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy file may insist on.
