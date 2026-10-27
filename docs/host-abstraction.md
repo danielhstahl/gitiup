@@ -393,8 +393,9 @@ API host the remote names, and a redacted `Secret` everywhere it might be printe
 
 Testing: the mock forge in `src/testing.rs` implements the *semantics* of the
 endpoints (create-only refusal, fast-forward refusal, `Link` pagination, primary and
-secondary rate limits), the shared suite in `gitiup_host::conformance` runs against it
-and against recorded HTTP in `tests/fixtures/`, and `tests/live_forge.rs` asks the
+secondary rate limits), the shared conformance suite in
+[`gitiup-host-tests`](../crates/gitiup-host-tests/README.md) runs against it (plus
+recorded HTTP in `tests/fixtures/`), and `tests/live_forge.rs` asks the
 real forge — read-only, `#[ignore]`d, and the only thing that can catch a shape the
 mock and the code agree on but the forge does not.
 
@@ -461,10 +462,15 @@ errors so typos surface instead of silently disabling a safety setting
    `RemoteConfig`; never overwrite an existing object.
 4. Implement `fetch_pack`/`put_pack` (or answer `UnsupportedCas` for formats you
    cannot serve) and honour `have` so clients do not re-download.
-5. Re-run the `tests/host_fs.rs` bodies against your host (they take `&dyn Host`
-   precisely so they can be lifted into the giti-xdw.5 conformance suite), plus
-   the two adversarial ones: concurrent create-only CAS writes, and a batch whose
-   last update conflicts.
+5. Register the host with the conformance suite:
+   [`gitiup-host-tests`](../crates/gitiup-host-tests/README.md) holds the bodies
+   every host owes — empty store, CAS conflict, pack round-trip, huge pack, paged
+   listings, ref deletion, refused credentials, unsupported operations, the
+   `cas = false` degradation — and one `test_host!` line runs all of them against
+   your host. Anything that genuinely does not apply has to be *said* in the
+   registration, and a body neither run nor explained fails `tests/coverage.rs`.
+   The host is not finished when it passes on your machine: it is finished when CI
+   runs it against the backend you claim to be (`.github/workflows/host-conformance.yml`).
 6. Keep the crate forge-free: `cargo test -p gitiup-host --test no_forge_deps`, and
    `cargo test -p gitiup --test no_forge_calls` for the CLI side. An adapter for an
    actual forge is its own crate, reached only through these traits, and it is

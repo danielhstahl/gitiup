@@ -220,8 +220,11 @@ cargo test -p gitiup-host --features s3          # same, with the AWS transport 
 ```
 
 `tests/host_fs.rs`, `tests/host_s3.rs` and `tests/host_git.rs` drive the traits
-through `&dyn Host` (shared bodies in `tests/support/`), so the same bodies are
-the starting point for the conformance suite (giti-xdw.5). `tests/host_s3.rs`
+through `&dyn Host` (shared bodies in `tests/support/`). Those are this crate's
+own tests; the cross-host contract — the thing that has to be the same for every
+host, forge included — is in [`gitiup-host-tests`](../gitiup-host-tests/README.md),
+which runs one set of bodies against every host in the workspace (and in CI,
+against a real MinIO and a real `git-http-backend`). `tests/host_s3.rs`
 covers the bucket promises on `MemoryBucket`: conditional writes on the wire, 412
 retry with backoff, two clones converging, tombstones instead of deletes, the
 degraded `cas = false` path, multipart packs and the ref cache.

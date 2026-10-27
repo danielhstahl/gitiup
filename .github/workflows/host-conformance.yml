@@ -1,0 +1,182 @@
+name: host-conformance
+
+# The one job that answers "do all the hosts still mean the same thing?".
+#
+# Every host in the workspace is run through `gitiup-host-tests`' shared suite —
+# the reference `fs` host, a bare repository over `file://`, a bare repository
+# served by `git-http-backend`, the in-memory bucket, a live MinIO, and the github
+# adapter against its mock forge. The services are real (MinIO, a real
+# `git-http-backend` CGI) because the drift this job exists to catch is exactly the
+# kind a fake agrees with your code about.
+#
+# Two things make this job worth running rather than just green:
+#
+# * `GITIUP_CONFORMANCE_REQUIRE_HOSTS` names the hosts that must be up. A service
+#   that failed to start fails the job instead of skipping quietly.
+# * a final step runs the suite with *revoked* credentials and requires a denial,
+#   which is the only way to test an expired credential against a real endpoint.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly: drift is a property of the whole set of hosts, and a host can drift
+    # because the *service* upgraded under it.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the linker under control on the smallest runners: `aws-sdk-s3` links are
+  # big and linking several test binaries at once gets them OOM-killed.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  conformance:
+    name: Every host, one contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      minio:
+        # A bucket that changes what `If-Match` means is changing the host contract,
+        # and this job is where that must surface as a failure on a branch rather
+        # than as a lost conditional write in production — so pin this once it has
+        # been resolved once (`docker images --digests minio/minio`) and bump it
+        # deliberately, with a note. Left moving until then, because a pin that was
+        # never verified against a registry is a guess with a date on it.
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: gitiup-conformance
+          MINIO_ROOT_PASSWORD: gitiup-conformance-secret
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        # The container's own storage is fine: the job is disposable, and the suite
+        # creates the bucket (with versioning, which it refuses to run without).
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: conformance-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/gitiup-host-tests/**') }}
+
+      - name: Static checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy -p gitiup-host-tests --features s3,github --all-targets -j 3
+
+      # The same repositories the suite would serve itself, but served the way an
+      # operator serves them: `git-http-backend` behind a CGI, rooted at a
+      # directory, with anonymous pushes enabled per repository (which the suite's
+      # own fixtures do too). Testing the deployment shape is the point of naming
+      # this a service.
+      - name: Serve bare repositories over git-http-backend
+        env:
+          GIT_PROJECT_ROOT: ${{ github.workspace }}/ci-git-root
+          GIT_HTTP_EXPORT_ALL: "1"
+        run: |
+          mkdir -p "$GIT_PROJECT_ROOT"
+          command -v git-http-backend || command -v /usr/lib/git-core/git-http-backend
+          python3 crates/gitiup-host/tests/fixtures/git-http-backend.py 8080 &
+          for _ in $(seq 1 50); do
+            if curl -sf "http://127.0.0.1:8080/" >/dev/null 2>&1 \
+              || curl -s -o /dev/null "http://127.0.0.1:8080/"; then
+              echo "git-http-backend is listening"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "git-http-backend did not come up" >&2
+          exit 1
+
+      - name: Run the suite
+        env:
+          GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080
+          GITIUP_CONFORMANCE_GIT_ROOT: ${{ github.workspace }}/ci-git-root
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          GITIUP_S3_LIVE_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+          # No skipping quietly: if one of these two is not up, that is a failure.
+          GITIUP_CONFORMANCE_REQUIRE_HOSTS: s3-minio,git-http
+          # A bucket that cannot do conditional writes cannot gate a merge, so this
+          # run insists it can: MinIO supports `If-Match`/`If-None-Match`, and if it
+          # ever stops doing so the suite must say so here.
+          GITIUP_CONFORMANCE_REQUIRE_CAS: "1"
+        run: cargo test -p gitiup-host-tests --features s3,github -j 3
+
+      - name: Report the matrix
+        env:
+          GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080
+          GITIUP_CONFORMANCE_GIT_ROOT: ${{ github.workspace }}/ci-git-root
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+        run: cargo run -p gitiup-host-tests --features s3,github --example report -j 3
+
+      # A bucket's LIST answers 1 000 keys at a time and a bucket's multipart
+      # threshold is 8 MiB: those two numbers are where a host's code paths change,
+      # so the default run (which stays quick on a laptop) is raised past both here.
+      - name: Past a bucket's own page and part boundaries
+        env:
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+          GITIUP_CONFORMANCE_LIST_COUNT: 2050
+          GITIUP_CONFORMANCE_PACK_BYTES: 33554432
+        run: |
+          cargo test -p gitiup-host-tests --features s3 -j 3 --test s3_minio -- \
+            listings_are_complete_across_pages a_huge_pack_round_trips_intact
+
+      # The expired-credential run. A real endpoint that validates signatures is
+      # the only thing that can answer this question — a fake like moto accepts any
+      # credentials, which is why the suite *refuses* to pass this body when nothing
+      # refused. Credentials are revoked for the whole step, so the live host's own
+      # bodies stand down (see `hosts::live::denied_mode`) and the refusal is what
+      # gets measured.
+      - name: Refused credentials must come back as a denial
+        env:
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          AWS_ACCESS_KEY_ID: gitiup-revoked-key
+          AWS_SECRET_ACCESS_KEY: gitiup-revoked-secret
+          GITIUP_CONFORMANCE_S3_DENIED: "1"
+        run: |
+          cargo test -p gitiup-host-tests --features s3 -j 3 --test s3_minio -- \
+            refused_credentials_are_denied_not_dropped --nocapture
+
+      # The git side of the same question: an endpoint that refuses the request
+      # rather than answering it. The suite starts this server itself (the fixture
+      # answers 403 to everything), so this step exists to make the *reason*
+      # explicit in the log: this is the expired-token case for smart HTTP.
+      - name: A git endpoint that refuses must come back as a denial
+        run: |
+          cargo test -p gitiup-host-tests --test git -j 3 -- \
+            git_http::refused_credentials_are_denied_not_dropped --nocapture

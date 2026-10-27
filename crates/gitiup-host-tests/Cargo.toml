@@ -1,0 +1,47 @@
+[package]
+name = "gitiup-host-tests"
+description = "The shared host conformance suite: one macro every host instantiates, run against fs, plain-git and S3/MinIO in CI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate is the referee (giti-xdw.5). It holds the one copy of "is this
+# really a gitiup host?" that every host in the workspace is measured against,
+# plus the CI wiring that runs it against real backends: a scratch directory
+# (fs), a bare repository (plain git, over `file://` and over `git-http-backend`),
+# and a MinIO bucket (S3). Its purpose is to make drift loud: a host that quietly
+# diverges from another one fails a named test, not a production merge.
+#
+# The bodies themselves live in `gitiup_host::conformance` (so a host inside
+# `gitiup-host` can run them without a dependency cycle) and in `bodies` here;
+# this crate adds the harness — the `test_host!` macro, the per-host
+# registrations, the accounting that refuses silent skips, and the fixtures that
+# stand up a real git server and talk to a real bucket.
+#
+# Nothing here is linked into a release build: `gitiup` does not depend on it,
+# and `gitiup-host`'s `tests/no_forge_deps.rs` keeps the core forge-free.
+
+[features]
+default = []
+
+# The live S3 transport, so the suite can point at a real MinIO/S3 endpoint.
+# Without it the MinIO registration does not exist and the suite is hermetic.
+s3 = ["gitiup-host/s3", "dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
+
+# The github adapter, so the suite covers the forge-backed host too. Off by
+# default: the adapter is the one crate allowed to talk to a forge, and this
+# crate must not smuggle one into a hermetic build by accident.
+github = ["dep:gitiup-host-github", "gitiup-host-github/testing"]
+
+[dependencies]
+gitiup-host = { path = "../gitiup-host" }
+gitiup-host-github = { path = "../gitiup-host-github", default-features = false, optional = true }
+tempfile = "3"
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+
+[lints]
+workspace = true

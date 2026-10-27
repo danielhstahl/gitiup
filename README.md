@@ -20,6 +20,7 @@ Two goals, one tool:
 | `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), and `gitiup.toml` remote config |
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
+| `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, `cas = false`), run against the `fs`, plain-git, bucket and forge hosts — in CI, against real backends |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
@@ -61,6 +62,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
 * [`gitiup-host-github` README](crates/gitiup-host-github/README.md) — the forge
   adapter: what a pull request and a check run become, what a forge admits it cannot
   promise, and how to build without it.
+* [`gitiup-host-tests` README](crates/gitiup-host-tests/README.md) — the conformance
+  suite: the bodies every host owes, the `test_host!` macro that runs them, how a host
+  says "this one does not apply to me" out loud, and how CI runs the whole matrix
+  against MinIO and a real `git-http-backend`.
 * [`gitiup-normalise` README](crates/gitiup-normalise/README.md) — the normalisation
   profile and its version story.
 * [ADR index](docs/adr/README.md) — where the decisions that several tickets depend on
@@ -103,6 +108,17 @@ The plain-git host drives the `git` binary, so `tests/host_git.rs` and
 `tests/host_git_http.rs` need git installed (they skip themselves when it is
 missing) and the HTTP ones need `python3` for `git-http-backend` and for the
 static server that stands in for "a repo on a web server".
+
+The hosts all get run against one contract instead:
+
+```sh
+cargo test -p gitiup-host-tests --features s3,github   # every hermetic host
+./ci/host-conformance.sh --minio                       # plus a live MinIO bucket
+```
+
+That is what `.github/workflows/host-conformance.yml` does, with a MinIO service
+and a `git-http-backend` service, and it fails rather than skips when a service
+is missing. See [`gitiup-host-tests`](crates/gitiup-host-tests/README.md).
 
 `gitiup run` plans a job by default — no process, no network, no secrets, and an
 attestation that says `tier: simulated` — and only runs the steps when given

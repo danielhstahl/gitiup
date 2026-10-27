@@ -988,6 +988,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitiup-host-tests"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "gitiup-host",
+ "gitiup-host-github",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gitiup-normalise"
 version = "0.1.0"
 dependencies = [
