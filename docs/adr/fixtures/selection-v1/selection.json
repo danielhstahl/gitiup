@@ -1,0 +1,213 @@
+{
+  "candidates": [
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "take",
+      "greedy_reason": "",
+      "key_id": "SHA256:qnSdLjRkUwW5i8BdfNJv9t+FjHwjEJYZeIz2/5uwfKE",
+      "score": "006e1c31d53d1ddeb3f7a9f62da4753a0ab0bc111e4a571f6a64f28b1c6427fa",
+      "selected": true
+    },
+    {
+      "eligible": false,
+      "excluded_by": "arch",
+      "greedy": "ineligible",
+      "greedy_reason": "",
+      "key_id": "SHA256:lEb+KbhVnlmdzMGjjyRJF2RkOJErtQb+QH4FShq12TQ",
+      "score": "1827070d3aa4e9337f69b447af001c35a3220d6f5bd52e1a4d00aa886d27b043",
+      "selected": false
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "take",
+      "greedy_reason": "",
+      "key_id": "SHA256:lQyfJ6tMaK0IF19fl0yqZDnLnxbf5oBdlhDCuzal4sg",
+      "score": "6bf179ee12844d636b2f1d27a5d4032b34b14fd41d5b89adaf131e6e3abc2b57",
+      "selected": true
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "take",
+      "greedy_reason": "",
+      "key_id": "SHA256:fDviWY/xw+ljyMTrq5OOgtIVuYDSqT0Zr/gFsF1irhw",
+      "score": "6e130241117b55668bca73e94d1e4064ede272d6319ff118c7a5a68a4872eccd",
+      "selected": true
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "take",
+      "greedy_reason": "",
+      "key_id": "SHA256:vjIiZn0K9BLE/I3SxLArBXVQ5NuwkeAo7XnQkEJRsLE",
+      "score": "8b7545e6ee725222d39d7a53793e38f9982127d2d1fee48c599bfdb47e131b4c",
+      "selected": true
+    },
+    {
+      "eligible": false,
+      "excluded_by": "arch",
+      "greedy": "ineligible",
+      "greedy_reason": "",
+      "key_id": "SHA256:+fsTNDqXzI4vyo/tA2S9s/06yzoARJVZ3AnObqKIy8Q",
+      "score": "9212e20789d189cbc8798eb0864b64477527ea941358631e247c8f5aea048a22",
+      "selected": false
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "take",
+      "greedy_reason": "",
+      "key_id": "SHA256:ohrBPPiXdDFSuOYAIPJv2PGL73wAbxpPsk3dczthI0I",
+      "score": "c69b16bb212b789ab5974faea21c43e9ac1cad5260998aceaa3af63d4d835cee",
+      "selected": true
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "skip",
+      "greedy_reason": "identity",
+      "key_id": "SHA256:n7k+zsxWgR3O+0XeLsNuD3VIN61Rh5MnDuYjqQmPzzo",
+      "score": "c9e25c4c207095eaeccd7227d0041f20fb61870d10fef2117956adbae7d590b7",
+      "selected": false
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "skip",
+      "greedy_reason": "tier_cap",
+      "key_id": "SHA256:dEJ8eIUIKYL1nlYNKwTpiPQoYshHBW0ZJArWm0VH4qE",
+      "score": "cc31f0064e2e34c327fc8f1e9f92098b9c0e61041d29fc9f44819c1aa3f4f8a4",
+      "selected": false
+    },
+    {
+      "eligible": false,
+      "excluded_by": "excluded",
+      "greedy": "ineligible",
+      "greedy_reason": "",
+      "key_id": "SHA256:MUoi3Fc3CAEOk+2fiWL7OsP5p+yftTuSJevOOUBZqCc",
+      "score": "cd21f3160a618012675e23c77d3168cb5e71e34b3393bf11ab0304c36e6dd0e9",
+      "selected": false
+    },
+    {
+      "eligible": false,
+      "excluded_by": "excluded",
+      "greedy": "ineligible",
+      "greedy_reason": "",
+      "key_id": "SHA256:1ID0EHwkXb45BX+p/BmTKOLxVlicjY9c8B6QL7nAiX0",
+      "score": "de8588ca6514cc56e3d8fe42a1fed0df50fb35a8ef818ac26c90a5ddeff7562b",
+      "selected": false
+    },
+    {
+      "eligible": true,
+      "excluded_by": null,
+      "greedy": "skip",
+      "greedy_reason": "tier_cap",
+      "key_id": "SHA256:2Y++TGau1gfFz73xpVUmOSRG6M/CGVnBzjYnz/jzPQs",
+      "score": "e10e178f63c5f9cd50461db16ab42405a4f4ae791df20337ce0b2408260ff541",
+      "selected": false
+    }
+  ],
+  "eligible": 8,
+  "kind": "selection",
+  "policy_digest": "sha256:97d8d4903559f88cf8fd6ec52f2ceb24abfccdb9c788122c2348d69dc7b8f572",
+  "promotion": {
+    "cases": [
+      {
+        "promoted": {
+          "handle": "e491db84a7fa434c0311fc19b9dae7ad",
+          "identity": "SHA256:aLc8IzGuv0J5eRkWHCJ1WYAUB5qFCRHHTTkoRELmCVo",
+          "key_id": "SHA256:dEJ8eIUIKYL1nlYNKwTpiPQoYshHBW0ZJArWm0VH4qE",
+          "rank": 5,
+          "slot": "c220a767ade82788ff5d0f8b494783597af44d7c161f8f3049eccb181d547306",
+          "tier": "anonymous"
+        },
+        "selected_after": 5,
+        "sufficient": true,
+        "voided": [
+          "SHA256:lQyfJ6tMaK0IF19fl0yqZDnLnxbf5oBdlhDCuzal4sg"
+        ],
+        "voided_machine": "ivy-lap"
+      },
+      {
+        "promoted": null,
+        "selected_after": 4,
+        "sufficient": false,
+        "voided": [
+          "SHA256:qnSdLjRkUwW5i8BdfNJv9t+FjHwjEJYZeIz2/5uwfKE"
+        ],
+        "voided_machine": "ada-primary"
+      }
+    ],
+    "note": "voiding a seat frees a slot for the highest-scoring eligible remainder; if caps leave no substitute the round is short, which is Insufficient (giti-msi.7) or an escalation (giti-msi.8), never a lower bar",
+    "rule": "re-run select with exclusions + voided, same seed and same epoch (ADR-0002 D3): the ordering does not change, only the pool does"
+  },
+  "reserves": [
+    {
+      "key_id": "SHA256:n7k+zsxWgR3O+0XeLsNuD3VIN61Rh5MnDuYjqQmPzzo",
+      "rank": 1,
+      "slot": "d9281a629503dce7041551a7dae1498297b366acf1d1bbdc998047e344f977e9",
+      "tier": "endorsed"
+    },
+    {
+      "key_id": "SHA256:dEJ8eIUIKYL1nlYNKwTpiPQoYshHBW0ZJArWm0VH4qE",
+      "rank": 2,
+      "slot": "c220a767ade82788ff5d0f8b494783597af44d7c161f8f3049eccb181d547306",
+      "tier": "anonymous"
+    },
+    {
+      "key_id": "SHA256:2Y++TGau1gfFz73xpVUmOSRG6M/CGVnBzjYnz/jzPQs",
+      "rank": 3,
+      "slot": "9d26a75bf2a0dc1b917800a468698f6ad4143610e94e17811b62d35ddacee34c",
+      "tier": "anonymous"
+    }
+  ],
+  "round_id": "gitiup-round-1/41/e3c05974bea30ff0c2ad3b9b8d4219b1d41a0c45a5e1c948c8455fdc4c304a74/chg-000000000000f00d/sha1:e255b091aabd7e443b5d2fbeb90bc9769d07cbeb/build/matrix/linux-x86_64/0",
+  "round_kind": "gitiup-round-1",
+  "schema_version": 1,
+  "seed": "sha256:f6bb5ca427209de28c8cc1d75d74c75f9d5b2f090be21c14f64be1557790c7eb",
+  "selected": [
+    {
+      "handle": "3efb23dee98c0bfcee87604210b35410",
+      "identity": "SHA256:nFKGWPjM6WPPCs7sFwLFKD7GuuzhTYNDYk2tpxJktMM",
+      "key_id": "SHA256:qnSdLjRkUwW5i8BdfNJv9t+FjHwjEJYZeIz2/5uwfKE",
+      "rank": 1,
+      "slot": "a22b67eca30f273e43151946a70ee0e7abce6b9d157e8986f61e75ccc7d4ce39",
+      "tier": "trusted"
+    },
+    {
+      "handle": "ac5b5fdf0701cbedb0fa032730fe784c",
+      "identity": "SHA256:o85w6NDDwFb3AaMSh1SVk0cniZ48e4xDs4+C53htzYU",
+      "key_id": "SHA256:lQyfJ6tMaK0IF19fl0yqZDnLnxbf5oBdlhDCuzal4sg",
+      "rank": 2,
+      "slot": "77a6a6d7c0363d82ddcceaf83dd220a02b1e7d5903f4f1fec65d6ec02692225f",
+      "tier": "anonymous"
+    },
+    {
+      "handle": "9f5f4092fc03330c945f0f74c82c6672",
+      "identity": "SHA256:DG/5TXLcIT9wDXmhBLttqbSV5y4Ej+1NDTPNYtCqdno",
+      "key_id": "SHA256:fDviWY/xw+ljyMTrq5OOgtIVuYDSqT0Zr/gFsF1irhw",
+      "rank": 3,
+      "slot": "6849ced696fb0ffde26bca4695f0536a2975aa3e0f62c842b845c9abf3edccb1",
+      "tier": "endorsed"
+    },
+    {
+      "handle": "4e8d1bdfe52aae41e94ed55ce404c5bc",
+      "identity": "SHA256:+umtApY/t+JXxFV2WLHoKEokDI3fkXBgJy421eIcQ2w",
+      "key_id": "SHA256:vjIiZn0K9BLE/I3SxLArBXVQ5NuwkeAo7XnQkEJRsLE",
+      "rank": 4,
+      "slot": "3480de1628d7baf1f927c4e4a46859fdcab0b6aab4a5fbbd6b29f5d4cece0c28",
+      "tier": "endorsed"
+    },
+    {
+      "handle": "0398b5a3b5d47b32d40826664b89313b",
+      "identity": "SHA256:4zeNrXJRTXX/fb80Fm3irFOpYqxdGla7ZEbWCr1JP44",
+      "key_id": "SHA256:ohrBPPiXdDFSuOYAIPJv2PGL73wAbxpPsk3dczthI0I",
+      "rank": 5,
+      "slot": "638529ce769f7dea313484fac1e8ce8563eb4e2fc7e5be1143ffe7cfb8208c01",
+      "tier": "endorsed"
+    }
+  ],
+  "sufficient": true
+}

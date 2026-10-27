@@ -13,8 +13,8 @@ wire formats, ref namespaces, error taxonomies, trust models, dependency policy.
 | id | title | status | decided by |
 |----|-------|--------|------------|
 | [0001](0001-attestation-encoding-hash-and-signature.md) | Attestation encoding, hash and signature format | accepted | `giti-1rs.1` |
+| [0002](0002-roster-verifier-selection-and-sybil-resistance.md) | Roster, verifiable selection and sybil resistance | accepted | `giti-msi.1` |
 | — | Host abstraction: CAS ref updates, `kv/` namespaces, store layout | *written up as [design notes](../host-abstraction.md), predates this directory* | `giti-xdw.1/.2` |
-| — | Roster, verifiable selection and sybil resistance | proposed (`giti-msi.1`) | — |
 
 When you write one of the placeholders above, add a row here in the same commit.
 
@@ -35,3 +35,8 @@ When you write one of the placeholders above, add a row here in the same commit.
   instead).
 * Reference them from code. `ADR-0001 D3` in a doc comment beats a paragraph that
   restates it and drifts.
+* A decision that several tickets must *reimplement* carries **reference vectors**: a
+  generator and its output, committed next to the ADR under `fixtures/<name>/` (as
+  [ADR-0002](0002-roster-verifier-selection-and-sybil-resistance.md) does) or in the
+  crate it describes (as ADR-0001 does with `crates/gitiup-attest/tests/fixtures/v1/`).
+  Prose that nothing checks is a suggestion.

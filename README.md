@@ -30,6 +30,11 @@ workspace globs `crates/*`, so a new crate is just `members`-free.
   over DSSE PAE, `result`/`claims` split, freshness as policy).
   The decisions are in the ADR, the implementation is
   [`gitiup-attest`](crates/gitiup-attest/README.md).
+* [ADR-0002 — roster, verifiable selection and sybil resistance](docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md) —
+  who may verify, how the five are picked so anyone can audit the pick afterwards, and
+  what a key has to cost to get in. The selection algorithm there has a byte-for-byte
+  reference implementation and golden vectors in
+  [`docs/adr/fixtures/selection-v1/`](docs/adr/fixtures/selection-v1/).
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy file may insist on.
