@@ -202,7 +202,8 @@ impl RemoteScheme {
             ),
             "github" | "gh" => (
                 "the forge is selected by the adapter, not by the URL",
-                "use https://github.com/owner/repo.git with the github adapter (giti-xdw.4)",
+                "use https://github.com/owner/repo.git — the github adapter \
+                 (`hosts-github`, on by default) serves it through the host traits",
             ),
             "ftp" | "ftps" => ("ftp is not a git transport", "use ssh:// or https://"),
             "ipfs" => ("ipfs remotes are not implemented", "use s3:// or ssh://"),

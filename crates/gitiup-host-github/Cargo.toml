@@ -1,0 +1,52 @@
+[package]
+name = "gitiup-host-github"
+description = "The GitHub host adapter: the forge demoted to one host among several, behind the gitiup-host traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This is the *only* crate in the workspace allowed to talk to a forge API, and
+# the only place a GitHub type may appear (giti-xdw.4). `gitiup-host` stays free of
+# forge clients and says so in its own `tests/no_forge_deps.rs`; the command line
+# pulls this crate in behind its `hosts-github` feature, so
+# `cargo build -p gitiup --no-default-features` links none of it.
+#
+# Everything a forge gives you — a PR, a check run, a webhook, a token — arrives
+# here as one of the three things a host is made of (refs, packs, content-addressed
+# records) or is refused with a message. Translation happens on the way in, never
+# on the way out: nothing above this crate ever sees a GitHub type.
+#
+# Deliberately no HTTP dependency. The live transport drives the `curl` binary the
+# same way the plain-git host drives the `git` binary (giti-xdw.3): system TLS, no
+# TLS stack in our process, and an audit trail that is one command line. Tests talk
+# to the in-process mock forge or replay recorded fixtures, so the suite needs no
+# network and no token.
+
+[features]
+default = ["curl"]
+
+# The live transport: `CurlTransport`, which shells out to `curl`. Turn it off for
+# a build that must not be able to touch a network at all — the host still
+# compiles and still answers reads from recorded fixtures, but `GitHubHost::open`
+# refuses with a message naming this feature.
+curl = []
+
+# The test doubles: the in-process mock forge and the record/replay transports.
+# Not for production builds. Enabled for this crate's own tests through the
+# self-dev-dependency below, and for giti-xdw.5's conformance CI the same way.
+testing = []
+
+[dependencies]
+gitiup-host = { path = "../gitiup-host" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# The standard cargo trick for "build my tests against my own optional feature".
+gitiup-host-github = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

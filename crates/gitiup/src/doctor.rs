@@ -13,21 +13,28 @@
 use gitiup_sandbox::doctor;
 
 use crate::CliError;
+use crate::remotes;
 
-/// Usage for the one thing `doctor` can inspect today.
+/// Usage for what `doctor` can inspect.
 pub const USAGE: &str = "\
-gitiup doctor — report what this machine can and cannot confine.
+gitiup doctor — report what this machine can and cannot confine, and which host
+serves which remote.
 
 USAGE:
     gitiup doctor --sandbox [--json]
+    gitiup doctor --remotes [--json]
 
 OPTIONS:
     --sandbox     survey the isolation backends: kernel support, each backend's probe,
                   and whether this host may serve a stranger's job at all
+    --remotes     for every `[[remote]]` in gitiup.toml, which host serves it and what
+                  that host warns about; a forge remote in a build without the forge
+                  adapter is named and refused here
     --json        the same report as JSON, for a dashboard or a support ticket
 
-Exit codes: 0 this machine may serve jobs (warnings possible — read them) ·
-6 it may not (nothing will be executed, whatever else is asked) · 2 usage.
+Exit codes: 0 this machine may serve jobs and every remote has a host (warnings
+possible — read them) · 6 it may not, or a remote has no host this build can serve ·
+2 usage.
 ";
 
 /// `gitiup doctor …`
@@ -37,6 +44,9 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            // A different subject, with its own report and its own exit conditions:
+            // hand the whole argument list over rather than re-parse it here.
+            "--remotes" | "--remote" => return remotes::run(args),
             "--sandbox" | "--sandboxes" => sandbox = true,
             "--json" => json = true,
             "--help" | "-h" => {

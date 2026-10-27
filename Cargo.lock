@@ -943,6 +943,8 @@ name = "gitiup"
 version = "0.1.0"
 dependencies = [
  "gitiup-attest",
+ "gitiup-host",
+ "gitiup-host-github",
  "gitiup-normalise",
  "gitiup-run",
  "gitiup-sandbox",
@@ -972,6 +974,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "gitiup-host-github"
+version = "0.1.0"
+dependencies = [
+ "gitiup-host",
+ "gitiup-host-github",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

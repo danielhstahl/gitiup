@@ -12,6 +12,14 @@
 //! 2. **the exit codes users branch on are one table, not two.** The usage text,
 //!    the module docs and the library's own taxonomy have to agree, because a
 //!    merge gate is written against the numbers.
+//! 3. **the CLI is the composition root, and only the composition root.** It may
+//!    depend on `gitiup-host` (it has to, to reach a remote at all) and on the forge
+//!    adapters behind their features — `hosts-github`, on by default. That is not a
+//!    license to talk to a forge from here: the adapter is reached through the host
+//!    traits and `tests/no_forge_calls.rs` fails the build if any forge wire
+//!    vocabulary appears in this crate's own source. What this file guards is the
+//!    *digest* dependencies: nothing that could recompute a digest differently, and
+//!    no HTTP or git client that would bypass the host abstraction entirely.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -19,13 +27,21 @@ use std::path::PathBuf;
 /// What the binary may depend on directly.
 // `gitiup-run` is the planning and tier-choosing crate behind `gitiup run`; it is
 // itself kept network-free by its own `tests/no_side_effects.rs`.
-const ALLOWED_DEPENDENCIES: [&str; 5] = [
+const ALLOWED_DEPENDENCIES: [&str; 7] = [
     "gitiup-attest",
     "gitiup-normalise",
     "gitiup-run",
     // `gitiup doctor --sandbox` asks it what this machine can confine; it produces no
     // digest and reads no report, so it cannot disagree with the format crate.
     "gitiup-sandbox",
+    // The host abstraction. Without it the CLI could not reach a remote at all; with
+    // it, every remote operation goes through `Host`/`RefStore`/`BlobStore` and no
+    // command gets to invent its own storage.
+    "gitiup-host",
+    // The github adapter, `optional = true` and gated on `hosts-github` (default on).
+    // Optional is the point: `--no-default-features` produces a binary with no forge
+    // code in it, which is what makes the feature gate mean something.
+    "gitiup-host-github",
     "serde_json",
 ];
 
@@ -47,8 +63,11 @@ fn sources() -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                // This file names the forbidden crates in order to forbid them.
-                if path.file_name().is_some_and(|n| n == "cli_hygiene.rs") {
+                // These two files name the forbidden things in order to forbid them.
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "cli_hygiene.rs" || n == "no_forge_calls.rs")
+                {
                     continue;
                 }
                 if path.extension().is_some_and(|e| e == "rs") {

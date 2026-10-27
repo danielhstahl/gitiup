@@ -36,6 +36,7 @@ use std::process::ExitCode;
 mod digest;
 mod doctor;
 mod normalise;
+mod remotes;
 mod run;
 
 /// The top-level usage text, also printed on `gitiup help`.

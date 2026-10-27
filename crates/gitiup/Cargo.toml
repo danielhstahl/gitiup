@@ -34,7 +34,24 @@ gitiup-sandbox = { path = "../gitiup-sandbox" }
 # computation for any run whose `normalisation_version` is 1, so a CLI that left it
 # out would be re-implementing the rules instead of calling them.
 gitiup-normalise = { path = "../gitiup-normalise" }
+# The host abstraction and the hosts that ship with it. The CLI is the composition
+# root: it is the one crate allowed to decide *which* host serves a remote (see
+# `src/remotes.rs`), and it is deliberately the only crate that both knows about
+# forge adapters and is not a forge adapter itself.
+gitiup-host = { path = "../gitiup-host" }
+# The github adapter, behind `hosts-github` (on by default). A build with
+# `--no-default-features` has no forge code in it at all: the remote is then refused
+# by name, with the flag to turn on in the message.
+gitiup-host-github = { path = "../gitiup-host-github", optional = true }
 serde_json = "1"
+
+[features]
+default = ["hosts-github"]
+# Every forge call — the pull request database, check runs, token auth, API
+# pagination, rate limits, the record store inside the repository — lives in
+# `gitiup-host-github`, and this feature is the only thing that pulls it in. With it
+# off, a forge remote is refused with a message that names this flag.
+hosts-github = ["dep:gitiup-host-github"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -79,6 +79,7 @@
 pub mod blob;
 pub mod capability;
 pub mod config;
+pub mod conformance;
 pub mod error;
 pub mod hosts;
 pub mod oid;

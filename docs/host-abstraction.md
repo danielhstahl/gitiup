@@ -323,6 +323,81 @@ protected until the push is refused, cannot revoke a key, and cannot make a
 reviewer's `+1` mean anything. Those stay owner-side, which is the same answer the
 bucket host gives.
 
+## The github adapter (`github`, feature `hosts-github`)
+
+Everything that is *GitHub* — the REST API, token auth, pagination, rate limits,
+the pull request database, check runs — lives in
+[`crates/gitiup-host-github`](../crates/gitiup-host-github/src/lib.rs), a separate
+crate that implements `Host`/`RefStore`/`BlobStore` and that the core does not know
+exists. `gitiup-host` still compiles with zero forge imports (its own
+`tests/no_forge_deps.rs` enforces it), and `gitiup` reaches the adapter only through
+the traits, from one place: `src/remotes.rs`, the composition root, which is also
+where a forge remote is refused when the adapter is not compiled in.
+
+The feature is `hosts-github`, on by default:
+
+```text
+cargo build                          has the adapter
+cargo build --no-default-features    no forge code in the binary at all
+```
+
+With the feature off a `https://github.com/owner/repo` remote is not silently
+downgraded to the plain-git host — the plain-git host can read its refs, and that
+would let a submit "succeed" against a remote whose change database it cannot read.
+It is refused by name, with the flag to turn on in the message, and
+`gitiup doctor --remotes` prints that refusal instead of pretending.
+
+**What a forge has is translated, not leaked.** The two traits are the whole
+vocabulary, so a forge's own nouns have to become gitiup's:
+
+| the forge's thing | becomes | and the translation is honest about |
+|-------------------|---------|-------------------------------------|
+| the pull request database | `ChangeRecord`, like a bucket's `refs/changes/**` | `origin: Pull { number }`, plus base/head as `RefName`/`Oid`, never a `base.ref` string |
+| a change gitiup wrote | the same `ChangeRecord`, `origin: Ref { name }` | a pull and a ref over the same commit are one change, listed once |
+| check runs, CI status | `AttestationRecord`, like `refs/attestations/<oid>` anywhere else | `source: Store | CheckRun | Both` and `copy_truncated`: a check run's copy is an advertisement, not the bytes a signature covers |
+| webhooks, `github.event.*` | `poll_changes(cursor)` | "what is new" is one conditional read of existing state; a workflow's event context comes from the runner that started it, not from a delivery |
+| opening a change | the ref first, then the pull request | the ref is the part the contributor owns; the forge's merge is used rather than imitated |
+
+**Inside the repository, gitiup stores the same thing it stores anywhere else**:
+`refs/gitiup/kv` as an append-only chain of pointer commits whose trees hold one
+file per record (a git ref cannot name a SHA-256 record, so the ref names a commit
+that carries `gitiup-ref.json` and the record bytes — same trick as the plain-git
+host, same audit trail in the forge's own UI), `refs/changes/**` and
+`refs/attestations/**` as usual, and blobs in the object database. `gitiup fetch`
+brings the proof with the ref here too.
+
+**Where a forge genuinely promises less, the adapter says so** rather than
+emulating a guarantee it does not have. `capabilities()` reports
+`cas = true, immutable = true, atomic_multi_write = false`, and `advice()` — printed
+by `gitiup doctor --remotes` — states the four caveats a caller needs: a multi-ref
+write is applied one ref at a time with best-effort rollback (no ref transaction
+exists on the API); a CAS is checked before it is sent and verified after, and a
+*rewind* is the one move the forge will not make conditionally, which gitiup refuses
+to force silently; a delete is check-then-delete, so a write racing the delete is not
+caught; a 404 conflict is reported as a conflict without the forge's "expected value",
+because the API does not say what it had.
+
+| `[remote.options]` | meaning (default) |
+|--------------------|-------------------|
+| `api-base` | the API root, for GitHub Enterprise (`https://github.com/api/v3` off-host, `https://api.github.com` on github.com) |
+| `token-env` | which environment variable holds the token (before the profile's `token-env`, before `GITIUP_GITHUB_TOKEN`/`GITHUB_TOKEN`) |
+| `accept-host` | `true`: this host really is GitHub although the URL does not say so |
+| `host-type` | `github`: the explicit spelling of the same thing |
+| `per-page`, `max-pages` | listing page size and the ceiling on pages (`100`, `200`) |
+| `rate-reserve`, `rate-wait` | requests to keep back, and the longest wait for a quota reset (`3`, `60s`) |
+| `ref-cache-ttl` | how long the ref advertisement is trusted (`2s`) |
+| `read-only` | refuse writes up front, for a token that may only read (`false`) |
+
+A token is never put in a URL — it is an `Authorization` header, sent only to the
+API host the remote names, and a redacted `Secret` everywhere it might be printed.
+
+Testing: the mock forge in `src/testing.rs` implements the *semantics* of the
+endpoints (create-only refusal, fast-forward refusal, `Link` pagination, primary and
+secondary rate limits), the shared suite in `gitiup_host::conformance` runs against it
+and against recorded HTTP in `tests/fixtures/`, and `tests/live_forge.rs` asks the
+real forge — read-only, `#[ignore]`d, and the only thing that can catch a shape the
+mock and the code agree on but the forge does not.
+
 ## Pack format
 
 `PackFormat::Raw` ("gitiup pack") is the transport for CAS-style hosts:
@@ -390,5 +465,10 @@ errors so typos surface instead of silently disabling a safety setting
    precisely so they can be lifted into the giti-xdw.5 conformance suite), plus
    the two adversarial ones: concurrent create-only CAS writes, and a batch whose
    last update conflicts.
-6. Keep the crate forge-free: `cargo test -p gitiup-host --test no_forge_deps`.
-   Adapters for actual forges go behind a non-default feature (giti-xdw.4).
+6. Keep the crate forge-free: `cargo test -p gitiup-host --test no_forge_deps`, and
+   `cargo test -p gitiup --test no_forge_calls` for the CLI side. An adapter for an
+   actual forge is its own crate, reached only through these traits, and it is
+   optional in the binary: `hosts-github` is on by default so the ordinary build
+   serves a forge, and `--no-default-features` produces one that contains no forge
+   code and refuses forge remotes by name. Which host serves which remote is decided
+   in exactly one place, `gitiup/src/remotes.rs`.

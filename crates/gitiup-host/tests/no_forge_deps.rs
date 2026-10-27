@@ -7,8 +7,9 @@
 //! 1. no `use`/`extern crate`/`mod` statement anywhere under `src/` may name a
 //!    forge client or HTTP/GraphQL stack used to talk to one;
 //! 2. `Cargo.toml` must not depend on one, and the default feature set must stay
-//!    forge-free — a future adapter (giti-xdw.4) has to sit behind a non-default
-//!    feature, exactly like the ticket for it says.
+//!    forge-free — an adapter for a real forge has to be a *separate crate* that
+//!    the binary makes optional, which is what `gitiup-host-github` and the CLI's
+//!    `hosts-github` feature do; nothing you can turn off inside this crate counts.
 
 use std::path::{Path, PathBuf};
 
@@ -234,9 +235,13 @@ fn forge_adapters_are_only_allowed_behind_a_non_default_feature() {
         if !present {
             continue;
         }
-        // giti-xdw.4 puts the adapter in this crate behind `hosts-github`.
-        // Until then there is nothing to gate; once it exists it may not be
-        // compiled by a default build.
+        // There is one arrangement that satisfies the ticket, and the github
+        // adapter took it: the adapter is a *separate crate* (`gitiup-host-github`)
+        // that depends on this one, not a module inside it. A module here would be
+        // compiled by every build of the core no matter what feature the binary
+        // turns on, and the whole point is that the core has no forge code to
+        // remove. This assertion stays as the tripwire for someone doing it that
+        // way anyway.
         assert!(
             !defaults.iter().any(|f| f.contains(adapter)),
             "adapter module {adapter} must not be reachable from default features"
