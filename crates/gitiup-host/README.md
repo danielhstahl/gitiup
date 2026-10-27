@@ -98,6 +98,42 @@ then per record `ns_len: u8`, `ns`, `len: u32be`, `bytes`, and a trailing
 32-byte SHA-256 of everything before it. The digest is verified on decode, so a
 truncated or edited pack is rejected rather than half-imported.
 
+## Hosts
+
+| host | remote URL | what it is |
+|------|------------|------------|
+| `FsHost` | `file:///srv/git/my-repo` | the reference host: refs, packs and a CAS blob store on a directory |
+| `S3Host` | `s3://bucket/prefix` | bucket-as-forge: refs are JSON objects, merges are conditional writes |
+
+`S3Host` stores `refs/<name>`, `kv/<kind>/<hash>` and `packs/<oid>.pack` under the
+store root and moves a ref with `If-None-Match` / `If-Match`, so two clones
+pushing at once cannot lose a ref. It requires object versioning (and says so
+with the command that turns it on), recommends Object Lock, tombstones ref
+deletions instead of deleting, caches ref listings for `ref-cache-ttl` (default
+2 s), and takes its credentials from the AWS chain — a token in `gitiup.toml` is
+refused, because it would be useless here and is a leak waiting to happen. The
+full design notes are in
+[`docs/host-abstraction.md`](../../docs/host-abstraction.md).
+
+```rust,ignore
+let bucket = MemoryBucket::forge("gitiup-forge");     // or: transport::connect(&remote)?
+let remote = RemoteConfig::new("origin", "s3://gitiup-forge/my-repo")?;
+let host = S3Host::open_or_init(Arc::new(bucket), &remote)?;
+let oid = host.put_cas(&Namespace::CHANGE, record)?;
+host.update_ref_cas(&RefUpdate::create(RefName::change_head("c1")?, oid))?;
+```
+
+`cargo run -p gitiup-host --example s3_tour` walks through it — refs, CAS
+conflicts, two clones converging, packs, tombstones — against `MemoryBucket`, an
+in-process bucket with real etags, real 412s, paged listings and staged
+multipart uploads, so the whole host is exercised with no network and no
+credentials.
+
+The `s3` cargo feature links the `aws-sdk-s3` transport used by
+`S3Host::from_remote`; without it the host still compiles (and answers *"this
+build has no S3 transport, feature `s3`"*), which keeps the default build free of
+HTTP and AWS code.
+
 ## `gitiup.toml`
 
 Schema-versioned config, discovered by walking up from the working directory
@@ -154,9 +190,23 @@ refusals and bad input no).
 ## Tests
 
 ```sh
-cargo test -p gitiup-host        # unit + integration + doc tests
+cargo test -p gitiup-host                        # unit + integration + doc tests
 cargo clippy -p gitiup-host --all-targets
+cargo test -p gitiup-host --features s3          # same, with the AWS transport linked
 ```
 
-`tests/host_fs.rs` drives the traits through `&dyn Host`, so the same bodies are
-the starting point for the shared conformance suite (giti-xdw.5).
+`tests/host_fs.rs` and `tests/host_s3.rs` drive the traits through `&dyn Host`
+(shared bodies in `tests/support/`), so the same bodies are the starting point
+for the conformance suite (giti-xdw.5). `tests/host_s3.rs` covers the bucket
+promises on `MemoryBucket`: conditional writes on the wire, 412 retry with
+backoff, two clones converging, tombstones instead of deletes, the degraded
+`cas = false` path, multipart packs and the ref cache.
+
+`tests/host_s3_live.rs` runs the same bodies against a real endpoint. It is
+`#[ignore]`d so the default suite needs no network:
+
+```sh
+pip install "moto[server]" && moto_server -H 127.0.0.1 -p 5500 &
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test GITIUP_S3_LIVE_ALLOW_UNVERSIONED=1 \
+  cargo test -p gitiup-host --features s3 --test host_s3_live -- --ignored
+```

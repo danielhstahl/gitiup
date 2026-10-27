@@ -12,9 +12,12 @@
 //!   can ask "may I do this here?" instead of guessing.
 //!
 //! The reference implementation is [`hosts::fs::FsHost`] (a bare directory with a
-//! single `refs` file plus a content-addressed `cas/` tree). Every test in the
-//! workspace uses it, and the conformance suite (giti-xdw.5) runs the same
-//! tests against the S3 and plain-git hosts.
+//! single `refs` file plus a content-addressed `cas/` tree). The second real host
+//! is [`hosts::s3::S3Host`]: one S3/MinIO bucket as a complete remote, refs
+//! updated with S3 conditional writes, packs by multipart upload, records
+//! content addressed under `kv/`. Every test in the workspace uses them, and the
+//! conformance suite (giti-xdw.5) runs the same tests against the plain-git host
+//! and a live MinIO.
 //!
 //! The second half of the crate is configuration: [`Config`] parses
 //! `gitiup.toml`, including [`RemoteConfig`] (name, url, store prefix,
@@ -92,6 +95,14 @@ pub use config::{
 };
 pub use error::{HostError, HostErrorExt, HostErrorKind, HostResult};
 pub use hosts::fs::FsHost;
+pub use hosts::s3::bucket::{
+    Bucket, BucketError, BucketFacts, BucketInfo, MemoryBucket, MemoryBucketConfig, Object,
+    ObjectMeta, PutCond, SharedBucket, VersioningState,
+};
+pub use hosts::s3::{
+    ConditionalWrites, HostManifest as S3HostManifest, RefCacheStats, RefDocument as S3RefDocument,
+    S3Host, S3Options,
+};
 pub use oid::{Oid, OidKind};
 pub use pack::{Pack, PackFormat, PackRequest};
 pub use refs::{Actor, Expect, Ref, RefDeletion, RefName, RefQuery, RefStore, RefUpdate};

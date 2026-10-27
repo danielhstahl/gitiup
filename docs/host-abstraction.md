@@ -88,6 +88,7 @@ key in a bucket.
 Derived in one place — `RemoteConfig` — and mirrored by every host:
 
 ```text
+<root>/host.json            what this store is (schema, kind, store-prefix)
 <root>/refs/<name>          ref -> { oid, updated_by, updated_at, schema }
 <root>/kv/<kind>/<hash>     change records, attestations, rosters, job records
 <root>/packs/<oid>.pack     packs, content addressed
@@ -108,6 +109,96 @@ Blob digests are SHA-256 of the exact bytes; `put_cas` is idempotent; nothing in
 this crate overwrites or deletes an object, and the `fs` host verifies a blob
 re-hashes to its name on read. Retention and tombstoning are host policy and
 belong to the attestation ticket (giti-1rs.5), not to this trait.
+
+## The bucket-as-forge host (`s3`)
+
+`S3Host` makes a plain bucket — S3, MinIO, anything that speaks the S3 API — the
+forge: refs are objects, merges are conditional writes, and there is no
+server-side code to trust. The layout is the one above plus a manifest, and the
+keys are exactly what `aws s3 ls` shows:
+
+```text
+<root>/host.json            { schema, kind: "s3", store-prefix, created-at }
+<root>/refs/<name>          { oid, updated_by, updated_at, schema } or a tombstone
+<root>/kv/<kind>/<hash>     records, one object each
+<root>/packs/<oid>.pack     packs, multipart above the threshold
+```
+
+**A ref is a small JSON object and moving it is a conditional write.**
+`Expect::Absent` is `If-None-Match: *`; `Expect::Is(oid)` re-reads the object and
+sends `If-Match: <etag>`; `Expect::Any` is a plain `PUT`. A 412 that a re-read
+explains is `HostError::Conflict` with both sides filled in, so the caller can
+rebuild the update. A 412 a re-read does *not* explain is retried with
+exponential backoff (`cas-attempts`, `cas-backoff`, `cas-backoff-cap`), because
+on a real bucket that is a flinch, not a lost race.
+
+**Deleting a ref tombstones it.** The object is overwritten with
+`{ ..., deleted: true, deleted_by, deleted_at }` and `get_ref` answers `None`.
+Nothing is ever `DELETE`d: on an unversioned bucket a delete is an irreversible
+loss and on a versioned one it buys nothing. A tombstone still occupies its key,
+so re-creating a ref is a CAS like any other — which is what two clones pushing
+the same branch name need.
+
+**Versioning is required, Object Lock is recommended, and both are checked
+rather than assumed.** At connect time the host reads the bucket's versioning
+state and Object Lock configuration and probes conditional writes by *doing one*
+(write the same key twice with `If-None-Match: *`; if it lands twice, this bucket
+is not doing CAS). An unversioned bucket is refused with the `aws s3api` command
+that fixes it, unless the operator sets `require-versioning = "false"`, in which
+case `capabilities.immutable` goes false and `advice()` keeps saying so. A bucket
+that cannot do conditional writes reports `capabilities.cas = false` and refuses
+CAS-dependent ref writes with `UnsupportedCas` — it never quietly overwrites a
+ref, which is exactly why owner-side merges are refused there. `Expect::Any`
+stays available: it is not CAS-dependent, and refusing it would be the host
+making the operator's decision for them.
+
+**Listings are cached for a moment; point lookups are not.** `list_refs` is an
+advertisement ("what I saw `ref-cache-ttl` ago", default 2 s), so a fetch loop
+costs one LIST rather than one GET per ref, while `get_ref` always reads the
+object. Any write invalidates the cache. A stale listing can be wrong but can
+never lose an update, because every write re-reads the ref it is about to
+replace.
+
+Options live in `[remote.options]` (or the URL query string). Unknown keys are
+not an error but appear in `advice()`, so a typo surfaces in
+`gitiup remote doctor` instead of silently disabling a safety setting:
+
+| option | default | meaning |
+|--------|---------|---------|
+| `region` | AWS chain | override the resolved region |
+| `endpoint` | AWS | MinIO/gateway URL, e.g. `http://127.0.0.1:9000` |
+| `profile` | `AWS_PROFILE`/chain | shared-config profile to use |
+| `force-path-style` | `false` | what most S3-compatible servers expect |
+| `require-versioning` | `true` | refuse buckets that do not keep history |
+| `conditional-writes` | `auto` | `auto` probes, `on` demands, `off` accepts a dumb bucket |
+| `multipart-threshold-mib` | 8 | objects at least this big go up as multipart |
+| `part-size-mib` | 8 | part size (S3's own minimum is 5) |
+| `ref-cache-ttl` | `2s` | advertisement TTL; `0s`/`off` turns the cache off |
+| `cas-attempts` | 4 | retries after an unexplained 412 |
+| `cas-backoff` / `cas-backoff-cap` | `20ms` / `2s` | the backoff for those retries |
+
+**Credentials come from the AWS chain and nowhere else**: environment (access
+keys or a web identity/IRSA), a shared-config profile, SSO — whatever `aws sts
+get-caller-identity` would use. A `gitiup.toml` credentials profile that names a
+token for an `s3://` remote is refused outright by
+`S3Host::check_credentials`: it would be useless here and is a leak waiting to
+happen. `describe()` names the endpoint, region and which chain member is in
+play, and never a credential value.
+
+**The transport is a trait, so the host is testable without a bucket.** Every
+bucket call goes through `hosts::s3::bucket::Bucket` (`facts`, `info`, `get`,
+`head`, `put`, `list`, `put_large` — synchronous, because the host traits are).
+`MemoryBucket` is a second, in-process implementation with real etags, real 412s,
+paged LISTs and staged multipart uploads, plus fault hooks
+(`fail_next_conditionals`, `lose_next_races`, `fail_writes_after`);
+`tests/host_s3.rs` runs the whole host against it, so the CAS paths are covered
+with no network and no credentials. The `s3` cargo feature adds the `aws-sdk-s3`
+transport used by `S3Host::from_remote` (async lives entirely inside that
+module); without it the host still compiles and answers "this build has no S3
+transport, feature `s3`" — which keeps the default build free of HTTP and AWS
+code, as `tests/no_forge_deps.rs` checks. `tests/host_s3_live.rs` runs the same
+bodies against a real endpoint and is `#[ignore]`d so the default suite stays
+hermetic.
 
 ## Pack format
 

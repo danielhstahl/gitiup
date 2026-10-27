@@ -1,5 +1,7 @@
-//! Host implementations. Only [`fs`] lives here for now; the S3 host
-//! (giti-xdw.2), plain-git host (giti-xdw.3) and the github adapter
-//! (giti-xdw.4, feature-gated) hang off the same traits.
+//! Host implementations. Every host is one `impl Host` over the same trait set:
+//! [`fs`] (the reference host), [`s3`] (bucket-as-forge, giti-xdw.2), and the
+//! plain-git host (giti-xdw.3) and the github adapter (giti-xdw.4,
+//! feature-gated) which hang off the same traits.
 
 pub mod fs;
+pub mod s3;

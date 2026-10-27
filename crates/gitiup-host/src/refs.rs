@@ -594,18 +594,38 @@ pub trait RefStore: Send + Sync {
                     applied.push((update.name.clone(), before));
                 }
                 Err(first) => {
-                    // Best-effort rollback, newest first.
+                    // Best-effort rollback, newest first. Best effort means what
+                    // it says: a host that refuses the undo (a transient bucket
+                    // error, say) leaves a ref behind, and the caller has to be
+                    // told rather than told "nothing happened".
+                    let mut left_behind: Vec<String> = Vec::new();
                     for (name, before) in applied.into_iter().rev() {
-                        match before {
-                            Some(oid) => {
-                                let _ = self.update_ref_cas(&RefUpdate::set(name.clone(), oid));
-                            }
-                            None => {
-                                let _ = self.delete_ref_cas(&RefDeletion::new(name, Expect::Any));
-                            }
+                        let undone = match before {
+                            Some(oid) => self
+                                .update_ref_cas(&RefUpdate::set(name.clone(), oid))
+                                .is_ok(),
+                            None => self
+                                .delete_ref_cas(&RefDeletion::new(name.clone(), Expect::Any))
+                                .is_ok(),
+                        };
+                        if !undone {
+                            left_behind.push(name.as_str().to_string());
                         }
                     }
-                    return Err(first);
+                    if left_behind.is_empty() {
+                        return Err(first);
+                    }
+                    let undone = format!(
+                        "the batch was rolled back except for {}; re-run the submit or repair \
+                         with `gitiup fsck`",
+                        left_behind.join(", ")
+                    );
+                    let already = first.hint().map(str::to_string);
+                    let hint = match already {
+                        Some(already) => format!("{already} — {undone}"),
+                        None => undone,
+                    };
+                    return Err(first.with_hint(hint));
                 }
             }
         }

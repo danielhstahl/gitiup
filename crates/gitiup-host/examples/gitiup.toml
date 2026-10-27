@@ -8,6 +8,9 @@ schema-version = 1
 default-remote = "origin"
 
 # The owner's bucket is the forge: refs, packs and records all live in it.
+# It must have object versioning on (`aws s3api put-bucket-versioning
+# --bucket gitiup-forge --versioning-configuration Status=Enabled`); Object Lock
+# is recommended so attestations survive their retention window.
 [[remote]]
 name = "origin"
 url = "s3://gitiup-forge/my-repo"
@@ -17,11 +20,18 @@ timeout = "45s"
 
 [remote.options]
 region = "eu-central-1"
+# endpoint = "https://git.minio.internal"   # MinIO or another S3-compatible server
+# force-path-style = true                   # ...which usually needs path-style addressing
+# profile = "ci-writer"                     # a shared-config profile, instead of the env
+# conditional-writes = "auto"               # probe once at connect (the default)
+# ref-cache-ttl = "2s"                      # ref advertisement TTL; "off" disables it
+# multipart-threshold-mib = 8               # packs at least this big go up as multipart
 
 # A plain git repo over smart-HTTP, e.g. a read-only mirror on nginx.
 [[remote]]
 name = "mirror"
 url = "https://git.example.com/owner/my-repo.git"
+# credentials-profile = "mirror"   # uncomment with the token block below
 timeout = 120
 
 # A bare repo on a box you ssh into. The scp-like form
@@ -36,9 +46,19 @@ credentials-profile = "deploy"
 name = "scratch"
 url = "file:///srv/git/my-repo.git"
 
+# The bucket is authenticated by the AWS chain — env (access keys or a web
+# identity/IRSA), a shared-config profile, or SSO — so this profile names no
+# token: an `s3://` remote that *does* name a token is refused, because it would
+# be useless here and is a leak waiting to happen.
 [credentials.owner]
-auth = "cloud-role"          # resolved from the AWS chain: env, profile, SSO, IRSA
-token-env = "GITIUP_TOKEN"   # read from the environment only if it is set
+auth = "cloud-role"
+
+# A token, for a smart-HTTP git remote: the profile names the *variable*, and the
+# value is read from the environment when it is used. Never put the value here,
+# and never point this at an `s3://` remote — the bucket is the AWS chain's alone.
+# [credentials.mirror]
+# auth = "token"
+# token-env = "GITIUP_MIRROR_TOKEN"
 
 [credentials.deploy]
 auth = "ssh-key"

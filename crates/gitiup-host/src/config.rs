@@ -1315,9 +1315,9 @@ impl WithLocation for HostError {
     }
 }
 
-/// Collapse a multi-line TOML error into one line that keeps both the position
+/// Collapse a multi-line error into one line that keeps both the position
 /// (first line) and the reason (last line).
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)

@@ -16,7 +16,7 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
-| `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` reference host, and `gitiup.toml` remote config |
+| `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 
 Later work adds the runner, attestation and quorum crates under `crates/`; the
 workspace globs `crates/*`, so a new crate is just `members`-free.
@@ -34,10 +34,18 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+The `s3` host (a repo in a plain bucket) is always compiled; the AWS transport
+behind it is a feature, so a default build links no HTTP or AWS code:
+
+```sh
+cargo build -p gitiup-host --features s3
+```
+
 Try it out without any infrastructure:
 
 ```sh
 cargo run -p gitiup-host --example fs_tour        # refs, CAS, packs on a temp dir
+cargo run -p gitiup-host --example s3_tour        # the same against an in-process S3 bucket
 cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml
 ```
 

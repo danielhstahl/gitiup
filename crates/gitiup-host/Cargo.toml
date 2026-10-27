@@ -14,11 +14,21 @@ rust-version.workspace = true
 [features]
 default = []
 
+# The live S3 transport: `aws-config` resolves the standard AWS credential chain
+# (env, shared profile, SSO, web identity/IRSA) and `aws-sdk-s3` talks to the
+# bucket. Off by default, so a plain `cargo build` links no HTTP or AWS code: the
+# bucket-as-forge host itself is always compiled and is tested against the
+# in-process `MemoryBucket`. Turn this on for `S3Host::from_remote`.
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
