@@ -362,7 +362,7 @@ mod tests {
                 {"id": "three", "name": "Deploy", "exit_code": 0, "outcome": "skipped"}
             ],
             "provenance": {"tier": "local", "runner": "gitiup 0.1.0",
-                           "normalisation_version": 0},
+                           "normalisation_version": 0, "sandbox": "shell"},
             "claims": {"run_id": "0123456789abcdef", "claimed_at_us": 1793092502500000}
         }"#
         .to_string()
@@ -435,10 +435,13 @@ mod tests {
     fn the_digest_is_a_known_answer() {
         // Not merely stable: this is the RunDigest of the report above, and a
         // third party rebuilding the canonical manifest must print the same thing.
+        // (Re-pinned when the fixture grew `provenance.sandbox`: a `local` run that
+        // does not name where it ran is no longer a well-formed manifest, so the
+        // bytes — and therefore the digest — of a fixture that omitted it moved.)
         let summary = Summary::compute(report_json().as_bytes()).unwrap();
         assert_eq!(
             summary.run_digest.to_string(),
-            "sha256:5ddf4e7d4910582c9228e463d6a31a87904fb8793ebd20b47953de23d6a5ad95"
+            "sha256:9461381cbf27127102a64b69090ff7c18ea186f82dade68b4d1c283c7c91ff5e"
         );
     }
 

@@ -22,6 +22,10 @@ path = "src/main.rs"
 
 [dependencies]
 gitiup-attest = { path = "../gitiup-attest" }
+# `gitiup run` plans and runs workflows: the planning, the simulated tier and the
+# sandbox seam all live there, so the CLI is a front end and not a second
+# implementation of "what did this run do".
+gitiup-run = { path = "../gitiup-run" }
 # Not a second opinion about the digest: `gitiup-normalise` *is* the digest
 # computation for any run whose `normalisation_version` is 1, so a CLI that left it
 # out would be re-implementing the rules instead of calling them.

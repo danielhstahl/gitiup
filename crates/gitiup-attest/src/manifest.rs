@@ -347,6 +347,11 @@ pub struct Artifact {
 
 /// How the result came about (giti-1rs.7 owns the meanings; the vocabulary is
 /// fixed here because the digest depends on it).
+///
+/// The three fields are one claim, not three, and [`Provenance::check`] checks
+/// them together: a tier is only believable next to the sandbox and the secrets
+/// it implies. That is why `local` requires a named sandbox and `simulated`
+/// forbids one — see [the tier table](../../../docs/provenance-tiers.md).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
@@ -360,8 +365,98 @@ pub struct Provenance {
     /// (giti-1rs.3). Two results with different versions are not comparable.
     pub normalisation_version: u32,
     /// Sandbox backend that confined the run, if any (`docker`, `landlock`, …).
+    ///
+    /// [`NO_SANDBOX`] (or absent) means "nothing confined this", which is honest
+    /// for a plan and not honest for a run. Policy narrows the list further
+    /// ([`crate::Policy::allowed_sandboxes`]); this field only states the fact.
     #[serde(default, skip_serializing_if = "with_opt")]
     pub sandbox: Option<String>,
+}
+
+/// The `sandbox` value that means "nothing confined this run".
+///
+/// Spelled, not `None`, so a producer states the absence rather than forgetting
+/// the field — and so a plan says out loud that it never executed.
+pub const NO_SANDBOX: &str = "none";
+
+/// Names that mean the same as [`NO_SANDBOX`], however a producer writes it.
+pub const NO_SANDBOX_ALIASES: [&str; 4] = ["none", "off", "no", ""];
+
+impl Provenance {
+    /// The backend that confined the run, or `None` when nothing did.
+    ///
+    /// [`NO_SANDBOX`] and its aliases are all read as "nothing", so a producer
+    /// cannot write `"off"` where a gate expects an absent field.
+    pub fn confining_sandbox(&self) -> Option<&str> {
+        match self.sandbox.as_deref() {
+            Some(name) if !NO_SANDBOX_ALIASES.contains(&name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The consistency rules that make a tier unforgable, given the secret names
+    /// the run had access to.
+    ///
+    /// Checked when a manifest is produced *and* when one is verified, by
+    /// [`RunManifest::validate`] and by [`crate::run::RunReport::validate`], so a
+    /// lie is refused at the first moment it is knowable rather than at the merge
+    /// gate. Three rules, one per tier:
+    ///
+    /// | tier | rule | why |
+    ///|------|------|-----|
+    ///| `quorum` | never in a run manifest | quorum is a verdict *over* attestations (giti-msi.7); one run cannot vote for the others |
+    ///| `simulated` | no secrets, no confining sandbox | nothing ran, so there was nothing to confine and nothing to hand it |
+    ///| `local` | a sandbox must be named | "really executed" without saying *where* is the shape of a laundered run |
+    pub fn check(&self, secret_names: &[String]) -> crate::Result<()> {
+        let sandbox = self.confining_sandbox();
+        match self.tier {
+            Tier::Quorum => Err(Error::new(
+                ErrorKind::Policy,
+                "provenance",
+                "a single run may not claim the quorum tier",
+            )
+            .with_hint(
+                "quorum is a verdict over several attestations (giti-msi.7); one run says local",
+            )),
+            Tier::Simulated => {
+                if let Some(name) = sandbox {
+                    return Err(Error::new(
+                        ErrorKind::Policy,
+                        "provenance",
+                        format!(
+                            "a simulated run cannot claim sandbox '{name}': nothing executed, so nothing needed confining"
+                        ),
+                    )
+                    .with_hint(format!("a plan says \"sandbox\": \"{NO_SANDBOX}\", or omits the field")));
+                }
+                if let Some(first) = secret_names.first() {
+                    return Err(Error::new(
+                        ErrorKind::Policy,
+                        "provenance",
+                        format!(
+                            "a simulated run cannot claim secrets were available ('{first}' and {} more)",
+                            secret_names.len().saturating_sub(1)
+                        ),
+                    )
+                    .with_hint("a simulated run touches no secrets; drop secret_names, or execute for real"));
+                }
+                Ok(())
+            }
+            Tier::Local => {
+                if sandbox.is_none() {
+                    return Err(Error::new(
+                        ErrorKind::Policy,
+                        "provenance",
+                        "tier 'local' asserts real execution, which must name the sandbox that confined it",
+                    )
+                    .with_hint(format!(
+                        "name what confined it — a container or namespace backend (docker, podman, unshare, landlock), or \"shell\" if it truly ran on the host; \"{NO_SANDBOX}\" belongs to a simulated run, not to an execution nobody can locate"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Provenance tiers, in increasing order of external evidence.
@@ -380,6 +475,9 @@ pub enum Tier {
 }
 
 impl Tier {
+    /// Every tier, lowest evidence first.
+    pub const ALL: [Tier; 3] = [Tier::Simulated, Tier::Local, Tier::Quorum];
+
     /// Wire name.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -387,6 +485,81 @@ impl Tier {
             Tier::Local => "local",
             Tier::Quorum => "quorum",
         }
+    }
+
+    /// Parse a tier name, tolerating case and surrounding whitespace because
+    /// these come from hand-written policy files.
+    ///
+    /// The error lists the vocabulary: a typo in `allowed_tiers` must not read as
+    /// "your policy silently accepts less than you meant".
+    pub fn parse(text: &str) -> Result<Tier> {
+        let trimmed = text.trim().to_ascii_lowercase();
+        Tier::ALL
+            .iter()
+            .find(|tier| tier.as_str() == trimmed)
+            .copied()
+            .ok_or_else(|| {
+                Error::invalid("provenance", format!("'{text}' is not a provenance tier"))
+                    .with_hint(format!(
+                        "tiers are {}",
+                        Tier::ALL
+                            .iter()
+                            .map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+            })
+    }
+
+    /// Can one run honestly claim this about itself?
+    ///
+    /// Only [`Tier::Quorum`] fails, because a quorum is a conclusion drawn from
+    /// several signed attestations and never a property of one run — that is the
+    /// single most abusable claim in this vocabulary, so it is refused in the
+    /// format rather than left to policy
+    /// ([`Provenance::check`]).
+    pub const fn claimable_by_single_run(self) -> bool {
+        !matches!(self, Tier::Quorum)
+    }
+
+    /// Did anything actually execute?
+    ///
+    /// The question a merge gate asks: `simulated` proves what a run *would*
+    /// have done; the other two describe work that happened.
+    pub const fn is_executed(self) -> bool {
+        !matches!(self, Tier::Simulated)
+    }
+
+    /// The loud warning a trust-bearing use of this tier deserves, if any.
+    ///
+    /// Kept here rather than in the CLI so every consumer — `gitiup run`,
+    /// `gitiup verify attestation`, a merge gate printing a verdict — says the
+    /// same uncomfortable sentence. `local` is silent: it is what a normal run
+    /// claims, and a warning nobody has read since Tuesday is noise that hides
+    /// the one that matters.
+    pub fn trust_warning(self) -> Option<&'static str> {
+        match self {
+            Tier::Simulated => Some(
+                "SIMULATED: nothing was executed. This attestation describes a plan \
+                 and proves intent, not behaviour: no code ran, no network was used, \
+                 no artifact was produced.",
+            ),
+            Tier::Local | Tier::Quorum => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Tier> {
+        Tier::parse(text)
     }
 }
 
@@ -594,6 +767,8 @@ impl RunManifest {
                 ));
             }
         }
+
+        self.result.provenance.check(&result.secret_names)?;
 
         if !result.sorted_lists_are_stable() {
             return Err(Error::new(

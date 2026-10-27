@@ -16,7 +16,8 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
-| `gitiup`        | the command line: `gitiup digest` turns a local run report into the digests a stranger can check — the only crate that reads files, so the format crate can stay I/O-free |
+| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check — the only crate that reads files, so the format crate can stay I/O-free |
+| `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
@@ -29,6 +30,9 @@ workspace globs `crates/*`, so a new crate is just `members`-free.
   over DSSE PAE, `result`/`claims` split, freshness as policy).
   The decisions are in the ADR, the implementation is
   [`gitiup-attest`](crates/gitiup-attest/README.md).
+* [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
+  each claim, why simulation is the safe default, why a single run can never claim
+  `quorum`, and what a policy file may insist on.
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
 * [Reproducibility — the contract](docs/reproducibility.md) — what a workflow must do
@@ -62,6 +66,9 @@ cargo build -p gitiup-host --features s3
 Try it out without any infrastructure:
 
 ```sh
+cargo run -p gitiup-run --example plan      # what a workflow would run, and what it assumed
+cargo run -p gitiup -- run                  # the same in your own repo (.github/workflows)
+cargo run -p gitiup -- run --help           # the tiers, and what it takes to earn each
 cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
 cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
 cargo run -p gitiup -- normalise crates/gitiup-normalise/tests/fixtures/corpus/machine-a/run.json
@@ -72,6 +79,11 @@ cargo run -p gitiup-host --example fs_tour        # refs, CAS, packs on a temp d
 cargo run -p gitiup-host --example s3_tour        # the same against an in-process S3 bucket
 cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml
 ```
+
+`gitiup run` plans a job by default — no process, no network, no secrets, and an
+attestation that says `tier: simulated` — and only runs the steps when given
+`--execute` inside a sandbox it could probe. See
+[provenance tiers](docs/provenance-tiers.md) for what each tier licenses you to believe.
 
 `gitiup digest` prints the `RunDigest` and `ResultDigest` of a run report — the same
 two numbers a third party recomputes from the signed attestation, from the same

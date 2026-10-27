@@ -1,0 +1,24 @@
+name: CI
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: how many test jobs
+        default: 4
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        if: github.event_name == 'pull_request'
+        run: cargo test --release

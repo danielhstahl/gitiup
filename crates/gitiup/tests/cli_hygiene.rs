@@ -17,7 +17,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// What the binary may depend on directly.
-const ALLOWED_DEPENDENCIES: [&str; 3] = ["gitiup-attest", "gitiup-normalise", "serde_json"];
+// `gitiup-run` is the planning and tier-choosing crate behind `gitiup run`; it is
+// itself kept network-free by its own `tests/no_side_effects.rs`.
+const ALLOWED_DEPENDENCIES: [&str; 4] = [
+    "gitiup-attest",
+    "gitiup-normalise",
+    "gitiup-run",
+    "serde_json",
+];
 
 /// Anything that could put a network, a forge client or a second digest
 /// implementation behind the command line. Chosen as crate names, deliberately:

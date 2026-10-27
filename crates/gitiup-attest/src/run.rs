@@ -87,7 +87,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, Result};
 use crate::manifest::{
     ActionPin, Artifact, Claims, Environment, EventContext, ImageRef, InputValue,
     NormalisationDiff, Provenance, RUN_MANIFEST_TYPE, RunManifest, RunResult, SCHEMA_VERSION,
@@ -790,16 +790,11 @@ impl RunReport {
                 artifact.content.hash()?;
             }
         }
-        if self.provenance.tier == Tier::Quorum {
-            return Err(Error::new(
-                ErrorKind::Policy,
-                "run report",
-                "a single run may not claim the quorum tier",
-            )
-            .with_hint(
-                "quorum is a verdict over several attestations (giti-msi.7); one run says local",
-            ));
-        }
+        // The same tier rules the manifest enforces, checked on the way in so the
+        // error names `provenance` before anything is hashed
+        // (giti-1rs.7): a report cannot describe a plan with secrets, or a
+        // `local` run with no sandbox, and cannot claim a quorum to itself.
+        self.provenance.check(&self.secret_names)?;
         let mut timings: Vec<&str> = Vec::new();
         for timing in &self.claims.timings {
             if timings.contains(&timing.step.as_str()) {
@@ -967,6 +962,7 @@ impl RunManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
 
     pub(crate) fn report() -> RunReport {
         RunReport {

@@ -94,7 +94,8 @@ take the steps separately.
     }
   ],
   "provenance": {
-    "tier": "local",                          // simulated | local (never quorum: that is a verdict over runs)
+    "tier": "local",                          // simulated | local (never quorum: that is a verdict over runs —
+                                              // see docs/provenance-tiers.md)
     "runner": "gitiup 0.1.0",
     "normalisation_version": 0,               // see "normalisation" below
     "sandbox": "docker"

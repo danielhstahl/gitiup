@@ -144,8 +144,8 @@ fn a_byte_of_tampering_changes_the_digest_and_fails_the_signature() {
     let dir = fixtures_dir();
     let bytes = read(&dir.join("local").join("manifest.json"));
     let text = String::from_utf8(bytes.clone()).unwrap();
-    let tampered = text.replace("\"tier\":\"local\"", "\"tier\":\"simulated\"");
-    assert_ne!(tampered, text, "the fixture must contain the tier field");
+    let tampered = text.replacen("\"exit_code\":0", "\"exit_code\":1", 1);
+    assert_ne!(tampered, text, "the fixture must contain an exit code");
 
     let manifest = RunManifest::from_canonical_bytes(tampered.as_bytes()).unwrap();
     let doc =
@@ -169,6 +169,34 @@ fn a_byte_of_tampering_changes_the_digest_and_fails_the_signature() {
         .unwrap_err();
     assert_eq!(err.kind(), gitiup_attest::ErrorKind::Signature);
     assert_eq!(err.exit_code(), 7);
+}
+
+#[test]
+fn relabelling_a_run_as_simulated_is_refused_without_a_signature() {
+    // The cheapest forgery to attempt is a *label* change, and giti-1rs.7 is the
+    // ticket that made it fail: the tier has to agree with the sandbox and the
+    // secrets around it, so flipping one word makes the manifest ill-formed. No
+    // key, no clock and no policy needed to notice.
+    let dir = fixtures_dir();
+    let text = String::from_utf8(read(&dir.join("local").join("manifest.json"))).unwrap();
+    let relabelled = text.replace("\"tier\":\"local\"", "\"tier\":\"simulated\"");
+    assert_ne!(relabelled, text, "the fixture must contain the tier field");
+
+    let err = RunManifest::from_canonical_bytes(relabelled.as_bytes()).unwrap_err();
+    assert_eq!(err.kind(), gitiup_attest::ErrorKind::Policy);
+    assert_eq!(err.exit_code(), 6);
+    assert!(
+        err.detail().contains("simulated run cannot claim sandbox"),
+        "unexpected refusal: {}",
+        err.detail()
+    );
+
+    // The other direction of the same lie: `local` with no sandbox named.
+    let unconfined = text.replace("\"sandbox\":\"docker\",", "");
+    assert_ne!(unconfined, text);
+    let err = RunManifest::from_canonical_bytes(unconfined.as_bytes()).unwrap_err();
+    assert_eq!(err.kind(), gitiup_attest::ErrorKind::Policy);
+    assert!(err.detail().contains("must name the sandbox"));
 }
 
 #[test]

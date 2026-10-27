@@ -7,6 +7,8 @@
 //! place it existed, "trust me, the digest matches" would be the story.
 //!
 //! ```text
+//! gitiup run [OPTIONS] [JOB]            plan a workflow job (nothing is run)
+//! gitiup run --execute --sandbox <name> run it for real, and attest as `local`
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup help                           this text
@@ -31,6 +33,7 @@ use std::process::ExitCode;
 
 mod digest;
 mod normalise;
+mod run;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -40,6 +43,7 @@ USAGE:
     gitiup <COMMAND> [OPTIONS] [ARGS]
 
 COMMANDS:
+    run [OPTIONS] [JOB]            plan a workflow job; --execute to run it
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     help                        print this text
@@ -47,12 +51,19 @@ COMMANDS:
 
 REPORT is a run-report JSON file (see docs/run-report.md), or `-` for stdin.
 
-Exit codes for `digest` and `normalise`: 0 ok · 2 usage · 3 I/O · 6 invalid run
-report · 8 digest mismatch or divergence
+Exit codes for `run`, `digest` and `normalise`: 0 ok · 2 usage · 3 I/O · 6 refused
+(bad run report, disallowed tier, no sandbox) · 8 digest mismatch or divergence
 (ADR-0001 D7: 6 refused/unsupported, 8 digest mismatch — the same codes
 `gitiup verify attestation` will use).
 
+`run` never runs anything unless you say `--execute`, and what it plans attests as
+`simulated` — a plan, not evidence. Policies say which tiers they accept; the
+default accepts `local` only. There is no way to ask for `quorum`: a single run
+cannot earn it.
+
 Try:
+    gitiup run                                 # plan the only job in the workflow
+    gitiup run --execute --sandbox unshare     # run it for real: tier `local`
     gitiup digest run.json
     gitiup digest --json run.json
     gitiup digest --expect sha256:… run.json   # exit 8 if the rerun disagrees
@@ -99,6 +110,30 @@ impl CliError {
             hint: None,
         }
     }
+
+    /// 6 — refused: a policy, a tier, a sandbox, or a selection this command will
+    /// not guess on the user's behalf. The same code the library uses for the same
+    /// kind of "we will not accept this", so a merge gate cannot tell them apart.
+    fn refused(message: impl Into<String>, hint: impl Into<String>) -> CliError {
+        CliError {
+            code: 6,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    /// An error whose exit code is already decided by the library's taxonomy.
+    fn new(
+        kind: gitiup_attest::ErrorKind,
+        message: impl Into<String>,
+        hint: Option<&str>,
+    ) -> CliError {
+        CliError {
+            code: kind.exit_code(),
+            message: message.into(),
+            hint: hint.map(str::to_string),
+        }
+    }
 }
 
 /// Library errors keep their own exit code: `gitiup digest` and a merge gate
@@ -130,6 +165,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
             println!("gitiup {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "run" => run::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
@@ -150,6 +186,10 @@ mod tests {
             );
         }
         assert!(USAGE.contains("digest"));
+        assert!(
+            USAGE.contains("run [OPTIONS] [JOB]"),
+            "the ticket's own command must be in the usage text"
+        );
     }
 
     #[test]

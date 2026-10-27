@@ -362,23 +362,11 @@ impl AttestationDoc {
             ));
         }
 
-        // Provenance tier and freshness.
+        // Provenance tier and sandbox, then freshness. Same call `gitiup run` makes
+        // against its own unsigned manifest, so "what the gate will say" and "what
+        // the gate says" cannot drift (giti-1rs.7).
         let tier = self.manifest.result.provenance.tier;
-        if !policy.allowed_tiers.contains(&tier) {
-            return Err(Error::new(
-                ErrorKind::Policy,
-                "policy",
-                format!(
-                    "provenance tier '{tier_str}' is not accepted here",
-                    tier_str = tier.as_str()
-                ),
-            )
-            .with_hint(if tier == crate::manifest::Tier::Simulated {
-                "a simulated run plans but does not execute; run it for real to satisfy this gate"
-            } else {
-                "adjust the owner's allowed provenance tiers deliberately"
-            }));
-        }
+        policy.check_provenance(&self.manifest.result.provenance)?;
         let freshness = check_freshness(self.manifest.claims.claimed_at_us, policy)?;
         if let Some(not_after) = self.manifest.claims.not_after_us
             && freshness.now.0 > not_after

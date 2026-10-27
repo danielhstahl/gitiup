@@ -633,10 +633,18 @@ fn mutations() -> Vec<Mutation> {
         (
             "provenance.tier",
             |r| {
-                r.provenance.tier = if r.provenance.tier == Tier::Simulated {
-                    Tier::Local
+                // The tier cannot move on its own any more, and that is the point
+                // (giti-1rs.7): `local` names a sandbox, `simulated` names none
+                // and touches no secrets. So the probe moves the neighbours with
+                // it — what is being asserted is that the tier itself is
+                // digest-visible, not that a lone tier word is legal.
+                if r.provenance.tier == Tier::Simulated {
+                    r.provenance.tier = Tier::Local;
+                    r.provenance.sandbox = Some("probe-sandbox".into());
                 } else {
-                    Tier::Simulated
+                    r.provenance.tier = Tier::Simulated;
+                    r.provenance.sandbox = None;
+                    r.secret_names.clear();
                 }
             },
             Reach::Result,

@@ -1,0 +1,45 @@
+[package]
+name = "gitiup-run"
+description = "Workflow planning and provenance: simulate by default, execute only inside a sandbox you named"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# giti-1rs.7: the tier the result carries is decided *here*, where the difference
+# between "planned" and "executed" is a fact about this process. Two rules shape
+# the crate:
+#
+# * **Simulation is the default and is total.** The plan path opens no socket,
+#   spawns no process, reads no secret and writes nothing outside the files the
+#   caller named — that is not a convention, it is the module boundary: `yaml`,
+#   `workflow`, `plan` and `simulate` never touch `std::process`, and
+#   `tests/no_side_effects.rs` fails the build if they start.
+# * **A tier is earned.** The `local` tier requires a sandbox that was probed and
+#   found, because an attestation saying "this really ran" is only worth the
+#   confinement claim next to it. `sandbox` is the seam giti-bgy.1 fills in;
+#   nothing here invents a backend it has not verified.
+#
+# Dependencies: the format crate, and the normaliser the executed logs are run
+# through. No argument parser, no YAML library, no HTTP: a workflow file is read
+# by `yaml`, a deliberately small subset reader that refuses what it cannot parse
+# rather than guessing (see its module docs).
+
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+# Executed output is normalised before it is hashed, by the same profile a
+# verifier uses, so a local run and a volunteer's rerun can converge. The
+# simulated path does not need it — a plan's text is written here and contains
+# nothing machine-specific — but one crate carrying both paths means one set of
+# rules.
+gitiup-normalise = { path = "../gitiup-normalise" }
+
+[dev-dependencies]
+# Test-only: the fixtures in `tests/` hand over run reports as JSON, the same shape
+# a runner writes. The library itself still depends on nothing but the format crate
+# and the normaliser.
+serde_json = "1"
+
+[lints]
+workspace = true

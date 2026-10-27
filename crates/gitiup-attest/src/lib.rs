@@ -25,6 +25,8 @@
 //!| the run digest pipeline (report → manifest → digests) | D4, D5 | [`run`], [`run::RunReport`], [`RunManifest::from_run`] |
 //!| the volatile-field register | D5 | [`manifest::Claims`], [`run::StepReport::timing`] |
 //!| claimed time + policy freshness window | D6 | [`policy`], [`time`] |
+//!| provenance tiers, and what each may claim | giti-1rs.7 | [`Tier`], [`Provenance::check`] |
+//!| the policy file a repo writes (`gitiup-policy.json`) | giti-1rs.7 | [`PolicyFile`] |
 //!| limits, and what a verifier may refuse | D7 | [`canon::MAX_ENCODED_BYTES`], [`RunManifest::validate`] |
 //!| versioning and migration | D8 | [`schema`], [`error::ErrorKind::UnsupportedSchema`] |
 //!| log anchoring as a separate record (intentionally *not* implemented yet) | D9 | the ADR only |
@@ -104,13 +106,15 @@ pub use envelope::{
 pub use error::{Error, ErrorKind, Result};
 pub use key::{PublicKey, Signature, SignatureAlgorithm, SignatureEntry, Signer, SigningKey};
 pub use manifest::{
-    ActionPin, Artifact, Claims, Environment, EventContext, ImageRef, InputValue,
-    NormalisationDiff, Provenance, RUN_MANIFEST_TYPE, ResultDigest, RunManifest, RunResult,
-    SCHEMA_VERSION, Source, Step, StepOutcome, StepTiming, Tier, ToolchainEntry, WorkflowRef,
+    ActionPin, Artifact, Claims, Environment, EventContext, ImageRef, InputValue, NO_SANDBOX,
+    NO_SANDBOX_ALIASES, NormalisationDiff, Provenance, RUN_MANIFEST_TYPE, ResultDigest,
+    RunManifest, RunResult, SCHEMA_VERSION, Source, Step, StepOutcome, StepTiming, Tier,
+    ToolchainEntry, WorkflowRef,
 };
 pub use oid::{GitOid, OidAlgorithm};
 pub use policy::{
-    DEFAULT_MAX_AGE_US, DEFAULT_MAX_CLOCK_SKEW_US, Freshness, Policy, Trust, check_freshness,
+    DEFAULT_MAX_AGE_US, DEFAULT_MAX_CLOCK_SKEW_US, Freshness, POLICY_FILE_NAME, POLICY_PATH_ENV,
+    POLICY_SCHEMA_VERSION, Policy, PolicyFile, Trust, check_freshness,
 };
 pub use run::{
     ArtifactReport, ClaimReport, EnvironmentReport, EventReport, Material, Normaliser, RawText,

@@ -65,7 +65,8 @@ fn report() -> String {
              "outputs": {"coverage": "91"},
              "artifacts": [{"name": "cov", "content": {"text": "TN:\n"}, "size_bytes": 3}]}
         ],
-        "provenance": {"tier": "local", "runner": "gitiup 0.1.0", "normalisation_version": 0},
+        "provenance": {"tier": "local", "runner": "gitiup 0.1.0", "normalisation_version": 0,
+                       "sandbox": "docker"},
         "claims": {"run_id": "0123456789abcdef", "claimed_at_us": 1793092502500000}
     }"#
     .to_string()
