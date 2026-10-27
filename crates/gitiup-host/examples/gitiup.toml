@@ -1,0 +1,45 @@
+# Sample gitiup.toml — one repo, four kinds of remote.
+#
+# gitiup finds this file by walking up from the working directory; set
+# GITIUP_CONFIG=/path/to/file to point at it explicitly.
+# Copy it to `gitiup.toml` in your repo root and edit.
+
+schema-version = 1
+default-remote = "origin"
+
+# The owner's bucket is the forge: refs, packs and records all live in it.
+[[remote]]
+name = "origin"
+url = "s3://gitiup-forge/my-repo"
+store-prefix = "gitiup"
+credentials-profile = "owner"
+timeout = "45s"
+
+[remote.options]
+region = "eu-central-1"
+
+# A plain git repo over smart-HTTP, e.g. a read-only mirror on nginx.
+[[remote]]
+name = "mirror"
+url = "https://git.example.com/owner/my-repo.git"
+timeout = 120
+
+# A bare repo on a box you ssh into. The scp-like form
+# `git@build.example.net:srv/git/my-repo.git` is accepted too.
+[[remote]]
+name = "colo"
+url = "ssh://git@build.example.net:2222/srv/git/my-repo.git"
+credentials-profile = "deploy"
+
+# A local directory — what the tests and air-gapped setups use.
+[[remote]]
+name = "scratch"
+url = "file:///srv/git/my-repo.git"
+
+[credentials.owner]
+auth = "cloud-role"          # resolved from the AWS chain: env, profile, SSO, IRSA
+token-env = "GITIUP_TOKEN"   # read from the environment only if it is set
+
+[credentials.deploy]
+auth = "ssh-key"
+key-path = "~/.ssh/id_ed25519"

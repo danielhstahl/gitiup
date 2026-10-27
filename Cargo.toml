@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["gitiup contributors"]
+repository = "https://github.com/gitiup/gitiup"
+rust-version = "1.88"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

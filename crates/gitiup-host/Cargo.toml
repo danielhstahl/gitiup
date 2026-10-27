@@ -1,0 +1,27 @@
+[package]
+name = "gitiup-host"
+description = "Host abstraction for gitiup: refs, packs and a content-addressed blob store, with zero forge dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# NOTE: this crate is the *core* host abstraction. It must stay free of forge
+# (GitHub/GitLab/...) clients: adapters live behind feature-gated submodules
+# added by later tickets (see giti-xdw.4) and every default-feature build must
+# be forge-free. `tests/no_forge_deps.rs` enforces this.
+[features]
+default = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
