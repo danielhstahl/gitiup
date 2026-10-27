@@ -943,6 +943,7 @@ name = "gitiup"
 version = "0.1.0"
 dependencies = [
  "gitiup-attest",
+ "gitiup-normalise",
  "serde_json",
  "tempfile",
 ]
@@ -969,6 +970,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "gitiup-normalise"
+version = "0.1.0"
+dependencies = [
+ "gitiup-attest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

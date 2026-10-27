@@ -1,0 +1,30 @@
+[package]
+name = "gitiup-normalise"
+description = "Output normalisation and the reproducibility contract: the rules that make independent reruns of one workflow converge on one digest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Normalisation is deliberately **not** in `gitiup-attest`: that crate is the wire
+# format, and it stays small, I/O-free and auditable because a `pre-receive` hook has
+# to link it (see its tests/dependency_hygiene.rs). Rewriting log text is a pile of
+# heuristics, and a pile of heuristics has no business inside a trust boundary — the
+# verifier compares digests, it does not need to know what a timestamp looks like.
+#
+# This crate is I/O-free too, for the same reason and a second one: the runner that
+# produces digests and the tool that compares two runs must use the *same* rules, so
+# they are a library, not a command.
+#
+# No regex dependency: the matchers in `grammar.rs` are hand-written, which keeps the
+# dependency list empty and makes every recogniser readable (and refusals testable)
+# instead of encoded in a pattern nobody wants to re-derive.
+
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

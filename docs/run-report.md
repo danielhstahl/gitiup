@@ -174,13 +174,22 @@ because two results normalised by different rules are not comparable.
 * If the report hands over **raw log text**, the declared version must equal the
   version of the [`Normaliser`](../crates/gitiup-attest/src/run.rs) that will be
   applied: `RunManifest::from_run` uses `RawText` (version `0`, "rewrote
-  nothing"), and `RunManifest::from_run_with(report, &profile)` takes giti-1rs.3's
-  profile and records *its* version. A report that hands over raw text while
+  nothing"), and `RunManifest::from_run_with(report, &profile)` takes a profile —
+  [`gitiup_normalise::Profile`](../crates/gitiup-normalise) is version `1`, `repro` —
+  and records *its* version. A report that hands over raw text while
   claiming version `7` is refused rather than believed.
 * If the logs arrived pre-hashed, the declared version is kept as the runner's
   claim about the profile it used.
 * An empty stream needs no profile — every profile hashes it the same — which is
   why a report may omit a step's empty `stderr` whatever the declared version.
+
+What version `1` rewrites, why, and what a workflow must do so that there is as
+little as possible to rewrite is
+[reproducibility — the contract](reproducibility.md); `gitiup normalise` prints the
+record for one run and compares two. A `kind` is any string (the format does not
+enumerate one), but the names version `1` emits are the twelve rule names plus the
+field names `exit-code`, `output:<name>`, `artifact:<name>`, `input:<name>`,
+`pin:<name>`, `source:*` and `step`, each suffixed `:stderr` for the error stream.
 
 ## Order, whitespace, and what is genuinely part of a digest
 
@@ -192,9 +201,11 @@ because two results normalised by different rules are not comparable.
 * **Ordered**: `steps`. Execution order is a fact about the run.
 * **Whitespace**: none of the *report's* whitespace is hash-visible, because a
   report is parsed and never encoded. Whitespace *inside a log line* is content:
-  it is part of the digest until giti-1rs.3 normalises it, and that ticket's
-  reproducibility contract (pin actions, pin images, honour `SOURCE_DATE_EPOCH`,
-  canonical line endings) is what makes two machines' logs hash alike.
+  it is part of the digest unless a profile rewrites it — version `1` canonicalises
+  line endings and field spacing, and the
+  [reproducibility contract](reproducibility.md) (pin actions, pin images, honour
+  `SOURCE_DATE_EPOCH`, sorted manifests) is what makes two machines' logs hash
+  alike in the first place.
 * **No floats, no nulls**: integers only in everything that reaches the manifest
   ([ADR-0001 D1](adr/0001-attestation-encoding-hash-and-signature.md)), and an
   absent field is an omitted key. `"duration_us": 5.5` is refused, not truncated.

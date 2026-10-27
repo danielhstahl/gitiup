@@ -1,8 +1,9 @@
 # gitiup (CLI)
 
 The command line. Thin on purpose: every rule about *what a digest is* lives in
-[`gitiup-attest`](../gitiup-attest/README.md), and this crate only reads a run
-report, calls that crate and prints. Two reasons to insist on that:
+[`gitiup-attest`](../gitiup-attest/README.md) and — since normalisation — in
+[`gitiup-normalise`](../gitiup-normalise/README.md), and this crate only reads a run
+report, calls those crates and prints. Two reasons to insist on that:
 
 * the number printed here and the number a stranger recomputes must be the same
   number, so there is exactly one implementation of the computation;
@@ -49,6 +50,56 @@ runs of the same change are supposed to agree on.
 gitiup digest --expect "$(cat expected-digest)" run.json || echo "rerun disagrees (exit 8)"
 ```
 
+## `gitiup normalise`
+
+The other half of the claim: what did normalisation do to my logs, and did two runs
+agree. The rules live in
+[`gitiup-normalise`](../gitiup-normalise/README.md) and the contract they sit inside
+is [documented here](../../docs/reproducibility.md); this prints them.
+
+```console
+$ gitiup normalise crates/gitiup-normalise/tests/fixtures/corpus/machine-b/run.json
+profile        repro v1
+result         sha256:00bf7ddb547f5fc3fdfde522206566b3efb8e8b65ca66464069bfd5f22ab1f0b
+rewritten      24 rewrites · no progress lines dropped · 5 streams
+
+checkout stdout: 7 rewrites
+  line-ending  (stream)
+    - stdout: CRLF line endings
+    + stdout: LF line endings
+  identity     line 1
+    - Runner host: build-07.example
+    + Runner host: <host>
+```
+
+```text
+gitiup normalise [OPTIONS] [REPORT]
+gitiup normalise [OPTIONS] --compare <OTHER> [REPORT]
+
+    REPORT                 run-report JSON file, or - for stdin (default: stdin)
+    --compare <REPORT>     compare two runs instead of describing one
+    --rules <LIST>         comma-separated rule names to apply (diagnosis, not policy)
+    --text                 print the normalised log text too
+    --json                 machine-readable output (keys sorted, one line)
+    --expect-result <d>    exit 8 unless the ResultDigest equals this
+```
+
+`--compare` is the question a reproducibility failure asks. Two runs that still
+disagree produce a structured divergence — step, field, both sides, with the log
+line number — and exit `8`:
+
+```console
+$ gitiup normalise broken.json --compare good.json; echo "exit $?"
+converged      no (3 divergences)
+result A       sha256:ee4e6946df04e79e71dae24c72fea5dd4361c4aae0b10aa0a92ab0fc5090c518
+result B       sha256:00bf7ddb547f5fc3fdfde522206566b3efb8e8b65ca66464069bfd5f22ab1f0b
+test             exit-code                - 101
+                                          + 0
+test             outcome                  - "failure"
+                                          + "success"
+exit 8
+```
+
 Exit codes follow [ADR-0001 D7](../../docs/adr/0001-attestation-encoding-hash-and-signature.md)
 where they overlap, because gates branch on the numbers:
 
@@ -58,7 +109,7 @@ where they overlap, because gates branch on the numbers:
 | 2 | usage: unknown flag, missing value, no report on stdin |
 | 3 | I/O: the report could not be read |
 | 6 | the report is not a valid run report, or this build cannot read it |
-| 8 | digest mismatch: the rerun disagreed with `--expect` |
+| 8 | digest mismatch: the rerun disagreed with `--expect`, or two runs did not converge |
 
 ## What is deliberately *not* here yet
 
@@ -73,9 +124,12 @@ line before any of the machinery around it is built.
 * `tests/digest_cli.rs` — runs the built binary: both digests, stdin, `--json`,
   `--quiet`, `--expect` both ways, every exit code, and the committed golden
   fixtures (so the CLI cannot drift from the pinned vectors).
+* `tests/normalise_cli.rs` — the same for `normalise`: the rewrite record, `--json`
+  agreeing with the library, two machines converging, a real divergence as exit `8`
+  naming step, field and both sides, `--rules`, and every exit code.
 * `tests/doc_examples.rs` — the worked report in `docs/run-report.md`, parsed and
   digested: the documentation example is the pinned example.
-* `tests/cli_hygiene.rs` — the dependency list stays at two crates, no network or
+* `tests/cli_hygiene.rs` — the dependency list stays at three crates, no network or
   forge client is reachable from here, and the documented exit codes are the ones
   the code uses.
 
@@ -86,5 +140,5 @@ cargo build -p gitiup
 cargo test -p gitiup
 ```
 
-Dependencies: `gitiup-attest`, `serde_json`. No argument parser, no HTTP client,
-no C toolchain.
+Dependencies: `gitiup-attest`, `gitiup-normalise`, `serde_json`. No argument
+parser, no HTTP client, no C toolchain.

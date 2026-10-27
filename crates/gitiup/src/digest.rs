@@ -326,7 +326,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn read_report(source: Option<&str>) -> Result<Vec<u8>, CliError> {
+pub(crate) fn read_report(source: Option<&str>) -> Result<Vec<u8>, CliError> {
     match source.unwrap_or("-") {
         "-" => {
             let mut buffer = Vec::new();

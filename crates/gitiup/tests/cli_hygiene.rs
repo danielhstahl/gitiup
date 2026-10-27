@@ -2,10 +2,13 @@
 //!
 //! Two properties worth more than the convenience they cost:
 //!
-//! 1. **the CLI decides nothing about the format.** It depends on `gitiup-attest`
-//!    and a JSON parser, nothing else. Every extra dependency is a place where the
-//!    digest printed here could differ from the digest a verifier recomputes, and
-//!    the second JSON library or arg-parser is where that happens.
+//! 1. **the CLI decides nothing about the format.** It depends on `gitiup-attest`,
+//!    `gitiup-normalise` and a JSON parser, nothing else. Every extra dependency is
+//!    a place where the digest printed here could differ from the digest a verifier
+//!    recomputes, and the second JSON library or arg-parser is where that happens.
+//!    The normaliser is allowed because it is not an opinion about the digest — for
+//!    `normalisation_version` 1 it *is* the computation, and leaving it out would
+//!    mean the CLI re-implemented the rules somewhere a verifier never looks.
 //! 2. **the exit codes users branch on are one table, not two.** The usage text,
 //!    the module docs and the library's own taxonomy have to agree, because a
 //!    merge gate is written against the numbers.
@@ -14,7 +17,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// What the binary may depend on directly.
-const ALLOWED_DEPENDENCIES: [&str; 2] = ["gitiup-attest", "serde_json"];
+const ALLOWED_DEPENDENCIES: [&str; 3] = ["gitiup-attest", "gitiup-normalise", "serde_json"];
 
 /// Anything that could put a network, a forge client or a second digest
 /// implementation behind the command line. Chosen as crate names, deliberately:

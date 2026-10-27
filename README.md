@@ -19,6 +19,7 @@ Two goals, one tool:
 | `gitiup`        | the command line: `gitiup digest` turns a local run report into the digests a stranger can check — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
+| `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 
 Later work adds the runner, quorum and CLI crates under `crates/`; the
 workspace globs `crates/*`, so a new crate is just `members`-free.
@@ -30,10 +31,16 @@ workspace globs `crates/*`, so a new crate is just `members`-free.
   [`gitiup-attest`](crates/gitiup-attest/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
+* [Reproducibility — the contract](docs/reproducibility.md) — what a workflow must do
+  so its products are the same bytes twice (pin by SHA, images by digest, sorted
+  manifests, `SOURCE_DATE_EPOCH`), what the runner rewrites instead (the twelve
+  rules), and how a divergence is reported.
 * [Host abstraction design notes](docs/host-abstraction.md) — the contracts every
   host owes, including the ref namespaces, store layout, pack format and error
   taxonomy.
 * [`gitiup-host` README](crates/gitiup-host/README.md) — the API surface.
+* [`gitiup-normalise` README](crates/gitiup-normalise/README.md) — the normalisation
+  profile and its version story.
 * [ADR index](docs/adr/README.md) — where the decisions that several tickets depend on
   are kept.
 
@@ -57,6 +64,10 @@ Try it out without any infrastructure:
 ```sh
 cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
 cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
+cargo run -p gitiup -- normalise crates/gitiup-normalise/tests/fixtures/corpus/machine-a/run.json
+cargo run -p gitiup -- normalise --compare \
+    crates/gitiup-normalise/tests/fixtures/corpus/machine-a/run.json \
+    crates/gitiup-normalise/tests/fixtures/corpus/machine-b/run.json
 cargo run -p gitiup-host --example fs_tour        # refs, CAS, packs on a temp dir
 cargo run -p gitiup-host --example s3_tour        # the same against an in-process S3 bucket
 cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml

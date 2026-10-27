@@ -1,0 +1,153 @@
+{
+  "repo": "gitiup/gitiup",
+  "commit": "sha1:1111111111111111111111111111111111111111",
+  "workflow": {
+    "path": ".github/workflows/ci.yml",
+    "text": "name: CI\non:\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-24.04\n"
+  },
+  "event": {
+    "name": "pull_request",
+    "action": "synchronize",
+    "payload": {
+      "text": "{\"action\":\"synchronize\",\"number\":7}"
+    }
+  },
+  "job": "build",
+  "matrix": {
+    "os": "ubuntu-24.04"
+  },
+  "inputs": {
+    "coverage": true,
+    "jobs": 4,
+    "toolchain": "1.99.1"
+  },
+  "secret_names": [
+    "CODECOV_TOKEN",
+    "NPM_TOKEN"
+  ],
+  "pins": {
+    "actions/checkout@v4": {
+      "repo": "actions/checkout",
+      "commit": "sha1:cccccccccccccccccccccccccccccccccccccccc",
+      "ref": "v4"
+    }
+  },
+  "reusable_workflows": [
+    {
+      "path": ".github/workflows/_lint.yml",
+      "oid": "sha1:dddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "environment": {
+    "provider": "docker",
+    "os": "linux",
+    "arch": "x86_64",
+    "image": {
+      "reference": "ghcr.io/gitiup/ci:2026-10",
+      "digest": "sha256:b8ae17dc1f09c93e5e9db6fe30f0f0890f63a4076ba4fbe1a8efcced474f6b1a"
+    },
+    "toolchain": [
+      {
+        "name": "cargo",
+        "version": "1.99.1"
+      },
+      {
+        "name": "rustc",
+        "version": "1.99.1"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "checkout",
+      "name": "Checkout",
+      "uses": "actions/checkout@v4",
+      "exit_code": 0,
+      "stdout": {
+        "text": "Runner host: build-07.example\r\nuid=1000(ci) gid=1000(ci) groups=1000(ci),27(sudo)\r\n[2026-10-27 09:11:12] Syncing repository gitiup/gitiup\r\nci@build-07:~$\r\n> git fetch --no-tags --prune --depth=1 origin +refs/pull/7/merge:\r\nHEAD is now at 1a2b3c4 Add the runner\r\nDate:   Mon, 27 Oct 2026 09:11:15 +0000\r\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "timing": {
+        "started_us": 1793092400000000,
+        "duration_us": 4003120
+      }
+    },
+    {
+      "id": "build",
+      "name": "cargo build",
+      "exit_code": 0,
+      "stdout": {
+        "text": "   Compiling gitiup v0.1.0 (/tmp/build0a9f)\r\nwarning: unused variable: `scratch`\r\nFinished dev [unoptimized + debuginfo] target(s) in 2.004s\r\nworkspace /tmp/build0a9f/target/debug/gitiup\r\nDownloading 100%\r\nsize 1536 bytes target/debug/gitiup\r\n"
+      },
+      "stderr": {
+        "text": "warning: 1 warning emitted\r\n"
+      },
+      "timing": {
+        "started_us": 1793092404003120,
+        "duration_us": 2004000
+      }
+    },
+    {
+      "id": "test",
+      "name": "cargo test",
+      "exit_code": 0,
+      "stdout": {
+        "text": "test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\nok coverage: 1234567 lines covered in 1,5 seconds\r\n-rw-r--r--  1 ci ci 1536 Oct 27 09:15 README.md\r\ndrwxr-xr-x  4 ci ci 4096 Oct 27 09:14 target\r\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "timing": {
+        "started_us": 1793092406007120,
+        "duration_us": 3400000
+      }
+    },
+    {
+      "id": "package",
+      "name": "Package",
+      "exit_code": 0,
+      "stdout": {
+        "text": "dist/SHA256SUMS\r\ndist/coverage.lcov\r\ndist/gitiup-linux-x86_64.tar.gz\r\n${TMPDIR}/x/dist/gitiup.tar\r\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "outputs": {
+        "size": "1536"
+      },
+      "artifacts": [
+        {
+          "name": "coverage",
+          "content": {
+            "files": {
+              "cov/lcov.info": {
+                "text": "TN:\nDA:1,1\n"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "provenance": {
+    "tier": "local",
+    "runner": "gitiup 0.1.0",
+    "normalisation_version": 1,
+    "sandbox": "docker"
+  },
+  "claims": {
+    "run_id": "ffeeddccbbaa0011",
+    "claimed_at_us": 1793092409547122,
+    "timings": [
+      {
+        "step": "package",
+        "duration_us": 140002
+      }
+    ],
+    "annotations": {
+      "x_ci": "self-hosted"
+    }
+  }
+}

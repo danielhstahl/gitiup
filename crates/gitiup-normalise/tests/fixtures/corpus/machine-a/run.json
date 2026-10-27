@@ -1,0 +1,153 @@
+{
+  "repo": "gitiup/gitiup",
+  "commit": "sha1:1111111111111111111111111111111111111111",
+  "workflow": {
+    "path": ".github/workflows/ci.yml",
+    "text": "name: CI\non:\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-24.04\n"
+  },
+  "event": {
+    "name": "pull_request",
+    "action": "synchronize",
+    "payload": {
+      "text": "{\"action\":\"synchronize\",\"number\":7}"
+    }
+  },
+  "job": "build",
+  "matrix": {
+    "os": "ubuntu-24.04"
+  },
+  "inputs": {
+    "coverage": true,
+    "jobs": 4,
+    "toolchain": "1.99.1"
+  },
+  "secret_names": [
+    "CODECOV_TOKEN",
+    "NPM_TOKEN"
+  ],
+  "pins": {
+    "actions/checkout@v4": {
+      "repo": "actions/checkout",
+      "commit": "sha1:cccccccccccccccccccccccccccccccccccccccc",
+      "ref": "v4"
+    }
+  },
+  "reusable_workflows": [
+    {
+      "path": ".github/workflows/_lint.yml",
+      "oid": "sha1:dddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "environment": {
+    "provider": "docker",
+    "os": "linux",
+    "arch": "x86_64",
+    "image": {
+      "reference": "ghcr.io/gitiup/ci:2026-10",
+      "digest": "sha256:b8ae17dc1f09c93e5e9db6fe30f0f0890f63a4076ba4fbe1a8efcced474f6b1a"
+    },
+    "toolchain": [
+      {
+        "name": "cargo",
+        "version": "1.99.1"
+      },
+      {
+        "name": "rustc",
+        "version": "1.99.1"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "checkout",
+      "name": "Checkout",
+      "uses": "actions/checkout@v4",
+      "exit_code": 0,
+      "stdout": {
+        "text": "Runner host: fv-az1024.internal\nuid=1001(runner) gid=1001(runner) groups=1001(runner)\n[2026-10-27T09:11:12.481392Z] Syncing repository gitiup/gitiup\nrunner@fv-az1024:~$\n> git fetch --no-tags --prune --depth=1 origin +refs/pull/7/merge:\nHEAD is now at 1a2b3c4 Add the runner\nDate:   Mon Oct 27 09:11:13 2026 +0000\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "timing": {
+        "started_us": 1793092272481392,
+        "duration_us": 1120004
+      }
+    },
+    {
+      "id": "build",
+      "name": "cargo build",
+      "exit_code": 0,
+      "stdout": {
+        "text": "\u001b[1m\u001b[32m   Compiling\u001b[0m gitiup v0.1.0 (/home/runner/work/gitiup/gitiup)\nwarning: unused variable: `scratch`\nFinished dev [unoptimized + debuginfo] target(s) in 41.283s\nworkspace /home/runner/work/gitiup/gitiup/target/debug/gitiup\n\r####---- 45%\nDownloading 12%\rDownloading 47%\rDownloading 100%\nsize 1.5 KiB target/debug/gitiup\n"
+      },
+      "stderr": {
+        "text": "warning: 1 warning emitted\n"
+      },
+      "timing": {
+        "started_us": 1793092273601400,
+        "duration_us": 41283002
+      }
+    },
+    {
+      "id": "test",
+      "name": "cargo test",
+      "exit_code": 0,
+      "stdout": {
+        "text": "test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\u001b[32mok\u001b[0m coverage: 1,234,567 lines covered in 1.5 seconds\ndrwxr-xr-x  4 runner runner 4096 Oct 27 09:11 target\n-rw-r--r--  1 runner runner 1536 Oct 27 09:12 README.md\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "timing": {
+        "started_us": 1793092314884402,
+        "duration_us": 903011
+      }
+    },
+    {
+      "id": "package",
+      "name": "Package",
+      "exit_code": 0,
+      "stdout": {
+        "text": "dist/gitiup-linux-x86_64.tar.gz\ndist/SHA256SUMS\ndist/coverage.lcov\n$RUNNER_TEMP/dist/gitiup.tar\n"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "outputs": {
+        "size": "1536"
+      },
+      "artifacts": [
+        {
+          "name": "coverage",
+          "content": {
+            "files": {
+              "cov/lcov.info": {
+                "text": "TN:\nDA:1,1\n"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "provenance": {
+    "tier": "local",
+    "runner": "gitiup 0.1.0",
+    "normalisation_version": 1,
+    "sandbox": "docker"
+  },
+  "claims": {
+    "run_id": "0a0b0c0d0e0f1011",
+    "claimed_at_us": 1793092315848417,
+    "timings": [
+      {
+        "step": "package",
+        "duration_us": 61004
+      }
+    ],
+    "annotations": {
+      "x_ci": "hosted"
+    }
+  }
+}

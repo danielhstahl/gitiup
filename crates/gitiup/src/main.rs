@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
+//! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -29,6 +30,7 @@
 use std::process::ExitCode;
 
 mod digest;
+mod normalise;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -38,13 +40,15 @@ USAGE:
     gitiup <COMMAND> [OPTIONS] [ARGS]
 
 COMMANDS:
-    digest [OPTIONS] [REPORT]   compute the RunDigest of a local run
+    digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
+    normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     help                        print this text
     version                     print the version of this build
 
 REPORT is a run-report JSON file (see docs/run-report.md), or `-` for stdin.
 
-Exit codes for `digest`: 0 ok · 2 usage · 3 I/O · 6 invalid run report · 8 digest mismatch
+Exit codes for `digest` and `normalise`: 0 ok · 2 usage · 3 I/O · 6 invalid run
+report · 8 digest mismatch or divergence
 (ADR-0001 D7: 6 refused/unsupported, 8 digest mismatch — the same codes
 `gitiup verify attestation` will use).
 
@@ -52,6 +56,8 @@ Try:
     gitiup digest run.json
     gitiup digest --json run.json
     gitiup digest --expect sha256:… run.json   # exit 8 if the rerun disagrees
+    gitiup normalise run.json                  # what was rewritten, and why
+    gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
 ";
 
 fn main() -> ExitCode {
@@ -125,6 +131,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         "digest" => digest::run(&args[1..]),
+        "normalise" => normalise::run(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }

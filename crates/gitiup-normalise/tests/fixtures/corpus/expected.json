@@ -1,0 +1,39 @@
+{
+  "comment": "One workflow, two machines. The ResultDigests are equal because gitiup-normalise rewrites what a log says about the machine; they are NOT equal without normalisation (see the `naive` digests below, and tests/corpus.rs). Regenerate with GITIUP_UPDATE_FIXTURES=1 cargo run -p gitiup-normalise --example make_corpus.",
+  "kinds": {
+    "machine-a": [
+      "ansi",
+      "duration",
+      "identity",
+      "listing",
+      "number",
+      "path",
+      "percent",
+      "progress",
+      "size",
+      "spacing",
+      "timestamp"
+    ],
+    "machine-b": [
+      "duration",
+      "identity",
+      "line-ending",
+      "line-ending:stderr",
+      "path",
+      "percent",
+      "size",
+      "spacing",
+      "timestamp"
+    ]
+  },
+  "naive_result_digests": [
+    "sha256:78e561f6de669be18d976a49ea0115bed1ee0b658d2f3a0643e1a311c54bb7d2",
+    "sha256:ced034d293890327bded0055384931526ef4a1e0edf19d60bd9616743d1334ca"
+  ],
+  "profile_version": 1,
+  "result_digest": "sha256:00bf7ddb547f5fc3fdfde522206566b3efb8e8b65ca66464069bfd5f22ab1f0b",
+  "result_digests": {
+    "machine-a": "sha256:00bf7ddb547f5fc3fdfde522206566b3efb8e8b65ca66464069bfd5f22ab1f0b",
+    "machine-b": "sha256:00bf7ddb547f5fc3fdfde522206566b3efb8e8b65ca66464069bfd5f22ab1f0b"
+  }
+}
