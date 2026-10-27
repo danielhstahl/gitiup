@@ -473,6 +473,18 @@ impl RunManifest {
         canon::to_bytes(self)
     }
 
+    /// The bytes to sign and to store: the canonical encoding, per
+    /// [ADR-0001 D1](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md).
+    ///
+    /// The producer-facing name for [`Self::canonical_bytes`], spelled out
+    /// because "encode" is the step giti-1rs.2's pipeline talks about (*build →
+    /// normalize → encode → digest → sign*) and because there is exactly one
+    /// answer: no pretty-printing, no second encoding, no leniency. Bytes written
+    /// by anything else are a different attestation of the same run.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.canonical_bytes()
+    }
+
     /// Re-parse bytes that claim to be a canonical manifest, then check them.
     ///
     /// This is the only sanctioned way to read a manifest from storage: bytes that

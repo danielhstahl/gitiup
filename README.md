@@ -16,6 +16,7 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
+| `gitiup`        | the command line: `gitiup digest` turns a local run report into the digests a stranger can check — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs` and `s3` (bucket-as-forge) hosts, and `gitiup.toml` remote config |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
 
@@ -27,6 +28,8 @@ workspace globs `crates/*`, so a new crate is just `members`-free.
   over DSSE PAE, `result`/`claims` split, freshness as policy).
   The decisions are in the ADR, the implementation is
   [`gitiup-attest`](crates/gitiup-attest/README.md).
+* [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
+  that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
 * [Host abstraction design notes](docs/host-abstraction.md) — the contracts every
   host owes, including the ref namespaces, store layout, pack format and error
   taxonomy.
@@ -52,10 +55,17 @@ cargo build -p gitiup-host --features s3
 Try it out without any infrastructure:
 
 ```sh
+cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
+cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
 cargo run -p gitiup-host --example fs_tour        # refs, CAS, packs on a temp dir
 cargo run -p gitiup-host --example s3_tour        # the same against an in-process S3 bucket
 cargo run -p gitiup-host --example remote_show    # render examples/gitiup.toml
 ```
+
+`gitiup digest` prints the `RunDigest` and `ResultDigest` of a run report — the same
+two numbers a third party recomputes from the signed attestation, from the same
+function. `--expect` makes "did this rerun converge?" a single command that exits 8
+when it did not.
 
 ## Where the design docs live
 

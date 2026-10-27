@@ -1,0 +1,41 @@
+{
+  "claims": {
+    "claimed_at_us": 1793092502500000,
+    "run_id": "0a0b0c0d0e0f1011"
+  },
+  "commit": "sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "environment": {
+    "arch": "x86_64"
+  },
+  "event": {
+    "name": "push",
+    "payload": {
+      "text": "{\"ref\":\"refs/heads/main\"}"
+    }
+  },
+  "job": "hi",
+  "provenance": {
+    "normalisation_version": 0,
+    "runner": "gitiup 0.1.0",
+    "sandbox": "none",
+    "tier": "simulated"
+  },
+  "repo": "gitiup/gitiup",
+  "steps": [
+    {
+      "exit_code": 0,
+      "id": "say",
+      "name": "Say hello",
+      "stderr": {
+        "text": ""
+      },
+      "stdout": {
+        "text": "hello from a simulated run\n"
+      }
+    }
+  ],
+  "workflow": {
+    "path": ".github/workflows/hello.yml",
+    "text": "name: hello\non: push\njobs:\n  hi:\n    runs-on: ubuntu-24.04\n"
+  }
+}

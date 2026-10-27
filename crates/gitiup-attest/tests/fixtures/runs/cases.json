@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "name": "hello",
+      "normalisation_version": 0,
+      "note": "a simulated plan: one step, everything handed over in the clear",
+      "result_digest": "sha256:28c73827c9a5506837c179128bca275f7f0ef42d84375f1b408573cfd62e82e4",
+      "run_digest": "sha256:5b71fcfdccb72830d84e1423292ede463d2216fe72c2a4cab2e3b354b8deb819",
+      "steps": 1,
+      "tier": "simulated"
+    },
+    {
+      "name": "matrix-build",
+      "normalisation_version": 1,
+      "note": "matrix arm of a real local run: pins, inputs, secrets, closure, artifacts",
+      "result_digest": "sha256:85d5a664e3b6974d11bf37e9c7fcc199c8de63cdd2987fc4372c5f22367dc0f6",
+      "run_digest": "sha256:50792b87b8fac6ba937acdad651dc48b5509c72d7272a9b1db2f806c32d452e5",
+      "steps": 3,
+      "tier": "local"
+    },
+    {
+      "name": "image-build-skipped",
+      "normalisation_version": 1,
+      "note": "digest-pinned image and toolchain inventory, with a conditional step that did not run",
+      "result_digest": "sha256:526a8a6b5cea70999964d85412391b0b52f30447134e1285096ab6063d7fa915",
+      "run_digest": "sha256:f3cd5623eaa724a851a13000c85c85e6d091460ae2452105a995942478185103",
+      "steps": 2,
+      "tier": "local"
+    },
+    {
+      "name": "test-failure",
+      "normalisation_version": 0,
+      "note": "a failing run is still provable: exit codes, stderr, a skipped follow-on",
+      "result_digest": "sha256:fee3b8e9194ff042b5725fd200f3b2360a9ab2b8c57a9b121e1aebb74d2ed88f",
+      "run_digest": "sha256:994698a11e4cbe855aedf227980bc75f74342b470e611c519dbe45bb864f1b1f",
+      "steps": 3,
+      "tier": "local"
+    },
+    {
+      "name": "dispatch-release",
+      "normalisation_version": 1,
+      "note": "workflow_dispatch with every input type, a sha256 commit and quorum-side claims",
+      "result_digest": "sha256:e2d89d03d3588136ad6ecef504c38d1734105704082fc1f5ed7e97a57bc708ff",
+      "run_digest": "sha256:2617385163aca566a881a33425385f54f12b4f35472aafe47d6205834dcfbd83",
+      "steps": 2,
+      "tier": "local"
+    }
+  ],
+  "comment": "Golden run-digest vectors. Generated with:\n  GITIUP_UPDATE_FIXTURES=1 cargo run -p gitiup-attest --example make_run_fixtures\nrun.json is a run *report* (pretty-printed for humans; its layout carries no meaning). manifest.json is the canonical manifest bytes it computes, exactly as signed and stored. The digests are the contract.",
+  "recipe": "RunDigest = sha256(canonical(manifest)); ResultDigest = sha256(canonical(manifest.result)). See ADR-0001 D2 and D4."
+}

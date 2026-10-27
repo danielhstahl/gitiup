@@ -1,0 +1,157 @@
+{
+  "claims": {
+    "annotations": {
+      "x_matrix": "ubuntu-24.04/release",
+      "x_runner": "gitiup-local"
+    },
+    "claimed_at_us": 1793092502500000,
+    "run_id": "1b2c3d4e5f607182",
+    "timings": [
+      {
+        "duration_us": 3900000,
+        "started_us": 1793092503000000,
+        "step": "build"
+      },
+      {
+        "duration_us": 412000,
+        "started_us": 1793092502600000,
+        "step": "checkout"
+      }
+    ]
+  },
+  "commit": "sha1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "environment": {
+    "arch": "x86_64",
+    "image": {
+      "digest": "sha256:3cafcfa89b212a186c2c2d4be67c3f248aaada2fe78e45bc61c804c15dc8bc54",
+      "reference": "ghcr.io/gitiup/ci:ubuntu-24.04"
+    },
+    "os": "linux",
+    "provider": "docker",
+    "toolchain": [
+      {
+        "name": "cargo",
+        "version": "1.99.1"
+      },
+      {
+        "name": "git",
+        "version": "2.47.0"
+      },
+      {
+        "name": "rustc",
+        "version": "1.99.1"
+      }
+    ]
+  },
+  "event": {
+    "action": "synchronize",
+    "name": "pull_request",
+    "payload": {
+      "digest": "sha256:e857047351c341a92c69c00923e3e548c182629494fb17f8c7a1db6b972e44a5"
+    }
+  },
+  "inputs": {
+    "coverage": true,
+    "jobs": 4,
+    "toolchain": "1.99.1"
+  },
+  "job": "build",
+  "matrix": {
+    "os": "ubuntu-24.04",
+    "profile": "release"
+  },
+  "pins": {
+    "actions/checkout@v4": {
+      "commit": "sha1:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "ref": "v4",
+      "repo": "actions/checkout"
+    },
+    "rust-actions/toolchain@v1": {
+      "commit": "sha1:abababababababababababababababababababab",
+      "repo": "rust-actions/toolchain"
+    }
+  },
+  "provenance": {
+    "normalisation_version": 1,
+    "runner": "gitiup 0.1.0",
+    "sandbox": "docker",
+    "tier": "local"
+  },
+  "repo": "gitiup/gitiup",
+  "reusable_workflows": [
+    {
+      "oid": "sha1:2121212121212121212121212121212121212121",
+      "path": ".github/workflows/_lint.yml"
+    },
+    {
+      "oid": "sha1:2222222222222222222222222222222222222222",
+      "path": ".github/workflows/_supply-chain.yml"
+    }
+  ],
+  "secret_names": [
+    "CODECOV_TOKEN",
+    "NPM_TOKEN"
+  ],
+  "steps": [
+    {
+      "exit_code": 0,
+      "id": "checkout",
+      "name": "Checkout",
+      "stderr": {
+        "text": ""
+      },
+      "stdout": {
+        "digest": "sha256:99d8892c9f5073f9b43da6dfa370b80728760383f8982ef88df1d378973d5cba"
+      },
+      "uses": "actions/checkout@v4"
+    },
+    {
+      "exit_code": 0,
+      "id": "build",
+      "name": "cargo test --release",
+      "outputs": {
+        "coverage": "91.4"
+      },
+      "stderr": {
+        "digest": "sha256:ec6e144ff3d256da36ff634c2cb865f6a8e748ad91d393828d01c0b703bbb36c"
+      },
+      "stdout": {
+        "digest": "sha256:4d7a969a992fce2e8c8252dc88ae94e56a1a1ee618adea4b210d512a1a02a6aa"
+      },
+      "uses": "rust-actions/toolchain@v1"
+    },
+    {
+      "artifacts": [
+        {
+          "content": {
+            "files": {
+              "cov/lcov.info": {
+                "text": "TN:\nDA:1,1\n"
+              },
+              "cov/summary.txt": {
+                "text": "91.4%\n"
+              }
+            }
+          },
+          "name": "coverage"
+        }
+      ],
+      "exit_code": 0,
+      "id": "upload",
+      "name": "Upload coverage",
+      "outputs": {
+        "size": "19"
+      },
+      "stderr": {
+        "text": ""
+      },
+      "stdout": {
+        "text": ""
+      }
+    }
+  ],
+  "workflow": {
+    "oid": "sha1:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "path": ".github/workflows/ci.yml"
+  }
+}

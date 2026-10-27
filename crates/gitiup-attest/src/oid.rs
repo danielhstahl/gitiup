@@ -79,6 +79,24 @@ impl GitOid {
         GitOid::new(OidAlgorithm::Sha1, &bytes)
     }
 
+    /// Name a file that is *not* a git blob by the SHA-256 of its bytes.
+    ///
+    /// This is how a workflow source that was read off disk (rather than out of
+    /// an object store) gets an `oid`: see
+    /// [`WorkflowRef`](crate::manifest::WorkflowRef), whose `oid` is a git blob id
+    /// when the file is committed and this content hash when it is not. Note the
+    /// deliberate difference from git's own blob hash: git hashes
+    /// `"blob <len>\0" ‖ content`, which only means something inside a git
+    /// object store, and this oid has to be computable by a verifier that has the
+    /// file and nothing else.
+    pub fn content_sha256(bytes: &[u8]) -> GitOid {
+        let digest = crate::digest::Digest::sha256(bytes);
+        GitOid {
+            algorithm: OidAlgorithm::Sha256,
+            bytes: digest.as_bytes().to_vec(),
+        }
+    }
+
     /// The algorithm.
     pub fn algorithm(&self) -> OidAlgorithm {
         self.algorithm

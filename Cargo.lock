@@ -939,6 +939,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitiup"
+version = "0.1.0"
+dependencies = [
+ "gitiup-attest",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "gitiup-attest"
 version = "0.1.0"
 dependencies = [

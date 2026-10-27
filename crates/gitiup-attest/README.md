@@ -40,6 +40,16 @@ signature    = ed25519( PAE("application/vnd.gitiup.run-manifest+json", canonica
 doc          = { schema_version, payload_type, manifest, signatures[] }   → kv/attestation/<hex>
 ```
 
+Above the manifest sits the thing a runner actually has: a **run report** — raw
+logs, event payload, environment inventory, artifacts. `RunManifest::from_run`
+(see [`run`](src/run.rs)) is the one sanctioned path from that to a manifest: it
+hashes the material, sorts what must be sorted, derives the environment
+fingerprint, and validates before returning.
+
+```text
+run report ──RunManifest::from_run──► manifest ──encode()──► canonical bytes ──sha256──► RunDigest
+```
+
 `result` is what a faithful re-run reproduces; `claims` is who said so and when. The
 split is what lets five volunteers re-running one change converge on one
 `ResultDigest` while their clocks, hostnames and step durations all differ — see
@@ -50,7 +60,8 @@ ADR-0001 D4/D5 for the register of what may never enter `result`.
 | module | what lives there |
 |--------|------------------|
 | [`canon`](src/canon.rs) | the canonicaliser: narrowed RFC 8785 writer **and** a strict reader that refuses whitespace, duplicate keys, floats, `\u0041`, `\/`, `null` and anything else that would be a second encoding of one document |
-| [`manifest`](src/manifest.rs) | `RunManifest` and friends, `canonical_bytes()`, `digest()`, `result_digest()`, `normalize()`, `validate()` |
+| [`manifest`](src/manifest.rs) | `RunManifest` and friends, `canonical_bytes()`, `encode()`, `digest()`, `result_digest()`, `normalize()`, `validate()` |
+| [`run`](src/run.rs) | the digest computation: `RunReport` (what a runner hands over), `RunManifest::from_run` / `from_run_with`, `Material` (bytes or their digest), the `Normaliser` seam giti-1rs.3 plugs into |
 | [`digest`](src/digest.rs), [`oid`](src/oid.rs) | `sha256:<hex>` digests and `sha1:<hex>` / `sha256:<hex>` git object ids — algorithm in the string, so a new digest is a policy change, not a format break |
 | [`key`](src/key.rs) | Ed25519 keys in SSH wire form, `SHA256:…` fingerprints as key ids, `SignatureEntry`, and the `Signer` trait ssh-agent/keystore backends plug into |
 | [`envelope`](src/envelope.rs) | `AttestationDoc`, PAE framing, signing, co-signing (`merge_signatures`), `verify`, DSSE import/export |
@@ -65,10 +76,15 @@ ADR-0001 D4/D5 for the register of what may never enter `result`.
 **Producing** (the runner, giti-1rs.2):
 
 ```rust,ignore
+// From a finished run: the one path, so nothing derivable is left to the caller.
+let manifest = RunManifest::from_run(&report)?;   // report: gitiup_attest::run::RunReport
+
+// …or, by hand, in exactly the order from_run uses:
 let mut manifest = RunManifest { … };
 manifest.normalize();                          // sorts the spec-sorted lists
 manifest.result.environment.fix_fingerprint()?;// the fingerprint is derived, never asserted
 manifest.validate()?;
+let bytes = manifest.encode()?;                // the canonical bytes: one encoding, no choices
 let mut doc = AttestationDoc::new(manifest);
 doc.sign(&signer)?;                            // signer: impl gitiup_attest::Signer
 host.put_cas(&Namespace::ATTESTATION, &doc.canonical_bytes()?)?;   // kv/attestation/<hex>
@@ -111,6 +127,9 @@ DSSE envelope. Log anchoring (Rekor-style) is a separate signed record over a
   the lists that must be sorted (JSON Schema cannot say so, `validate()` does).
 * `tests/fixtures/v1/` — committed canonical bytes plus their digests and signatures,
   for four cases. `tests/golden.rs` fails if they move.
+* `tests/fixtures/runs/` — five representative *run reports*, the canonical manifest
+  each computes to, and both digests: the golden vectors for `RunManifest::from_run`.
+  `tests/run_digest_golden.rs` fails if they move.
 * `tests/verify_fixtures.py` — re-verifies those fixtures using only Python's stdlib and
   `openssl`: digests, the SSH fingerprint derivation, and the signature. Independent
   proof of the primitives, not a second copy of this crate's logic.
@@ -118,12 +137,17 @@ DSSE envelope. Log anchoring (Rekor-style) is a separate signed record over a
   specifications cannot drift.
 * `tests/format_properties.rs` — order independence, idempotent encoding, "no second
   encoding", and a mutation of **every field** proving it moves the digest.
+* `tests/run_digest_golden.rs` / `tests/run_digest_properties.rs` — the five golden
+  run reports, plus the properties that make a run digest stable at all: reordering
+  and reformatting a report cannot move a digest, production is idempotent, and every
+  report field reaches a digest.
 
 ## Building
 
 ```sh
 cargo test -p gitiup-attest
-cargo run -p gitiup-attest --example make_fixtures   # prints how to regenerate fixtures
+cargo run -p gitiup-attest --example make_fixtures     # prints how to regenerate fixtures
+cargo run -p gitiup-attest --example make_run_fixtures # the run-digest vectors
 ```
 
 Dependencies: `serde`, `serde_json`, `sha2`, `ed25519-dalek` — all pure Rust, all pinned
@@ -131,6 +155,7 @@ by a test.
 
 ## What lives elsewhere
 
-storage and refs (`.5`, `gitiup-host`), output normalisation (`.3`), environment
-fingerprint inventory (`.4`), key storage/ssh-agent/gpg (`.6`), the CLI surface
-(`.5`, `.8`), quorum selection and vote counting (`giti-msi.*`).
+storage and refs (`.5`, `gitiup-host`), output normalisation (`.3` — it plugs into
+`run::Normaliser`), environment fingerprint inventory (`.4`), key
+storage/ssh-agent/gpg (`.6`), the CLI surface (`.5`, `.8`; `gitiup digest` already
+prints these digests), quorum selection and vote counting (`giti-msi.*`).

@@ -1,0 +1,84 @@
+{
+  "claims": {
+    "claimed_at_us": 1793092502500000,
+    "run_id": "3d4e5f60718293a4"
+  },
+  "commit": "sha1:dddddddddddddddddddddddddddddddddddddddd",
+  "environment": {
+    "arch": "aarch64",
+    "os": "macos",
+    "provider": "shell",
+    "toolchain": [
+      {
+        "name": "rustc",
+        "version": "1.99.1"
+      }
+    ]
+  },
+  "event": {
+    "action": "opened",
+    "name": "pull_request",
+    "payload": {
+      "text": "{\"action\":\"opened\",\"number\":7}"
+    }
+  },
+  "job": "test",
+  "matrix": {
+    "os": "macos"
+  },
+  "pins": {
+    "actions/checkout@v4": {
+      "commit": "sha1:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "ref": "v4",
+      "repo": "actions/checkout"
+    }
+  },
+  "provenance": {
+    "normalisation_version": 0,
+    "runner": "gitiup 0.1.0",
+    "sandbox": "landlock",
+    "tier": "local"
+  },
+  "repo": "gitiup/gitiup",
+  "steps": [
+    {
+      "exit_code": 0,
+      "id": "checkout",
+      "name": "Checkout",
+      "stderr": {
+        "text": ""
+      },
+      "stdout": {
+        "text": "Checked out dddddd\n"
+      },
+      "uses": "actions/checkout@v4"
+    },
+    {
+      "exit_code": 101,
+      "id": "test",
+      "name": "cargo test",
+      "stderr": {
+        "text": "error: test failed, to rerun pass `--lib`\n"
+      },
+      "stdout": {
+        "text": "running 3 tests\ntest slow_one ... FAILED\n"
+      }
+    },
+    {
+      "exit_code": 0,
+      "id": "publish",
+      "name": "Publish",
+      "outcome": "skipped",
+      "stderr": {
+        "text": ""
+      },
+      "stdout": {
+        "text": ""
+      }
+    }
+  ],
+  "workflow": {
+    "path": ".github/workflows/ci.yml",
+    "text": "name: CI\non: pull_request\n"
+  }
+}

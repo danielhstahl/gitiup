@@ -22,7 +22,8 @@
 //!| `sha256:` digests, algorithm tagged in the string | D2 | [`digest::Digest`], [`oid::GitOid`] |
 //!| raw Ed25519, SSH public keys, SSH fingerprints as key ids | D3 | [`key`] |
 //!| `result` vs `claims` split; two digests | D4 | [`manifest`] |
-//!| the volatile-field register | D5 | [`manifest::Claims`] |
+//!| the run digest pipeline (report → manifest → digests) | D4, D5 | [`run`], [`run::RunReport`], [`RunManifest::from_run`] |
+//!| the volatile-field register | D5 | [`manifest::Claims`], [`run::StepReport::timing`] |
 //!| claimed time + policy freshness window | D6 | [`policy`], [`time`] |
 //!| limits, and what a verifier may refuse | D7 | [`canon::MAX_ENCODED_BYTES`], [`RunManifest::validate`] |
 //!| versioning and migration | D8 | [`schema`], [`error::ErrorKind::UnsupportedSchema`] |
@@ -58,11 +59,13 @@
 //! Deliberately, so that the trust-critical code stays small and offline:
 //!
 //! * **no I/O** — storage is `gitiup-host`'s job (giti-1rs.5 writes these bytes to
-//!   `kv/attestation/<hex>` and points `refs/attestations/<oid>` at them);
+//!   `kv/attestation/<hex>` and points `refs/attestations/<oid>` at them); the
+//!   `gitiup` CLI crate is the one place that reads a run report off disk;
 //! * **no keystore** — key generation, encryption, ssh-agent and gpg live in
 //!   giti-1rs.6 and plug in through [`key::Signer`];
 //! * **no normalisation** — the digests in [`manifest::Step`] are of *normalised*
-//!   output, produced by giti-1rs.3;
+//!   output, produced by giti-1rs.3, which plugs into the digest computation
+//!   through [`run::Normaliser`] rather than living here;
 //! * **no network** — log anchoring is a separate signed *record* over a RunDigest
 //!   (ADR-0001 D9), never a fetch inside verification, so verification works on a
 //!   plane, in a pre-receive hook, and under DoS.
@@ -85,6 +88,7 @@ pub mod key;
 pub mod manifest;
 pub mod oid;
 pub mod policy;
+pub mod run;
 pub mod sample;
 pub mod schema;
 pub mod time;
@@ -107,6 +111,10 @@ pub use manifest::{
 pub use oid::{GitOid, OidAlgorithm};
 pub use policy::{
     DEFAULT_MAX_AGE_US, DEFAULT_MAX_CLOCK_SKEW_US, Freshness, Policy, Trust, check_freshness,
+};
+pub use run::{
+    ArtifactReport, ClaimReport, EnvironmentReport, EventReport, Material, Normaliser, RawText,
+    RunReport, StepReport, TimingReport, WorkflowSource, file_set_digest,
 };
 pub use time::TimeUs;
 

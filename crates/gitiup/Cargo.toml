@@ -1,0 +1,31 @@
+[package]
+name = "gitiup"
+description = "The gitiup command line: the user-facing surface that turns a local run into a digest a stranger can check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate is the only place in the workspace that reads a run report off disk:
+# the format crate (`gitiup-attest`) refuses I/O so it can run in a pre-receive
+# hook, and the host crate (`gitiup-host`) owns storage. Printing a digest for a
+# local run belongs to neither, so it lives here.
+#
+# Deliberately no argument-parsing dependency: the surface is a handful of flags,
+# and a parser would be the largest thing in the binary. `tests/cli_hygiene.rs`
+# keeps it that way.
+
+[[bin]]
+name = "gitiup"
+path = "src/main.rs"
+
+[dependencies]
+gitiup-attest = { path = "../gitiup-attest" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
