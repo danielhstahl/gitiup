@@ -25,6 +25,7 @@ macro_rules! conformance_body_names {
             "listings_are_complete_across_pages",
             "concurrent_ref_writers_never_lose_one",
             "unsupported_operations_are_refused_by_name",
+            "one_object_is_forgotten_or_the_refusal_says_why",
             "describe_and_capabilities",
             "refused_credentials_are_denied_not_dropped",
             "a_host_without_cas_refuses_cas_writes",
@@ -84,6 +85,13 @@ macro_rules! each_conformance_body {
         fn unsupported_operations_are_refused_by_name() {
             $crate::runner::require_body(
                 "unsupported_operations_are_refused_by_name",
+                &$registration,
+            );
+        }
+        #[test]
+        fn one_object_is_forgotten_or_the_refusal_says_why() {
+            $crate::runner::require_body(
+                "one_object_is_forgotten_or_the_refusal_says_why",
                 &$registration,
             );
         }

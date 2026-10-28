@@ -53,6 +53,9 @@
 //! refs/gitiup/**           roster, job/lease records, quorum state
 //! ```
 //!
+//! The attestation namespace is keyed by the *subject* first and holds one ref per
+//! proof, and [`attest`] owns that layout plus the retention policy that prunes it.
+//!
 //! ```
 //! use gitiup_host::{BlobStore, Host, RefStore, Namespace, RefName, RefUpdate, Expect};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,6 +79,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod attest;
 pub mod blob;
 pub mod capability;
 pub mod config;

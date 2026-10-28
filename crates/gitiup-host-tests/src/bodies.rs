@@ -704,6 +704,63 @@ fn unsupported_operations_are_refused_by_name(ctx: &Ctx<'_>) {
     let _ = host.update_refs_cas(&[]);
 }
 
+/// Forgetting one object is answered, not dodged.
+///
+/// Retention has to be able to say what happened to the bytes, and there are only
+/// two honest answers: they are gone, or this kind of store cannot forget a single
+/// object and says so. The failure this body exists to catch is the third — a host
+/// that returns `Ok` while the bytes stay, or deletes something and reports a
+/// refusal — because a retention report that overstates what it deleted is how a
+/// store ends up claiming it forgot signed evidence it still holds.
+fn one_object_is_forgotten_or_the_refusal_says_why(ctx: &Ctx<'_>) {
+    let host = ctx.host();
+    let bytes = b"{\"forgotten\":true}";
+    let digest = host
+        .put_cas(&Namespace::ATTESTATION, bytes)
+        .expect("store the object");
+    assert!(host.exists(&digest).unwrap(), "and it is there to forget");
+
+    match host.purge_cas(&digest) {
+        Ok(true) => {
+            assert!(
+                host.get(&digest)
+                    .expect("a read after a successful purge is not an error")
+                    .is_none(),
+                "the host said the bytes are gone, so they must not be readable"
+            );
+            assert!(!host.exists(&digest).unwrap(), "and must not exist");
+            // Forgetting is not corruption: the name is free again, and the same
+            // bytes re-store to the same digest.
+            let again = host
+                .put_cas(&Namespace::ATTESTATION, bytes)
+                .expect("re-store after a purge");
+            assert_eq!(again, digest, "a digest is not a slot number");
+        }
+        // "Nothing happened, and that was fine" is not a thing a purge can be: a
+        // host that cannot forget answers in the taxonomy, so the caller's report
+        // can say so.
+        Ok(false) => panic!(
+            "purge_cas reported success without removing the object; refuse with              UnsupportedCas instead, so the retention report says why"
+        ),
+        Err(err) => {
+            assert!(
+                err.is_unsupported(),
+                "a purge that did not happen must be an unsupported refusal, not {err}"
+            );
+            assert!(
+                host.get(&digest)
+                    .expect("a read after a refusal is not an error")
+                    .is_some(),
+                "a refusal may not have deleted anything on the way to saying no"
+            );
+        }
+    }
+    // Purging what was never there is the same answer as purging it twice would be:
+    // nothing to forget, said quietly.
+    let absent = Oid::hash_bytes(b"nobody ever stored this");
+    let _ = host.purge_cas(&absent);
+}
+
 /// Credentials that were refused come back as a refusal.
 ///
 /// The dangerous failure mode of an expired or revoked credential is not the
@@ -954,7 +1011,7 @@ pub fn bodies() -> &'static [Body] {
     &BODIES
 }
 
-static BODIES: [Body; 14] = [
+static BODIES: [Body; 15] = [
     Body {
         name: "blobs_round_trip",
         shape: Shape::Single,
@@ -1031,6 +1088,13 @@ static BODIES: [Body; 14] = [
         requires_cas: false,
         note: "what a host cannot do is refused by name, not half-done",
         run: unsupported_operations_are_refused_by_name,
+    },
+    Body {
+        name: "one_object_is_forgotten_or_the_refusal_says_why",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "retention's delete question gets an honest answer: gone, or why not",
+        run: one_object_is_forgotten_or_the_refusal_says_why,
     },
     Body {
         name: "describe_and_capabilities",

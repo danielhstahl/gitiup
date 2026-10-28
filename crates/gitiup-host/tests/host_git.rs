@@ -13,6 +13,7 @@
 //! tests run in parallel and a shared mirror would make one test's fetch another's
 //! race.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -800,4 +801,170 @@ fn an_ssh_remote_that_is_not_answering_is_unreachable() {
         "a refused ssh connection is a transport answer, not a corrupt store: {error}"
     );
     assert!(error.hint().is_some(), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Attestation storage (giti-1rs.5) over the git transport.
+// ---------------------------------------------------------------------------
+
+/// The headline claim of the attestation ticket, tested with the literal tool it
+/// names: a proof about a commit lives under `refs/attestations/**`, so a stranger
+/// with plain `git` and no gitiup anywhere fetches the attestation *in the same
+/// packfile as the ref that names it*. No second protocol, no API, no download
+/// afterwards — which is the difference between "the store can serve the proof" and
+/// "the store can tell you where it keeps the proof".
+#[test]
+fn a_plain_clone_fetches_a_commits_attestations() {
+    require_git();
+    let scratch = Scratch::new();
+    let host = scratch.host();
+    // A commit oid, in this case a real sha1: the attestation namespace is keyed by
+    // the object attested, so the listing question is a ref lookup on every host.
+    let commit = Oid::from_hex("e255b091aabd7e443b5d2fbeb90bc9769d07cbeb").unwrap();
+    let ada = b"{signed-by:ada,tier:local}".to_vec();
+    let bruno = b"{signed-by:bruno,tier:local}".to_vec();
+    let first = gitiup_host::attest::publish(&host, &commit, &ada, "ada").expect("publish ada");
+    let second =
+        gitiup_host::attest::publish(&host, &commit, &bruno, "bruno").expect("publish bruno");
+
+    // Two handles, two mirrors: what the reviewer's machine sees is what the
+    // repository says, not what this process wrote.
+    let reviewer = scratch.peer("reviewer");
+    let catalog = gitiup_host::attest::list_for(&reviewer, &commit).expect("list");
+    let digests: BTreeSet<String> = catalog
+        .entries
+        .iter()
+        .map(|entry| entry.digest.hex())
+        .collect();
+    assert_eq!(
+        digests,
+        BTreeSet::from([first.digest.hex(), second.digest.hex()]),
+        "both attestations for this commit are advertised, and the store can say who \
+         published each: {:?}",
+        catalog.entries
+    );
+    assert!(catalog.unexpected.is_empty(), "{catalog:?}");
+    assert_eq!(
+        gitiup_host::attest::fetch(&reviewer, &first.digest)
+            .expect("fetch")
+            .expect("present"),
+        ada,
+        "the bytes come back verbatim, which is what a signature is checked against"
+    );
+
+    // Now with nothing but git: clone, fetch the namespace, read the proof out of
+    // the pointer commit the ref names.
+    let clone = scratch._dir.path().join("clone.git");
+    let out = Command::new("git")
+        .args(["clone", "--bare"])
+        .arg(&scratch.repo)
+        .arg(&clone)
+        .output()
+        .expect("git clone");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["fetch", "origin", "refs/attestations/*:refs/attestations/*"])
+        .current_dir(&clone)
+        .output()
+        .expect("git fetch");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let advertised = plain_git(&clone, &["for-each-ref", "--format=%(refname)"]);
+    for entry in &catalog.entries {
+        assert!(
+            advertised.contains(entry.reference.as_str()),
+            "the attestation ref must be fetchable by a plain git client: {advertised}"
+        );
+        let tip = plain_git(&clone, &["rev-parse", entry.reference.as_str()]);
+        let record = plain_git(&clone, &["cat-file", "blob", &format!("{tip}:record")]);
+        let expected = if entry.digest == first.digest {
+            &ada
+        } else {
+            &bruno
+        };
+        assert_eq!(
+            record.as_bytes(),
+            expected.as_slice(),
+            "the attestation bytes arrived with the ref, in the same packfile"
+        );
+        // And the pointer document says what the ref promised, so a reviewer can
+        // check the store did not quietly re-encode the signed bytes.
+        let pointer = plain_git(
+            &clone,
+            &["cat-file", "blob", &format!("{tip}:gitiup-ref.json")],
+        );
+        assert!(
+            pointer.contains(&entry.digest.hex()),
+            "the pointer names the digest the ref is keyed by: {pointer}"
+        );
+    }
+}
+
+/// Retention on a git host is honest about what a git object database cannot do: it
+/// withdraws the advertisement and reports that the bytes stay. Refusing and saying
+/// so beats a report that implies space was reclaimed.
+#[test]
+fn retiring_an_attestation_unpublishes_it_and_says_the_bytes_stay() {
+    require_git();
+    let scratch = Scratch::new();
+    let host = scratch.host();
+    let commit = Oid::from_hex("1111111111111111111111111111111111111111").unwrap();
+    let bytes = b"{expired-proof}".to_vec();
+    let published = gitiup_host::attest::publish(&host, &commit, &bytes, "ada").expect("publish");
+    let item = gitiup_host::attest::AttestationItem {
+        digest: published.digest,
+        subject: commit,
+        claimed_at_us: 1,
+        size: bytes.len() as u64,
+        label: None,
+        reference: Some(published.reference.as_str().to_string()),
+    };
+    let policy = gitiup_host::attest::Retention {
+        max_age_us: Some(1_000),
+        max_per_subject: None,
+    };
+    let plan = gitiup_host::attest::plan(&policy, 10_000_000, &[item], &BTreeMap::new());
+    let report = gitiup_host::attest::apply(
+        &host,
+        &plan,
+        &BTreeMap::new(),
+        &gitiup_host::attest::GcOptions {
+            dry_run: false,
+            purge_blobs: true,
+            ..Default::default()
+        },
+    )
+    .expect("apply");
+    assert_eq!(report.pruned.len(), 1, "{report:?}");
+    assert!(
+        matches!(
+            report.pruned[0].blob,
+            gitiup_host::attest::BlobAction::Refused { .. }
+        ),
+        "a git store cannot forget one object, and must say that rather than pretend: {:?}",
+        report.pruned[0]
+    );
+    assert!(
+        gitiup_host::attest::list_for(&host, &commit)
+            .expect("list")
+            .entries
+            .is_empty(),
+        "the attestation is no longer advertised, which is what retiring means"
+    );
+    // The record chain still holds it: `refs/gitiup/kv/attestation` is append-only
+    // by design, so the audit trail outlives the advertisement.
+    assert_eq!(
+        gitiup_host::attest::fetch(&host, &published.digest)
+            .expect("fetch")
+            .expect("still there"),
+        bytes
+    );
 }

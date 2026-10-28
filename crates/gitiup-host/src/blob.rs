@@ -312,6 +312,34 @@ pub trait BlobStore: Send + Sync {
     fn list(&self, namespace: &Namespace) -> HostResult<Vec<BlobEntry>> {
         self.list_prefix(namespace.as_str())
     }
+
+    /// Forget one blob, at the operator's instruction (retention and GC,
+    /// giti-1rs.5).
+    ///
+    /// This is *not* part of the immutability promise and cannot be used to
+    /// rewrite history: it is only ever called for an object a retention policy
+    /// has already unpublished and nothing in the store still references, and the
+    /// default says the host cannot do it at all — which is the truthful answer
+    /// for a git object database (no single object can be removed) and for a
+    /// versioned bucket (a delete is a marker, and the bytes stay reachable
+    /// forever by design). Callers must treat a refusal as a normal outcome and
+    /// report it, not as a failure of the run; see [`crate::attest`].
+    ///
+    /// `Ok(true)` means the bytes are gone, `Ok(false)` that they were not there.
+    fn purge_cas(&self, oid: &Oid) -> HostResult<bool> {
+        Err(HostError::unsupported(
+            "purge-blob",
+            format!(
+                "this host cannot forget the object {}; it can unpublish it and say so",
+                oid.short_default()
+            ),
+        )
+        .with_hint(
+            "the ref is retired and this store keeps history: a git object database cannot \
+             drop a single object, and a versioned bucket keeps every version. Immutability \
+             is what was promised here, so nothing was lost",
+        ))
+    }
 }
 
 #[cfg(test)]

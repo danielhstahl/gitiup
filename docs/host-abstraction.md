@@ -73,10 +73,10 @@ Shared by every host, so a change or an attestation is found the same way
 wherever the repo lives:
 
 ```text
-refs/heads/**            real branches (owner writes)
-refs/changes/<id>/head   proposed change head
-refs/attestations/<oid>  attestations for a commit, so `git fetch` carries proof
-refs/gitiup/**           roster, job/lease records, quorum state
+refs/heads/**                        real branches (owner writes)
+refs/changes/<id>/head               proposed change head
+refs/attestations/<subject>/<digest>  attestations for a commit, so `git fetch` carries proof
+refs/gitiup/**                       roster, job/lease records, quorum state
 ```
 
 `RefName` validates names git-style (no `..`, no `~^:?*[\\`, no `.lock` suffix,
@@ -90,15 +90,34 @@ in its own idiom:
 |-----------|---------------|---------------|------------------------------|
 | `refs/heads/**` | the owner, with plain `git push` | a branch, left exactly as git made it | one ref object, `refs/heads/main` |
 | `refs/changes/<id>/head` | gitiup, for a contributor | a ref pointing at the change record (via a pointer commit, so the bytes travel with it) | a ref object plus `kv/change/<hash>` |
-| `refs/attestations/<oid>` | gitiup, after a run verifies | a ref pointing at the attestation, named by the digest it attests to | a ref object plus `kv/attestation/<hash>` |
+| `refs/attestations/<subject>/<digest>` | gitiup, after a run verifies (or `gitiup attest push`) | a ref pointing at the attestation (via a pointer commit, so the bytes travel with it) | a ref object plus `kv/attestation/<hash>` |
 | `refs/gitiup/**` | gitiup only | the store manifest and the record chains; never listed | `host.json` and `kv/**` |
 
-Two things follow from that table and both are load-bearing. `refs/attestations/<oid>`
-is named by the digest of the thing *attested*, so "give me the proof about this
-object" is a ref lookup, on every host, and on a git host it is a `git fetch` that
-arrives with the proof in the same packfile. And `refs/gitiup/**` is reserved: a
-host keeps its bookkeeping there and hides it from an ordinary ref listing, so
-`gitiup change list` never has to know which host it is talking to.
+Two things follow from that table and both are load-bearing. `refs/attestations/**`
+is named by the digest of the thing *attested* first, so "give me the proof about
+this object" is a ref prefix read on every host, and on a git host it is a
+`git fetch 'refs/attestations/<subject>/*'` that arrives with every proof for that
+commit in the same packfile. And `refs/gitiup/**` is reserved: a host keeps its
+bookkeeping there and hides it from an ordinary ref listing, so `gitiup change list`
+never has to know which host it is talking to.
+
+The attestation's own digest is the *leaf* of the ref rather than its only component
+so that a commit can carry several proofs — several signers, several runs, several
+tiers — where a single-level ref could hold exactly one and publishing a second would
+be an overwrite. A ref named by one digest cannot be both a leaf and a directory, so
+where the older single-level spelling occupies a subject, gitiup says so rather than
+losing the ref or reporting "no attestation".
+
+The single-level form (`refs/attestations/<digest>`, one ref per attestation) is what
+the github adapter files when it publishes a check run's proof, and a store that
+holds both shapes is fine: a listing reports those refs under `unexpected` rather
+than mis-reading one as the other, `gitiup attest gc` leaves them alone, and a
+`git fetch refs/attestations/*` carries both. What is *not* reconciled yet is the
+question they answer differently — one ref per attestation cannot be listed by
+subject — so an attestation filed by the forge adapter does not appear in
+`gitiup attest list --commit`. Making the two paths agree is follow-up work spanning
+the adapter and the quorum's per-seat storage (giti-1rs.2, giti-msi), not a detail an
+attestation store can decide alone.
 
 ## Store layout
 
@@ -124,8 +143,8 @@ for the `fs` host it is literally directories:
 
 Blob digests are SHA-256 of the exact bytes; `put_cas` is idempotent; nothing in
 this crate overwrites or deletes an object, and the `fs` host verifies a blob
-re-hashes to its name on read. Retention and tombstoning are host policy and
-belong to the attestation ticket (giti-1rs.5), not to this trait.
+re-hashes to its name on read. Retention is a policy decision on top of that, not a
+change to it — see [Attestations in the store](#attestations-in-the-store).
 
 For signed records the bytes are not chosen by the host: [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md)
 decides that `kv/attestation/<hex>` holds the *canonical* encoding of an
@@ -134,6 +153,83 @@ that re-serializes a record on the way to storage — pretty-printing it, reorde
 keys, adding a trailing newline — has silently broken the signature, so hosts store
 and return blobs verbatim and `gitiup-attest` refuses bytes that are not canonical
 (`gitiup verify attestation` exits 8).
+
+## Attestations in the store
+
+An attestation is signed bytes, so storing one is two acts: keep the bytes verbatim,
+and make them findable. `gitiup_host::attest` does both, and `gitiup attest` is the
+same three verbs on every host:
+
+```bash
+gitiup attest push attestation.json --store <store>   # or --run-report <run.json>, --sign
+gitiup attest list --commit <oid> --store <store>     # or --all
+gitiup attest show <digest> --store <store>           # --json, --bytes, --dsse
+```
+
+Publishing writes in one order and it is not an implementation detail: **the bytes
+first, then the ref**. A ref naming bytes no reader can fetch is a broken proof, while
+bytes nobody has advertised yet are merely unread. On a git host that order is also
+what the host needs — the ref write wraps the record into a pointer commit, which it
+can only build from the blob the previous line stored. Both writes are create-only:
+re-publishing the same bytes reports `already`, and two people publishing *different*
+proofs about one commit get two refs instead of a lost update.
+
+Because a signature is only valid over exact bytes, the store holds the canonical
+encoding byte for byte, and a host that files bytes under a digest they do not hash
+to is refused rather than trusted (`BlobStore::return_preserves_digest` says which
+hosts are exempt because they cannot compute it; `gitiup attest show` re-hashes
+whatever it reads back and exits 8 on a mismatch).
+
+A listing is a ref prefix read — it never fetches the whole namespace — and it reports
+attestation refs it cannot parse under `unexpected_refs` rather than skipping them:
+a listing that quietly drops a ref is how "there is no proof here" becomes a lie.
+
+### Retention
+
+A bucket that keeps every attestation forever is a bucket somebody has to pay for and
+somebody will eventually delete wholesale. Three limits, all optional, all checked in
+this order:
+
+| limit | flag | what it means |
+|-------|------|---------------|
+| **referenced** | none — not a knob | an object any other live ref points at is never pruned |
+| `max_age_us` | `--max-age 90d` | age of the *claim* (the attestation's own `claimed_at`), falling back to when this host published it |
+| `max_per_subject` | `--max-per-commit 10` | newest N survive per subject; the rest are retired even if young |
+
+The first row is not a setting because it cannot be. `attest::referenced` collects the
+digests that live refs *outside* `refs/attestations/**` point at, and that is exactly
+where a quorum keeps its evidence: each verifier's submission is a blob in this same
+content-addressed store, advertised by `refs/gitiup/reveal/<change>/<job>/<slot>`, so a
+policy that would sweep a finished round would be deleting the ballots a published
+verdict was counted from. That is why it is a property of the store rather than a knob:
+there is no flag that forces a pinned attestation away.
+
+The scan reads refs, not record bodies, and says so: a digest named *inside* another
+record — a merge record's `attestation` field, a verdict's contributing list — is a
+claim about that document, not an advertisement of the object, so the caller that read
+the record adds the pin (`attest::pin`, or `gitiup attest gc --keep <digest>` from the
+command line). Guessing which strings in which blobs meant "do not delete this" would
+make retention impossible to predict, and an unpredictable retention rule is one that
+gets switched off. Expired attestations are also not counted against the per-subject
+quota: an hour-old store with a month of expired proof in it reduces to the quota
+question once the age has been applied.
+
+`plan` is pure and `apply` is separate, so `gitiup attest gc` is reviewable before it
+is destructive — it prints the plan and changes nothing unless told `--apply`, and
+exits 6 when given no limit at all rather than guessing a retention policy for a
+vault of signed evidence. Each applied run writes a `kv/gc/<digest>` record: what was
+removed, what was pinned, and what each decision was *based on* (the timestamp and the
+limit it missed), because "the gc job ran and things disappeared" is not an audit trail.
+
+Retiring an advertisement is not the same as forgetting bytes, and a tool that
+conflates the two is lying about provenance. A git store's record chain is
+append-only, a versioned bucket keeps history by contract, and a `packs/*.pack`
+copy is a second copy of the bytes gc does not own: on those hosts the report says
+`retained`, and only `BlobStore::purge_cas` on a host that can honestly forget (the
+`fs` host today) removes the object — and only when asked (`--purge-blobs`). Every
+removed ref is reported by name, so a host that stores a second public copy can
+report what still needs deleting there instead of pretending the packfile was the
+whole store.
 
 ## The bucket-as-forge host (`s3`)
 
@@ -465,9 +561,9 @@ errors so typos surface instead of silently disabling a safety setting
 5. Register the host with the conformance suite:
    [`gitiup-host-tests`](../crates/gitiup-host-tests/README.md) holds the bodies
    every host owes — empty store, CAS conflict, pack round-trip, huge pack, paged
-   listings, ref deletion, refused credentials, unsupported operations, the
-   `cas = false` degradation — and one `test_host!` line runs all of them against
-   your host. Anything that genuinely does not apply has to be *said* in the
+   listings, ref deletion, refused credentials, unsupported operations, forgetting
+   one object, the `cas = false` degradation — and one `test_host!` line runs all of
+   them against your host. Anything that genuinely does not apply has to be *said* in the
    registration, and a body neither run nor explained fails `tests/coverage.rs`.
    The host is not finished when it passes on your machine: it is finished when CI
    runs it against the backend you claim to be (`.github/workflows/host-conformance.yml`).

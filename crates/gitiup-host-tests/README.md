@@ -46,6 +46,7 @@ accepts any credentials without checking them makes that body *fail*, on purpose
 | expired / refused credentials | `refused_credentials_are_denied_not_dropped` |
 | `cas = false` degradation | `a_host_without_cas_refuses_cas_writes` |
 | unsupported operations | `unsupported_operations_are_refused_by_name` |
+| forgetting one object (retention) | `one_object_is_forgotten_or_the_refusal_says_why` |
 | multi-ref atomicity | `multi_ref_writes_are_all_or_nothing` |
 | capability honesty | `describe_and_capabilities` |
 

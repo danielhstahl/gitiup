@@ -14,6 +14,9 @@
 //! gitiup doctor --sandbox               what this machine can confine, and whether it
 //!                                      may serve a stranger's job at all
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
+//! gitiup attest push|list|show|gc        file signed attestations in a host, read them
+//!                                      back, and retire the ones a retention policy
+//!                                      says are old
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
@@ -39,6 +42,7 @@
 
 use std::process::ExitCode;
 
+mod attest;
 mod digest;
 mod doctor;
 mod env;
@@ -62,6 +66,7 @@ COMMANDS:
                                    a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
+    attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     key [COMMAND] [OPTIONS]        the signing keys this machine can use (gen, import,
                                    list, show, delete, probe)
@@ -94,12 +99,20 @@ passphrase and `--json` on anything a script reads.
 name, `list` and `verify-roster` read the epoch the owner signed, and `approve` and
 `revoke` are the owner's acts. Same exit table, same passphrase rules as `key`.
 
-`select` is the other half: who is asked about one change, and the proof. Run it with a
-published round and it re-derives the ordered selection from the round record, the roster
+`select` is the other half: who is asked about one change, and the proof. Run it with apublished round and it re-derives the ordered selection from the round record, the roster
 epoch it pinned and the published seed — no key, no secret, no trust root. Run it before
 the round exists and it derives the seed from the selector's key, excludes the change
 author and every other key of theirs, and writes the round record that makes the choice
 auditable. `--explain` prints the audit table; ADR-0002 D3 is what it explains.
+
+`attest` is where a proof lives after it is signed. `push` files the exact canonical
+bytes at kv/attestation/<digest> and points refs/attestations/<subject>/<digest> at them,
+so on a git-backed host a plain `git fetch` of that namespace carries the attestation in
+the same packfile as the ref. `list --commit` and `show` read them back from any host —
+fs, a bare repo, a bucket — and refuse anything that does not re-hash to its own name.
+`gc` applies a retention policy (`--max-age`, `--max-per-commit`) to the published set and
+never touches an attestation another ref still points at, which is what keeps a quorum's
+seat submissions and a merge's recorded proof safe. Without --apply it only prints the plan.
 
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
@@ -115,6 +128,10 @@ Try:
     gitiup digest run.json
     gitiup digest --json run.json
     gitiup digest --expect sha256:… run.json   # exit 8 if the rerun disagrees
+    gitiup attest push attestation.json --store ./store --json
+    gitiup attest list --commit $(git rev-parse HEAD) --store ./store
+    gitiup attest show --digest <hex> --store ./store --json
+    gitiup attest gc --store ./store --max-age 90d --max-per-commit 5   # the plan
     gitiup normalise run.json                  # what was rewritten, and why
     gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
     gitiup participant list --store ./store --json
@@ -237,6 +254,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "run" => run::run(&args[1..]),
         "doctor" => doctor::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
+        "attest" => attest::attest(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
         "key" => keys::key(&args[1..]),

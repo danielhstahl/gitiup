@@ -153,6 +153,82 @@ where they overlap, because gates branch on the numbers:
 | 6 | the report is not a valid run report, or this build cannot read it |
 | 8 | digest mismatch: the rerun disagreed with `--expect`, or two runs did not converge |
 
+## `gitiup attest`
+
+Put a signed attestation *in* a host store, read it back out, and keep the store from
+filling up. A `gitiup run` that proves something is worth nothing if the proof lives
+on the laptop that made it, so the unit of storage is the same on every host: the
+attestation's canonical bytes at `kv/attestation/<digest>`, advertised by
+`refs/attestations/<subject>/<digest>` so that on a git-backed host a plain
+`git fetch 'refs/attestations/<subject>/*'` arrives carrying the proof.
+
+```console
+$ gitiup attest push --run-report crates/gitiup-attest/tests/fixtures/runs/hello/run.json --sign --store ./store
+filed 42ea717b…3aae for aaaaaaaaaaaa
+  store    fs store ./store
+  ref      refs/attestations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae
+  blob     kv/attestation/42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae
+  run      sha256:5b71fcfdccb72830d84e1423292ede463d2216fe72c2a4cab2e3b354b8deb819
+  tier     simulated · signed by Lds7upm9…Ns7s
+  warning  SIMULATED: nothing was executed. This attestation describes a plan and proves intent, not behaviour: no code ran, no network was used, no artifact was produced.
+
+$ gitiup attest list --commit sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --store ./store
+42ea717b0674  5b71fcfd…b819  simulated 2026-10-27T09:15:02Z  Lds7upm9…Ns7s
+
+$ gitiup attest show 42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae --store ./store
+attestation 42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae
+  store     fs store ./store
+  ref       refs/attestations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae
+  subject   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  commit    sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · workflow .github/workflows/hello.yml · event push
+  tier      simulated · runner gitiup 0.1.0 · sandbox none · normalisation v0
+  env       arch x86_64
+  steps     1
+  signed    Lds7upm9…Ns7s (ed25519)
+  claimed   2026-10-27T09:15:02Z (17h old)
+  run       sha256:5b71fcfdccb72830d84e1423292ede463d2216fe72c2a4cab2e3b354b8deb819
+  result    sha256:28c73827c9a5506837c179128bca275f7f0ef42d84375f1b408573cfd62e82e4
+  note      verification (is any of the above *trusted*?) is `gitiup verify attestation` (giti-1rs.8); this command prints what the store holds
+  warning   SIMULATED: nothing was executed. This attestation describes a plan and proves intent, not behaviour: no code ran, no network was used, no artifact was produced.
+```
+
+```text
+gitiup attest push [OPTIONS] [ATTESTATION]
+    --run-report <file|->   build the document from a run report instead of a file
+    --sign                  sign it with this machine's key (`--key`/`--issuer` to choose)
+    --subject <oid>         what it attests to (default: the commit the run is bound to)
+    --store | --remote      where to file it (see `gitiup doctor --remotes`)
+gitiup attest list   --commit <oid> | --all [--json]
+gitiup attest show   <digest> | --commit <oid> [--json | --bytes | --dsse]
+gitiup attest gc     --max-age <dur> --max-per-commit <n> [--keep <digest>] [--apply] [--purge-blobs]
+```
+
+Three things are deliberate:
+
+* **The bytes are stored verbatim, and the store is checked on the way back.** A
+  signature is only valid over exact bytes, so `push` files the buffer the signature
+  covers, and `show` re-hashes what it reads and exits `8` if the bytes no longer hash
+  to the digest they are filed under — an integrity failure on the *store*, not a
+  missing file.
+* **An unsigned attestation is refused.** `push` wants `--sign` (or a document that
+  already carries a signature), because filing a proof nobody signed grows a store of
+  rumours. Whether a signature *counts* is `gitiup verify attestation` (giti-1rs.8);
+  these commands print signers and the tier's trust warning and claim nothing.
+* **`gc` plans before it prunes, and never prunes what something still points at.**
+  It prints the plan and changes nothing without `--apply`, refuses a policy with no
+  limits (exit `6`), and an attestation another live ref still targets — a quorum
+  seat's submission at `refs/gitiup/reveal/…`, which is where a round's ballots live in
+  this same store — is reported `pinned` and survives with no flag to force it. A digest
+  named *inside* some other record (a merge record's `attestation` field) is not a ref,
+  so `--keep <digest>` is how the caller that read that record says so. Retiring means
+  un-advertising: the ref goes, a `kv/gc/<digest>` record says why, and the bytes are
+  only deleted where the host can honestly forget (`--purge-blobs`, the `fs` host; git
+  and bucket hosts report `retained`, because an append-only store cannot forget one
+  object).
+
+The full rules, including what retention cannot do, are in
+[docs/host-abstraction.md](../../docs/host-abstraction.md#attestations-in-the-store).
+
 ## `gitiup key` and `gitiup identity`
 
 ```console
@@ -225,8 +301,8 @@ refuses the round afterwards if the check says the author got in anyway. See
 
 ## What is deliberately *not* here yet
 
-storing or fetching attestations
-(giti-1rs.5), `gitiup verify attestation` (giti-1rs.8), and the runner that
+`gitiup verify attestation` (giti-1rs.8) — deciding whether a stored attestation's
+signature is *trusted* against a trust root — and the runner that
 writes these reports in the first place. `digest` is the slice that exists once
 the format does, which is the point: the computation is checkable from the command
 line before any of the machinery around it is built.
@@ -253,6 +329,13 @@ line before any of the machinery around it is built.
   which, and a pool too small for five saying `Insufficient` instead of shrinking.
 * `tests/participant_cli.rs` — the roster round trip: register, approve, list, revoke, and
   a published epoch that re-verifies from the store's own bytes.
+* `tests/attest_cli.rs` — `gitiup attest` as command lines, each in a fresh process with a
+  temp home and store: push → list → show with digests that match `gitiup digest` for the
+  same report, an unsigned document refused (`6`), a re-push reported idempotent, `gc`
+  pruning over a per-commit cap and by age (with the run recorded), a `--keep` surviving,
+  an empty policy refused, and — over loopback smart HTTP with nothing but `git` on the
+  reading side — a plain `git clone` + `fetch refs/attestations/*` ending up holding the
+  exact signed bytes.
 * `tests/doc_examples.rs` — the worked report in `docs/run-report.md`, parsed and
   digested: the documentation example is the pinned example.
 * `tests/cli_hygiene.rs` — the dependency list stays at three crates, no network or

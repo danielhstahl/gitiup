@@ -53,11 +53,42 @@ multi-write (`auth: cloud-role`), git = `cas + immutable` via force-with-lease
 ## Ref namespaces (shared by every host)
 
 ```text
-refs/heads/**            real branches (owner writes)
-refs/changes/<id>/head   proposed change head        (giti-kd4.1)
-refs/attestations/<oid>  attestations for a commit, so `git fetch` carries proof (giti-1rs.5)
-refs/gitiup/**           roster, job/lease records, quorum state
+refs/heads/**                        real branches (owner writes)
+refs/changes/<id>/head               proposed change head        (giti-kd4.1)
+refs/attestations/<subject>/<digest> attestations for a commit, so `git fetch` carries proof (giti-1rs.5)
+refs/gitiup/**                       roster, job/lease records, quorum state
 ```
+
+## Attestations (`attest`)
+
+An attestation is signed bytes, so storing one is two writes in a fixed order and one
+rule that is not a policy knob:
+
+* **bytes first, then the ref** — a ref naming bytes no reader can fetch is a broken
+  proof, while un-advertised bytes are merely unread; on a git host the ref write is
+  what wraps the record into a pointer commit, and it needs the blob to exist already.
+  Both writes are create-only, so a re-publish is idempotent and a second proof about
+  the same commit gets its own ref instead of overwriting the first.
+* **a listing is a prefix read** — `list_for(subject)` lists
+  `refs/attestations/<subject>/*` and nothing else, so answering "what proves this
+  commit?" does not cost more as the store fills. Refs in that namespace that are not
+  this shape come back as `unexpected` rather than being skipped.
+* **an object another live ref points at is never pruned** — `referenced()` collects
+  the digests live refs *outside* `refs/attestations/**` point at, which is where a
+  quorum keeps its evidence: each seat's submission is a blob in this same CAS, held by
+  `refs/gitiup/reveal/<change>/<job>/<slot>`. So “keep the round's ballots” is not a
+  setting; it is what the store does, and `plan` reports such a digest as `Pinned` with
+  the ref that holds it. A digest named inside another record is not a ref, so
+  `pin()`/`--keep` is how a caller declares that one — see
+  [docs/host-abstraction.md](../../docs/host-abstraction.md#retention).
+
+`plan` / `apply` are separate so a `gc` is reviewable before it is destructive, and
+retiring means *un-advertising*: the ref goes, a record lands in `kv/gc/<digest>`
+saying what was removed, what was pinned and what each decision was based on, and the
+bytes are only deleted where the host can honestly forget (`BlobStore::purge_cas`,
+which the `fs` host implements and a git or versioned-bucket store refuses — an
+append-only store cannot forget one object). The full rules, and the reasons, are in
+[docs/host-abstraction.md](../../docs/host-abstraction.md#attestations-in-the-store).
 
 ## Store layout
 
@@ -81,7 +112,10 @@ lays the same objects out (`fs` mirrors it as directories):
 ```
 
 CAS digests are SHA-256 over the exact bytes handed to `put_cas`; `put_cas` is
-idempotent and nothing in this crate overwrites or deletes a stored object.
+idempotent and nothing in this crate overwrites or deletes a stored object. The one
+exception is deliberate and reported: `BlobStore::purge_cas` forgets one object where
+the host honestly can (the `fs` host), and everywhere else says so instead of
+pretending — see [Attestations](#attestations-attest).
 
 ## Packs
 
@@ -238,6 +272,13 @@ stays out of the listing. `tests/host_git_http.rs` runs the same store through
 `git-http-backend` (a CGI shim in `tests/fixtures/`, no web server installed) and
 through a static file server, which is where the read-only promise gets tested.
 Both skip themselves if `python3` or `git-http-backend` is missing.
+
+`tests/attest_store.rs` runs the attestation store (`attest::publish`, listing,
+retention, retirement) against the two hosts a test can stand up without
+credentials — `FsHost` and a bucket host on an in-process bucket — and asserts the
+promise the hosts share but the transports do not: the same bytes, ref and answer
+from both, and a git store's *refusal* to delete signed proof it cannot honestly
+forget.
 
 `tests/host_s3_live.rs` runs the same bodies against a real endpoint. It is
 `#[ignore]`d so the default suite needs no network:

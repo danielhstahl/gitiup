@@ -809,6 +809,27 @@ impl BlobStore for FsHost {
         out.sort_by_key(BlobEntry::key);
         Ok(out)
     }
+
+    /// Forget a blob for real: this host is a directory the operator owns, so
+    /// unlinking is what "retire it" means here.
+    ///
+    /// The one host in the workspace that can say yes. A git object database has no
+    /// operation for "drop this object" and a versioned bucket's delete is a marker
+    /// in front of bytes that stay forever, so they refuse and retention reports the
+    /// refusal instead of a smaller disk usage.
+    fn purge_cas(&self, oid: &Oid) -> HostResult<bool> {
+        let Some((_, path)) = self.locate(oid)? else {
+            return Ok(false);
+        };
+        std::fs::remove_file(&path).map_err(|e| HostError::from_io("purge blob", &path, e))?;
+        // Leave no empty shard directories behind: a store that has been through a
+        // retention run should still look like a store, not like a hash tree with
+        // holes in it.
+        if let Some(shard) = path.parent() {
+            let _ = std::fs::remove_dir(shard);
+        }
+        Ok(true)
+    }
 }
 
 impl Host for FsHost {
