@@ -6,7 +6,7 @@
 //! once is excluded for every key it holds. All deterministic: the "randomness" is keyed
 //! on a fixed counter, so a failure reproduces exactly.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gitiup_quorum::capability::RosterTier;
 use gitiup_quorum::derive::SelectionSecret;
@@ -254,4 +254,195 @@ fn excluding_an_identity_takes_its_whole_family() {
         chosen.contains(&boxes[1].as_str()) || !selection.sufficient,
         "the sibling box stays eligible: a box exclusion is not an exile of a person"
     );
+}
+
+/// The acceptance criterion at the size the ADR quotes: **ten thousand selections**, and
+/// a χ² test at p > 0.01 on both the seats and the ranks.
+///
+/// The pool is homogeneous on purpose — twelve `endorsed` principals with caps wide
+/// enough that nothing but the ordering decides — because caps are *meant* to make a
+/// heterogeneous roster non-uniform (that is what a cap is). What this measures is the
+/// one thing that must not be skewed: `score`'s ordering. Two counts are checked, since
+/// "selected evenly" and "ranked evenly" are different properties: a function that put
+/// the same candidate first a little too often would pass the first and fail the second.
+///
+/// Critical value: χ²₀.₀₁(11 df) = 24.725. Deterministic, so a failure reproduces
+/// exactly — the "randomness" is HMACs over a counter.
+#[test]
+fn ten_thousand_selections_pass_a_chi_square_test() {
+    let owner = sample::owner_key();
+    let candidates = 12u8;
+    let roster = symmetric_pool(&owner, candidates);
+    let inputs = round_for(&roster, symmetric_policy(N));
+    let rounds = 10_000usize;
+
+    let mut wins = vec![0usize; candidates as usize];
+    let mut firsts = vec![0usize; candidates as usize];
+    // Built once, outside the loop: deriving a `SigningKey` is a scalar multiplication,
+    // and looking one up per seat per round would make this test measure key generation
+    // instead of the ordering.
+    let pool: BTreeMap<String, usize> = (0..candidates)
+        .map(|index| {
+            (
+                sample::verifier_key(index).public_key().key_id(),
+                index as usize,
+            )
+        })
+        .collect();
+    let index_of = |key_id: &str| -> usize {
+        *pool.get(key_id).unwrap_or_else(|| {
+            panic!(
+                "{} is not in the pool",
+                gitiup_quorum::record::short_key(key_id)
+            )
+        })
+    };
+    for round in 0..rounds {
+        let selection = Selection::select(&roster, &inputs, &secret_for(round)).unwrap();
+        assert!(selection.sufficient, "round {round} filled its seats");
+        assert_eq!(selection.selected.len(), N);
+        for seat in &selection.selected {
+            wins[index_of(&seat.key_id)] += 1;
+        }
+        firsts[index_of(&selection.selected[0].key_id)] += 1;
+    }
+
+    let chi_square = |counts: &[usize], expected: f64| -> f64 {
+        counts
+            .iter()
+            .map(|observed| {
+                let deviation = *observed as f64 - expected;
+                (deviation * deviation) / expected
+            })
+            .sum()
+    };
+    let expected_seats = (rounds * N) as f64 / candidates as f64;
+    let expected_first = rounds as f64 / candidates as f64;
+    let seats = chi_square(&wins, expected_seats);
+    let ranks = chi_square(&firsts, expected_first);
+    let df = candidates as usize - 1;
+    assert!(
+        seats < CRITICAL_11_DF,
+        "χ² {seats:.2} on {df} degrees of freedom over {rounds} rounds (seats {wins:?}, \
+         expected {expected_seats:.1} each): selection is not uniform over the pool"
+    );
+    assert!(
+        ranks < CRITICAL_11_DF,
+        "χ² {ranks:.2} on {df} degrees of freedom over {rounds} rounds (rank 1 {firsts:?}, \
+         expected {expected_first:.1} each): the first seat is not uniform either"
+    );
+    // A sanity check on the test itself: every candidate won, and no candidate won so
+    // rarely that the χ² above was computed over an essentially empty cell.
+    assert_eq!(wins.iter().filter(|won| **won == 0).count(), 0);
+    assert!(wins.iter().min().unwrap() > &(rounds * N / candidates as usize / 2));
+}
+
+/// The critical value of χ² at p = 0.01 with 11 degrees of freedom
+/// (`candidates - 1`), quoted by ADR-0002's uniformity note.
+const CRITICAL_11_DF: f64 = 24.725;
+
+/// The acceptance criterion "the author and their other keys are always excluded", read
+/// across many rounds rather than one.
+///
+/// One round proves the exclusion filter fired; a hundred prove it does not depend on the
+/// seed, and that a second and third box of the same principal are as dead as the first
+/// however the ordering falls. The author here anchors *three* boxes and is named by one
+/// of them, which is the case a hand-maintained exclusion list gets wrong.
+#[test]
+fn the_author_and_their_other_keys_never_get_a_seat() {
+    let owner = sample::owner_key();
+    // Fifteen boxes, one of them the author's first; the author anchors two more under
+    // the same principal, and every other box is its own principal.
+    let author_boxes = [0u8, 7, 13];
+    let entries: Vec<RosterEntry> = (0..15u8)
+        .map(|index| {
+            let principal = if author_boxes.contains(&index) {
+                author_boxes[0]
+            } else {
+                index
+            };
+            sample::entry_with(index, principal, EPOCH, RosterTier::Endorsed)
+        })
+        .collect();
+    let roster = sample::roster_of_entries(&owner, entries, EPOCH);
+    let author = vec![sample::verifier_key(author_boxes[0]).public_key().key_id()];
+
+    let family: BTreeSet<String> = gitiup_quorum::proposer_family(&roster, &author)
+        .iter()
+        .map(|entry| entry.key_id.clone())
+        .collect();
+    assert_eq!(
+        family.len(),
+        author_boxes.len(),
+        "naming one of the author's keys has to reach every box they anchor"
+    );
+
+    let inputs = round_for(&roster, symmetric_policy(N))
+        .excluding(&roster, &author)
+        .unwrap();
+    for round in 0..100 {
+        let selection = Selection::select(&roster, &inputs, &secret_for(round)).unwrap();
+        assert!(selection.sufficient, "round {round} filled its seats");
+        let seated: BTreeSet<&str> = selection
+            .selected
+            .iter()
+            .map(|seat| seat.key_id.as_str())
+            .collect();
+        for key in &family {
+            assert!(
+                !seated.contains(&**key),
+                "round {round} seated {} of the author's family: {:?}",
+                key,
+                selection
+                    .selected
+                    .iter()
+                    .map(|seat| &seat.key_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The audit check an auditor runs, on the round as published.
+        let check = gitiup_quorum::ProposerExclusion::check(&roster, &inputs, &selection, &author);
+        assert!(check.held(), "round {round}: {}", check.describe());
+    }
+}
+
+/// The exclusion set is closed over the family before it reaches the round, so the audit
+/// record says *why* each of the author's boxes is out (`excluded`, D7's order) instead
+/// of leaving it to chance that a box was too slow or the wrong architecture.
+#[test]
+fn an_unexcluded_author_is_visible_in_the_audit_rather_than_lucky() {
+    let owner = sample::owner_key();
+    let entries: Vec<RosterEntry> = (0..10u8)
+        .map(|index| {
+            sample::entry_with(
+                index,
+                if index == 1 { 0 } else { index },
+                EPOCH,
+                RosterTier::Endorsed,
+            )
+        })
+        .collect();
+    let roster = sample::roster_of_entries(&owner, entries, EPOCH);
+    let author = vec![sample::verifier_key(0).public_key().key_id()];
+
+    // A round that forgot: same pool, no exclusion. The author's other box is still in
+    // the eligible pool, and the check says so — that is the whole point of publishing
+    // the exclusion list with the round.
+    let forgot = round_for(&roster, symmetric_policy(N));
+    let selection = Selection::select(&roster, &forgot, &secret_for(4)).unwrap();
+    let check = gitiup_quorum::ProposerExclusion::check(&roster, &forgot, &selection, &author);
+    assert_eq!(
+        check.missing.len(),
+        2,
+        "both of the author's boxes were left in the pool"
+    );
+    assert!(!check.held());
+
+    // The same round with the rule applied: nothing to report, and the seats it happens
+    // to hold anyway are gone.
+    let closed = forgot.excluding(&roster, &author).unwrap();
+    let selection = Selection::select(&roster, &closed, &secret_for(4)).unwrap();
+    let check = gitiup_quorum::ProposerExclusion::check(&roster, &closed, &selection, &author);
+    assert!(check.held(), "{}", check.describe());
+    assert_eq!(check.family.len(), 2);
 }

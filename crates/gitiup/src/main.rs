@@ -18,6 +18,7 @@
 //! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
 //! gitiup participant …                  volunteering to verify: register, withdraw, list
+//! gitiup select …                       who verifies one change, and why: derive or audit
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -46,6 +47,7 @@ mod normalise;
 mod participant;
 mod remotes;
 mod run;
+mod select;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -67,6 +69,8 @@ COMMANDS:
                                    verify, endorse, use, whoami, import)
     participant [COMMAND] [OPTS]   the quorum roster: register, withdraw, list,
                                    verify-roster, approve, revoke
+    select [OPTIONS]               who verifies one change: re-derive a published
+                                   selection, or open a new round and exclude the author
     help                        print this text
     version                     print the version of this build
 
@@ -90,6 +94,13 @@ passphrase and `--json` on anything a script reads.
 name, `list` and `verify-roster` read the epoch the owner signed, and `approve` and
 `revoke` are the owner's acts. Same exit table, same passphrase rules as `key`.
 
+`select` is the other half: who is asked about one change, and the proof. Run it with a
+published round and it re-derives the ordered selection from the round record, the roster
+epoch it pinned and the published seed — no key, no secret, no trust root. Run it before
+the round exists and it derives the seed from the selector's key, excludes the change
+author and every other key of theirs, and writes the round record that makes the choice
+auditable. `--explain` prints the audit table; ADR-0002 D3 is what it explains.
+
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
 default accepts `local` only. There is no way to ask for `quorum`: a single run
@@ -106,6 +117,10 @@ Try:
     gitiup digest --expect sha256:… run.json   # exit 8 if the rerun disagrees
     gitiup normalise run.json                  # what was rewritten, and why
     gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
+    gitiup participant list --store ./store --json
+    gitiup select --change chg-1 --store ./store --explain
+    gitiup select --change chg-1 --job build/matrix/linux-x86_64 --head sha1:… \
+        --proposer ada --require-arch x86_64 --store ./store --publish
     gitiup key gen --comment ada@laptop         # a new key, in the age-encrypted keystore
     gitiup identity publish ada --email ada@example.com
     gitiup identity whoami --check              # proves this machine can still sign
@@ -227,6 +242,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "key" => keys::key(&args[1..]),
         "identity" => keys::identity(&args[1..]),
         "participant" => participant::participant(&args[1..]),
+        "select" => select::select(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }

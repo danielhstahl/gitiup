@@ -23,7 +23,9 @@
 //! signatures: a store that lies about bytes is caught at the digest, not assumed away.
 
 use gitiup_attest::AttestationDoc;
-use gitiup_host::{Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefName, RefUpdate};
+use gitiup_host::{
+    Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefName, RefQuery, RefUpdate,
+};
 
 use crate::error::{Error, Result};
 use crate::record::{Record, short_key};
@@ -336,6 +338,46 @@ pub fn publish_round(host: &dyn Host, round: &Round) -> Result<Oid> {
         round.inputs.attempt,
     )?;
     put_record(host, &ns::ROUND, &name, &round.canonical_bytes()?, "round")
+}
+
+/// `refs/gitiup/round/<change>` — every round (job × attempt) the store holds for one
+/// change.
+///
+/// A ref *prefix* rather than a ref, so `gitiup select --change <id>` can find a round
+/// without being told the job id, which is what the acceptance criterion's shortest
+/// command line needs.
+pub fn round_prefix(change: &str) -> Result<String> {
+    check_segment(change, "change id")?;
+    Ok(format!("refs/gitiup/round/{}", escape(change)))
+}
+
+/// Every round published for one change, ordered by `(job, attempt)`.
+///
+/// Whole records, not ref names: a round is only meaningful against the roster epoch it
+/// pinned, so a caller that listed rounds is going to fetch them anyway. A blob that
+/// does not parse is an error and not a skipped row — a store that holds a corrupt round
+/// is a store bug, and quietly ignoring it would make "this change has no quorum" a lie.
+pub fn rounds_for(host: &dyn Host, change: &str) -> Result<Vec<Round>> {
+    let prefix = round_prefix(change)?;
+    let mut out = Vec::new();
+    for reference in host
+        .list_refs(&RefQuery::prefix(&prefix))
+        .map_err(|e| Error::store("list rounds", &e))?
+    {
+        if let Some(bytes) = host
+            .get(&reference.oid)
+            .map_err(|e| Error::store("fetch round", &e))?
+        {
+            out.push(Round::from_canonical_bytes(&bytes)?);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.inputs
+            .job_id
+            .cmp(&b.inputs.job_id)
+            .then(a.inputs.attempt.cmp(&b.inputs.attempt))
+    });
+    Ok(out)
 }
 
 /// Fetch the round for one change/job/attempt.

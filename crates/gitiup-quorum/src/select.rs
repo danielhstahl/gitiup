@@ -27,6 +27,11 @@
 //! Reserves are a *listing*, not a second decision: promotion re-runs the same round
 //! with a longer exclusion list and takes the head of the new list, so an issuer who
 //! could otherwise pick a substitute could steer the quorum.
+//!
+//! The proposer rule is a call and a check, not a convention: [`RoundInputs::excluding`]
+//! closes an exclusion set over a principal's whole family, and [`ProposerExclusion`]
+//! re-checks a published round against it. "The author cannot referee their own change"
+//! is worth nothing if it is only documented.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -154,6 +159,232 @@ impl RoundInputs {
     /// exactly which inputs a verdict was drawn from.
     pub fn digest(&self) -> Result<Digest> {
         Ok(Digest::sha256(&record::canonical_bytes(self)?))
+    }
+
+    /// These inputs with `principals` excluded, family-closed
+    /// ([ADR-0002 D4](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+    ///
+    /// This is the proposer rule as a call instead of a convention: the caller names the
+    /// author's key (or their principal key) and every other box that author anchors is
+    /// excluded with it, whether or not anybody remembers to list them. A change's
+    /// committer keys belong in the same call — the ADR's threat table lists "voting
+    /// through their own other machines" as one threat, not two.
+    ///
+    /// Names the roster does not know are kept anyway: excluding an author who is not on
+    /// the epoch is a no-op on the pool and a fact in the audit record.
+    ///
+    /// ```
+    /// use gitiup_quorum::prelude::*;
+    /// use gitiup_quorum::{sample, ProposerExclusion, SelectionSecret};
+    ///
+    /// // A roster where the author anchors two boxes under one principal.
+    /// let owner = sample::owner_key();
+    /// let entries = vec![
+    ///     sample::entry_with(0, 0, 41, RosterTier::Endorsed), // the author's box
+    ///     sample::entry_with(1, 0, 41, RosterTier::Endorsed), // their other box
+    ///     sample::entry(2, 41, RosterTier::Endorsed),
+    ///     sample::entry(3, 41, RosterTier::Endorsed),
+    /// ];
+    /// let roster = sample::roster_of_entries(&owner, entries, 41);
+    /// let author = vec![sample::verifier_key(0).public_key().key_id()];
+    ///
+    /// let inputs = sample::round_inputs(&roster, "chg-1", "build")
+    ///     .excluding(&roster, &author)
+    ///     .expect("the exclusion names a real key id");
+    /// let selection = Selection::select(&roster, &inputs, &SelectionSecret::test_vector())?;
+    /// let check = ProposerExclusion::check(&roster, &inputs, &selection, &author);
+    /// assert!(check.held(), "{}", check.describe());
+    /// assert_eq!(check.family.len(), 2, "one name, both boxes");
+    /// # Ok::<(), gitiup_quorum::Error>(())
+    /// ```
+    pub fn excluding(&self, roster: &Roster, principals: &[String]) -> Result<RoundInputs> {
+        let mut next = self.clone();
+        for name in proposer_family_exclusions(roster, principals) {
+            record::require_key_id_shape(&name, "exclusion")?;
+            next.exclusions.insert(name);
+        }
+        Ok(next)
+    }
+
+    /// Whether the exclusion list already takes `entry` out of the pool (D4's family
+    /// rule, read the same way [`exclusion_of`](crate::exclusion_of) reads it).
+    pub fn excludes(&self, entry: &crate::roster::RosterEntry) -> bool {
+        self.exclusions.contains(&entry.key_id) || self.exclusions.contains(&entry.identity)
+    }
+}
+
+/// Every roster entry that belongs to one of `principals`
+/// ([ADR-0002 D4](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+///
+/// Two hops, because that is what the rule is: a name reaches the entry it matches *and*
+/// every entry that shares that entry's `identity`. Naming a change author's commit key
+/// therefore takes out the other three boxes they anchor under the same principal, which
+/// is the difference between "the author was excluded" and "one of the author's keys was
+/// excluded".
+///
+/// The relation is self-declared (an entry's `identity` is chosen by whoever registered
+/// it), which makes it a floor on what one human controls and never a ceiling — the
+/// honest sentence is "a sybil costs a vouching decision", which is what the ADR says.
+pub fn proposer_family<'a>(
+    roster: &'a Roster,
+    principals: &[String],
+) -> Vec<&'a crate::roster::RosterEntry> {
+    let named: BTreeSet<&str> = principals.iter().map(String::as_str).collect();
+    // The principals the names reach: a named box anchors its own principal, and a named
+    // principal anchors itself (kept even when it owns nothing, so a name the roster has
+    // never seen is a no-op rather than an error).
+    let anchors: BTreeSet<&str> = roster
+        .entries
+        .iter()
+        .filter(|entry| {
+            named.contains(entry.key_id.as_str()) || named.contains(entry.identity.as_str())
+        })
+        .map(|entry| entry.identity.as_str())
+        .chain(named.iter().copied())
+        .collect();
+    roster
+        .entries
+        .iter()
+        .filter(|entry| {
+            named.contains(entry.key_id.as_str()) || anchors.contains(entry.identity.as_str())
+        })
+        .collect()
+}
+
+/// The names an exclusion set must contain to take `principals` out of the pool.
+///
+/// Each name given, plus every key id and every principal of every family they anchor.
+/// It is a superset on purpose: `exclusion_of` needs only one hit per entry, and listing
+/// the whole family is what makes the audit record readable without re-deriving it.
+pub fn proposer_family_exclusions(roster: &Roster, principals: &[String]) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = principals.iter().cloned().collect();
+    for entry in proposer_family(roster, principals) {
+        out.insert(entry.key_id.clone());
+        out.insert(entry.identity.clone());
+    }
+    out
+}
+
+/// The proposer rule *checked*, not assumed
+/// ([ADR-0002 D4, D7](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+///
+/// "Proposer" here is the ADR's word for the author of the change under verification —
+/// the same party ADR-0002 D4 calls `proposer`, and the same party a caller types as
+/// `--proposer`. The name is the ADR's `check_proposer_exclusion`, because the ADR's
+/// complaint about its sibling was "only documented, and the prose lives in an ADR, which
+/// is a document and not a check".
+///
+/// `excluding` is what a selector does; this is what an auditor — and `gitiup select`
+/// itself — asks afterwards, because "the author was excluded" is a property of one
+/// published round and not of the code path that made it. Everything it reads is
+/// public: the roster, the round's exclusion list, the derived seats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposerExclusion {
+    /// The principals the check was asked about, as given.
+    pub principals: Vec<String>,
+    /// Every roster entry the rule covers — the author's own boxes, key ids first.
+    pub family: Vec<String>,
+    /// Family entries the round left in the eligible pool without excluding them.
+    ///
+    /// "In the pool" is the honest wording, not "was picked": a box the round forgot to
+    /// name is a hole even when a lower cap happened to keep it out of the seats.
+    pub missing: Vec<String>,
+    /// Seats held by a family member. Always empty in a legitimate round.
+    pub seated: Vec<String>,
+}
+
+impl ProposerExclusion {
+    /// Check `selection` (derived from `inputs` over `roster`) against `principals`.
+    pub fn check(
+        roster: &Roster,
+        inputs: &RoundInputs,
+        selection: &Selection,
+        principals: &[String],
+    ) -> ProposerExclusion {
+        let family = proposer_family(roster, principals);
+        let mut missing = Vec::new();
+        let mut covered = Vec::new();
+        for entry in family {
+            covered.push(entry.key_id.clone());
+            if inputs.excludes(entry) {
+                continue;
+            }
+            // Not named by the round. Was it eligible anyway? Re-running the D7 filters
+            // with an empty exclusion set asks exactly that, and answers with the same
+            // first-failing reason the audit table would print.
+            let otherwise = exclusion_of(
+                entry,
+                inputs.roster_epoch,
+                &inputs.required_capabilities,
+                &Default::default(),
+                inputs.policy.tier_floor,
+            );
+            if otherwise.is_none() {
+                missing.push(entry.key_id.clone());
+            }
+        }
+        let seated = selection
+            .selected
+            .iter()
+            .filter(|seat| {
+                covered.contains(&seat.key_id) || principals.iter().any(|p| p == &seat.identity)
+            })
+            .map(|seat| seat.key_id.clone())
+            .collect();
+        ProposerExclusion {
+            principals: principals.to_vec(),
+            family: covered,
+            missing,
+            seated,
+        }
+    }
+
+    /// Whether the rule held: nothing in the family sits in the pool, and nothing in it
+    /// holds a seat.
+    pub fn held(&self) -> bool {
+        self.missing.is_empty() && self.seated.is_empty()
+    }
+
+    /// The one-line form `--explain` prints.
+    pub fn describe(&self) -> String {
+        if self.principals.is_empty() {
+            return "proposer: none named".to_string();
+        }
+        if self.held() {
+            return format!(
+                "proposer: {} family box(es) excluded ({})",
+                self.family.len(),
+                self.family
+                    .iter()
+                    .map(|key| record::short_key(key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let mut parts = Vec::new();
+        if !self.missing.is_empty() {
+            parts.push(format!(
+                "{} eligible box(es) were not excluded: {}",
+                self.missing.len(),
+                self.missing
+                    .iter()
+                    .map(|key| record::short_key(key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.seated.is_empty() {
+            parts.push(format!(
+                "{} hold seats: {}",
+                self.seated.len(),
+                self.seated
+                    .iter()
+                    .map(|key| record::short_key(key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        format!("proposer: REFUSED — {}", parts.join("; "))
     }
 }
 
@@ -757,4 +988,159 @@ fn require_round_inputs(text: &str, what: &'static str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProposerExclusion, RoundInputs, Selection, SelectionPolicy, proposer_family,
+        proposer_family_exclusions,
+    };
+    use crate::capability::RosterTier;
+    use crate::derive::SelectionSecret;
+    use crate::sample;
+    use gitiup_attest::SigningKey;
+
+    /// One author with two boxes (`0` and `1` share a principal), six strangers besides.
+    ///
+    /// The shape the acceptance criterion is about: naming the author's *one* key has to
+    /// take both of their boxes out, and forgetting to has to be visible rather than
+    /// silently harmless.
+    fn fixture() -> (crate::roster::Roster, Vec<String>) {
+        let owner = sample::owner_key();
+        let entries = (0..8u8)
+            .map(|index| {
+                // Box 1 is the author's second machine: same principal, different key.
+                let principal = if index == 1 { 0 } else { index };
+                sample::entry_with(index, principal, 41, RosterTier::Endorsed)
+            })
+            .collect::<Vec<_>>();
+        let roster = sample::roster_of_entries(&owner, entries, 41);
+        let author = sample::verifier_key(0).public_key().key_id();
+        (roster, vec![author])
+    }
+
+    fn inputs(roster: &crate::roster::Roster) -> RoundInputs {
+        sample::round_inputs_with(
+            roster,
+            "chg-000000000000f00d",
+            "build/matrix/linux-x86_64",
+            SelectionPolicy {
+                tier_caps: [("endorsed", 5)]
+                    .into_iter()
+                    .map(|(tier, cap)| (tier.to_string(), cap))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn naming_one_key_of_the_author_takes_every_box_of_theirs() {
+        let (roster, author) = fixture();
+        let family = proposer_family(&roster, &author);
+        assert_eq!(
+            family.len(),
+            2,
+            "the fixture author anchors two boxes through one principal"
+        );
+        let closed = proposer_family_exclusions(&roster, &author);
+        assert!(closed.contains(&author[0]), "the named key stays named");
+        for entry in &family {
+            assert!(closed.contains(&entry.key_id));
+            assert!(closed.contains(&entry.identity));
+        }
+
+        let inputs = inputs(&roster).excluding(&roster, &author).unwrap();
+        assert!(inputs.exclusions.len() > family.len());
+        for entry in &family {
+            assert!(
+                inputs.excludes(entry),
+                "{} is out of the pool",
+                entry.key_id
+            );
+        }
+        let selection =
+            Selection::select(&roster, &inputs, &SelectionSecret::test_vector()).unwrap();
+        let check = ProposerExclusion::check(&roster, &inputs, &selection, &author);
+        assert!(check.held(), "{}", check.describe());
+        assert!(check.seated.is_empty());
+        assert!(
+            selection
+                .selected
+                .iter()
+                .all(|seat| !family.iter().any(|entry| entry.key_id == seat.key_id)),
+            "the author's boxes hold seats"
+        );
+    }
+
+    #[test]
+    fn a_round_that_forgot_the_author_is_refused_by_the_check() {
+        // The other half of the rule: a round (or a selector) that never applied the
+        // exclusion does not quietly pass. An auditor runs the same check this test does.
+        let (roster, author) = fixture();
+        let forgot = inputs(&roster);
+        let selection =
+            Selection::select(&roster, &forgot, &SelectionSecret::test_vector()).unwrap();
+        let check = ProposerExclusion::check(&roster, &forgot, &selection, &author);
+        assert!(!check.held(), "{}", check.describe());
+        assert!(
+            !check.missing.is_empty(),
+            "the author's eligible boxes were left in the pool: {}",
+            check.describe()
+        );
+        assert!(check.describe().contains("REFUSED"));
+
+        // Naming the *principal* instead of a box closes the same hole.
+        let principal = roster
+            .entry(&author[0])
+            .expect("the author is on the epoch")
+            .identity
+            .clone();
+        let by_principal = inputs(&roster)
+            .excluding(&roster, std::slice::from_ref(&principal))
+            .unwrap();
+        assert!(by_principal.exclusions.contains(&author[0]));
+        let selection =
+            Selection::select(&roster, &by_principal, &SelectionSecret::test_vector()).unwrap();
+        let check = ProposerExclusion::check(&roster, &by_principal, &selection, &[principal]);
+        assert!(check.held(), "{}", check.describe());
+    }
+
+    #[test]
+    fn an_author_who_is_not_on_the_epoch_is_still_named() {
+        // Excluding someone who is not on the roster is a no-op on the pool and a fact
+        // in the audit record, not an error: the author of a change need not be a
+        // registered verifier, and the round still says who it was not going to pick.
+        let (roster, _) = fixture();
+        let stranger = SigningKey::from_seed(&[0x5a; 32]);
+        let stranger_id = stranger.public_key().key_id();
+        let inputs = inputs(&roster)
+            .excluding(&roster, std::slice::from_ref(&stranger_id))
+            .unwrap();
+        assert!(inputs.exclusions.contains(&stranger_id));
+        assert!(proposer_family(&roster, std::slice::from_ref(&stranger_id)).is_empty());
+        let selection =
+            Selection::select(&roster, &inputs, &SelectionSecret::test_vector()).unwrap();
+        let check = ProposerExclusion::check(&roster, &inputs, &selection, &[stranger_id]);
+        assert!(check.held());
+        assert!(check.family.is_empty());
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_key_id_is_refused_before_it_reaches_a_round() {
+        // The exclusion set goes into a signed document and into a seed message, so a
+        // typo is caught at the door rather than discovered as an unexplainable round.
+        let (roster, _) = fixture();
+        assert!(
+            inputs(&roster)
+                .excluding(&roster, &["ada".into()],)
+                .is_err()
+        );
+        assert!(
+            inputs(&roster)
+                .excluding(&roster, &["SHA256:not-a-fingerprint".into()])
+                .is_err()
+        );
+    }
 }

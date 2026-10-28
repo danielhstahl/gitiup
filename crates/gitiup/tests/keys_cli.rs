@@ -238,10 +238,7 @@ fn only_the_encrypted_container_is_written() {
         names.contains(&"ada-laptop.secret.age".to_string()),
         "the container should exist: {names:?}"
     );
-    let leftovers: Vec<&String> = names
-        .iter()
-        .filter(|name| name.ends_with(".tmp"))
-        .collect();
+    let leftovers: Vec<&String> = names.iter().filter(|name| name.ends_with(".tmp")).collect();
     assert!(
         leftovers.is_empty(),
         "the atomic writer left {leftovers:?} behind"

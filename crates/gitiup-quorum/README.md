@@ -27,6 +27,10 @@ Three rules hold the crate together:
   (`participate`), requiring a quorum is an owner's choice (`verdict`), and an
   unimplemented option (a `reveal_mode` this build cannot honour) is refused rather
   than quietly downgraded.
+* **The author never referees their own change, and the round proves it.**
+  `RoundInputs::excluding` closes an exclusion set over a principal's whole key family
+  before the seed is derived, and `ProposerExclusion::check` re-checks a published round
+  against it — from public bytes, so an auditor runs the same check the CLI does.
 
 ```rust,ignore
 use gitiup_quorum::prelude::*;

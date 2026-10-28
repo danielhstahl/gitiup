@@ -5,6 +5,12 @@
 //! needs that a library cannot supply: a human decision, and a store to put the signed
 //! documents in.
 //!
+//! The plumbing below — where the store is, which keys can sign, whose signature makes a
+//! roster a trust root, and how a record gets to `--out`/`--publish` — is `pub(crate)`,
+//! because `gitiup select` (giti-msi.3) reads the same roster from the same store and
+//! must not grow a second, slightly different answer to those questions. Two definitions
+//! of "the current epoch" in one binary is exactly the bug this crate exists to avoid.
+//!
 //! ```text
 //! gitiup participant register        a volunteer's self-signed sign-up
 //! gitiup participant withdraw        a signed tombstone naming the epoch you leave at
@@ -219,9 +225,9 @@ pub fn participant(args: &[String]) -> Result<(), CliError> {
 // ---------------------------------------------------------------------------
 
 /// A store the flags named, with a description of it for the output.
-struct Opened {
-    host: Box<dyn Host>,
-    what: String,
+pub(crate) struct Opened {
+    pub(crate) host: Box<dyn Host>,
+    pub(crate) what: String,
 }
 
 /// The store `--store`/`--remote` names, if either does.
@@ -229,7 +235,7 @@ struct Opened {
 /// Read-only commands may fall back to the configured default remote — there is nothing
 /// to damage by reading — while anything that writes requires the store to have been
 /// named, so a mistyped remote cannot turn into a roster published somewhere else.
-fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
+pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
     if let Some(dir) = args.get("--store") {
         let host =
             FsHost::open_or_create(dir).map_err(|e| CliError::io(format!("store '{dir}': {e}")))?;
@@ -274,7 +280,7 @@ fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
 }
 
 /// The store, required: writing a record somewhere needs an explicit somewhere.
-fn need_store(args: &Args) -> Result<Opened, CliError> {
+pub(crate) fn need_store(args: &Args) -> Result<Opened, CliError> {
     store_from(args)?.ok_or_else(|| {
         CliError::refused(
             "no store was named",
@@ -284,19 +290,22 @@ fn need_store(args: &Args) -> Result<Opened, CliError> {
 }
 
 /// The keystore and the identity config: who can sign here, and who signs by default.
-struct KeystoreHere {
-    keys: Keystore,
-    config: KeyConfig,
+pub(crate) struct KeystoreHere {
+    pub(crate) keys: Keystore,
+    pub(crate) config: KeyConfig,
 }
 
-fn keystore() -> Result<KeystoreHere, CliError> {
+pub(crate) fn keystore() -> Result<KeystoreHere, CliError> {
     let keys = Keystore::new(keys::paths()?);
     let config = KeyConfig::load(keys.paths())?;
     Ok(KeystoreHere { keys, config })
 }
 
 /// The key to sign with — the same rules as `gitiup identity` (see [`keys::signing_key`]).
-fn signing_key(args: &Args, here: &KeystoreHere) -> Result<gitiup_keys::signer::Key, CliError> {
+pub(crate) fn signing_key(
+    args: &Args,
+    here: &KeystoreHere,
+) -> Result<gitiup_keys::signer::Key, CliError> {
     keys::signing_key(args, &here.keys, &here.config)
 }
 
@@ -306,7 +315,7 @@ fn signing_key(args: &Args, here: &KeystoreHere) -> Result<gitiup_keys::signer::
 /// to default against — a withdrawal's `effective_epoch`, a revocation's — it has to mean
 /// what it means on `list`: the epoch in question. Silently preferring a store the operator
 /// did not name would be the same mistake as guessing one.
-fn current_epoch(args: &Args) -> Result<Option<Roster>, CliError> {
+pub(crate) fn current_epoch(args: &Args) -> Result<Option<Roster>, CliError> {
     if let Some(path) = args.get("--roster") {
         return Ok(Some(Roster::from_canonical_bytes(&read_maybe_stdin(
             path,
@@ -323,7 +332,7 @@ fn current_epoch(args: &Args) -> Result<Option<Roster>, CliError> {
 /// Both spellings are accepted wherever a key is named, because the two people who type
 /// one are a volunteer with their own `ssh-keygen -lf` output and an owner with a name
 /// they gave a key last week.
-fn key_id_of(here: &KeystoreHere, value: &str) -> Result<String, CliError> {
+pub(crate) fn key_id_of(here: &KeystoreHere, value: &str) -> Result<String, CliError> {
     let trimmed = value.trim();
     if trimmed.starts_with("SHA256:") {
         // Shape is checked by the library when the record is built; the prefix is the
@@ -344,7 +353,7 @@ fn key_id_of(here: &KeystoreHere, value: &str) -> Result<String, CliError> {
 /// `--owner` if given; otherwise this machine's own keys — the same local-trust rule
 /// `gitiup identity verify` uses, and reported in every output, because a roster
 /// believed because of a file listing is a roster believed by accident.
-fn owner_trust(args: &Args, here: &KeystoreHere) -> Result<(Trust, String), CliError> {
+pub(crate) fn owner_trust(args: &Args, here: &KeystoreHere) -> Result<(Trust, String), CliError> {
     let named = args.all("--owner");
     if !named.is_empty() {
         let mut ids = BTreeSet::new();
@@ -406,7 +415,7 @@ fn roster_here(args: &Args, trust: &Trust, now: TimeUs) -> Result<(Roster, Strin
 }
 
 /// A key id shortened for a terminal: `SHA256:abcd…wxyz`.
-fn short(key_id: &str) -> String {
+pub(crate) fn short(key_id: &str) -> String {
     let body = key_id.strip_prefix("SHA256:").unwrap_or(key_id);
     if body.len() <= 12 {
         key_id.to_string()
@@ -415,7 +424,7 @@ fn short(key_id: &str) -> String {
     }
 }
 
-fn read_maybe_stdin(path: &str) -> Result<Vec<u8>, CliError> {
+pub(crate) fn read_maybe_stdin(path: &str) -> Result<Vec<u8>, CliError> {
     if path == "-" {
         let mut buf = Vec::new();
         std::io::stdin()
@@ -426,7 +435,7 @@ fn read_maybe_stdin(path: &str) -> Result<Vec<u8>, CliError> {
     std::fs::read(path).map_err(|e| CliError::io(format!("reading '{path}': {e}")))
 }
 
-fn write_out(path: &str, bytes: &[u8]) -> Result<(), CliError> {
+pub(crate) fn write_out(path: &str, bytes: &[u8]) -> Result<(), CliError> {
     if path == "-" {
         // The bytes and nothing else: `gitiup participant register --out - | …` is a
         // pipe, and a pipe does not want a progress line in it.
@@ -448,17 +457,17 @@ fn write_out(path: &str, bytes: &[u8]) -> Result<(), CliError> {
 /// Where a record went: `--out` writes bytes, `--publish` writes to the store, and a
 /// command with neither has produced a record that exists only in this process — which
 /// is worth saying out loud, because it is the state a human mistakes for "submitted".
-struct Sink {
-    written: Option<String>,
-    published: Option<String>,
+pub(crate) struct Sink {
+    pub(crate) written: Option<String>,
+    pub(crate) published: Option<String>,
 }
 
 impl Sink {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         json!({ "written": self.written, "published": self.published })
     }
 
-    fn lines(&self) -> Vec<String> {
+    pub(crate) fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(path) = &self.written {
             out.push(format!("wrote {path}"));
@@ -482,7 +491,7 @@ impl Sink {
 /// `--out` gets the exact canonical bytes — the same bytes a store would hold, so a
 /// record handed over on a stick and a record read from a store verify identically — and
 /// `publish` is called only when `--publish` was given.
-fn emit(
+pub(crate) fn emit(
     args: &Args,
     bytes: &[u8],
     publish: impl FnOnce(&dyn Host) -> Result<String, CliError>,
@@ -508,11 +517,11 @@ fn emit(
 }
 
 /// The bytes are already on stdout, so the human summary would corrupt them.
-fn only_bytes(args: &Args) -> bool {
+pub(crate) fn only_bytes(args: &Args) -> bool {
     args.get("--out").is_some_and(|path| path == "-")
 }
 
-fn print_json(value: Value) {
+pub(crate) fn print_json(value: Value) {
     keys::print_json(value);
 }
 
@@ -546,7 +555,7 @@ fn entry_json(entry: &RosterEntry, epoch: u64, requirements: Option<&Requirement
 }
 
 /// The requirements the `--require-*` flags describe, if any was given.
-fn requirements_from(args: &Args) -> Result<Option<Requirements>, CliError> {
+pub(crate) fn requirements_from(args: &Args) -> Result<Option<Requirements>, CliError> {
     let asked = [
         "--require-arch",
         "--require-ram-mb",
@@ -584,10 +593,11 @@ fn requirements_from(args: &Args) -> Result<Option<Requirements>, CliError> {
     let sandboxes = args.all("--require-sandbox");
     let requirements = Requirements {
         // One architecture per round is the rule (ADR-0002 D7): a matrix with two is
-        // two rounds, each with its own seed.
+        // two rounds, each with its own seed. A repeat means the later one won, which is
+        // what every other `--require-*` flag here already does.
         arch: args
             .all("--require-arch")
-            .first()
+            .last()
             .cloned()
             .unwrap_or_default(),
         ram_mb: megabytes("--require-ram-mb")?,

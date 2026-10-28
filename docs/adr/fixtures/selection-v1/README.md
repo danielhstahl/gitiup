@@ -56,7 +56,8 @@ runs the selection, and compares the whole document — seed, scores, greedy rea
 seats, reserves, both promotion cases and the policy digest — against `selection.json`.
 The uniform case (`--uniform`) is
 `crates/gitiup-quorum/tests/selection_properties.rs`, which runs 200 rounds and checks
-χ² over the wins rather than one published number.
+χ² over the wins rather than one published number, plus a 10 000-round run (giti-msi.3's
+acceptance criterion) that checks χ² over the seat counts *and* over who got rank 1.
 
 Two things the Rust discovered while reproducing this set, both recorded so a later
 reader does not rediscover them:

@@ -1,8 +1,9 @@
 # The quorum verification network
 
-Status: **the mechanism exists, and so do the roster commands** (`gitiup participant
-register|withdraw|list|verify-roster`, plus the owner's `approve` and `revoke`); the
-selection, job and verdict CLIs are open tickets.
+Status: **the mechanism exists, and so do the roster and selection commands** —
+`gitiup participant register|withdraw|list|verify-roster` (plus the owner's `approve` and
+`revoke`) and `gitiup select`, which opens a round or re-derives a published one. The job,
+lease and verdict CLIs are open tickets.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -34,7 +35,7 @@ decision, and neither changes what a plain local run produces.
 | [`derive`](../crates/gitiup-quorum/src/derive.rs) | the domain separation: round id message, seed, score, handle, key slot, per-key challenge. All of it HMAC-SHA-256 over a versioned domain string. |
 | [`roster`](../crates/gitiup-quorum/src/roster.rs) | the trust list: epochs, key-ownership proofs, sign-ups, withdrawals, revocations, one-identity-one-vote. |
 | [`capability`](../crates/gitiup-quorum/src/capability.rs) | the eligibility filters and their order — the order is a published decision, because it decides which reason a refusal names. |
-| [`select`](../crates/gitiup-quorum/src/select.rs) | the selection proper: score ordering, the greedy pass over tier and identity caps, reserves, promotion, and `explain()`, the audit trail. |
+| [`select`](../crates/gitiup-quorum/src/select.rs) | the selection proper: score ordering, the greedy pass over tier and identity caps, reserves, promotion, the proposer-family rule (`proposer_family`, `RoundInputs::excluding`, `ProposerExclusion`), and `explain()`, the audit trail. |
 | [`round`](../crates/gitiup-quorum/src/round.rs) | the signed record that pins a round to a roster epoch and digest and publishes the seats and the seed. |
 | [`store`](../crates/gitiup-quorum/src/store.rs) | the ref names and CAS writes. The store is the broker: compare-and-swap does the locking, so there is no coordinator to bribe. |
 | [`gate`](../crates/gitiup-quorum/src/gate.rs) | admission at submission time: is *this key* approved, for *this epoch*, in *this round*, and is *this document* its own? Every refusal has its own code. |
@@ -181,8 +182,59 @@ The published golden vectors
 reproduces `selection.json` from `roster.json` + `round.json` — candidates, scores,
 greedy reasons, seats, reserves, promotion cases, seed and policy digest — and
 [`tests/selection_properties.rs`](../crates/gitiup-quorum/tests/selection_properties.rs)
-checks the statistical claims over 200 simulated rounds (χ² uniformity, one identity one
-seat, a key rotation changing the pick).
+checks the statistical and structural claims over many simulated rounds: χ² uniformity over
+**10 000** selections on both the seat counts and the rank-1 counts (p > 0.01), one identity
+one seat, a key rotation changing the pick, and the proposer's whole family staying out of
+every seat.
+
+## Selecting, from the command line
+
+`gitiup select` is one command with two jobs, and which one it runs depends on whether the
+round already exists:
+
+```sh
+# the selector (the owner by default): open the round, then publish the audit record
+gitiup select --change chg-1 --job build/matrix/linux-x86_64 \
+    --head "sha1:$(git rev-parse HEAD)" --proposer ada \
+    --require-arch x86_64 --store ./store --explain --publish
+
+# anybody, including a stranger with no keys at all: re-derive it from what is published
+gitiup select --change chg-1 --store ./store --explain
+gitiup select --change chg-1 --store ./store --json | jq .selection
+
+# or from bytes alone: no store, no key, no trust root
+gitiup select --change chg-1 --round round.json --roster roster.json --proposer ada
+```
+
+Four things are worth naming, because each is a refusal in the code rather than a rule in
+prose:
+
+* **deriving needs a key, auditing needs none.** The seed is keyed on the selector's
+  Ed25519 seed ([D2](adr/0002-roster-verifier-selection-and-sybil-resistance.md)), so only
+  the selector can open a round; the seed is then *published* in the round record, so
+  anybody can re-derive the ordering. An auditor with an empty keystore gets the same
+  `selection` as the owner — plus a note saying whose signature was **not** believed,
+  because "reproduced" and "authorised" are different claims.
+* **the proposer is excluded, and then checked.** `--proposer` is required to open a round,
+  is closed over the author's whole identity family (`RoundInputs::excluding`, so a second
+  box anchored on the same principal leaves with the first), and the result is re-checked
+  with `ProposerExclusion::check` before the command prints. Auditing a round that left an
+  author's eligible box in the pool is exit 6: the exclusion set is part of the signed
+  record, so such a round is refused rather than re-interpreted.
+* **a published round is not re-specified.** In audit mode `--n`, `--head`, `--require-*`
+  and friends are refused instead of ignored. An auditor who could restate the policy would
+  not be auditing the published selection, they would be proposing a different one.
+* **insufficient is an answer.** If the filters and caps fill fewer than `n` seats the
+  command reports `sufficient: false` and exits 0 — deciding what that *means* is
+  giti-msi.7's verdict engine, and silently lowering `n` is the failure mode ADR-0002 names
+  as the dangerous one.
+
+The `--explain` table is the audit trail ADR-0002 D3 specifies: the round id, the seed, the
+policy digest, and one row per roster entry with its score, the *first* D7 filter that
+failed it, and what the greedy pass decided (`take`, `skip:identity`, `skip:tier_cap`).
+`--json` puts the ADR's selection document at `.selection`, with everything needed to
+reproduce it — `inputs`, `seed`, roster epoch and digest — beside it, so two auditors'
+output differs in provenance and never in the answer.
 
 ## Deferred, with the reason
 

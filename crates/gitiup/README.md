@@ -190,6 +190,39 @@ The commands, the passphrase rules and the claim format are
 | 6 | refused: wrong passphrase, name taken, a claim that is unsigned or malformed |
 | 7 | a signature does not verify (a tampered claim, a broken endorsement) |
 
+## `gitiup select`
+
+Who verifies one change, and the proof of why they were chosen. One command, two jobs,
+told apart by whether the round already exists — the selector's and everybody else's.
+
+```console
+$ gitiup select --change chg-1 --job build/matrix/linux-x86_64 \
+      --head sha1:e255b091aabd7e443b5d2fbeb90bc9769d07cbeb \
+      --proposer ada --require-arch x86_64 --store ./store --explain --publish
+derived a new selection — change chg-1 · job build/matrix/linux-x86_64 · attempt 0
+  roster   epoch 29631 · 8 entries · 7 identities · sha256:…
+  policy   n=5 · agree 4 · reserves 2 · floor anonymous · 1 seat(s) per identity · caps …
+  seed     sha256:… — derived from the selector key SHA256:own… (ADR-0002 D2)
+  proposer: 2 family box(es) excluded (SHA256:ada…, SHA256:ada…)
+  seats    5 of 5 filled · 6 of 8 roster entries eligible
+  …
+```
+
+```console
+$ gitiup select --change chg-1 --store ./store --json | jq '.selected | length'
+5
+```
+
+The audit path needs no key: it reads the round record, the roster epoch it pinned and
+the published seed, and re-derives the same ordered list
+([ADR-0002](../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md) D3).
+`--explain` prints the audit table — every roster entry, its score, the first eligibility
+filter that failed it, and what the greedy pass decided — and `--json` puts the ADR's
+selection document at `.selection`. Opening a round is the other half: it requires
+`--proposer`, excludes that author's whole identity family before the seed is derived, and
+refuses the round afterwards if the check says the author got in anyway. See
+[docs/quorum.md](../../docs/quorum.md).
+
 ## What is deliberately *not* here yet
 
 storing or fetching attestations
@@ -212,6 +245,14 @@ line before any of the machinery around it is built.
   through stdin and `--json`, no terminal; exit `3` for a missing agent, `6` for a
   wrong passphrase or a duplicate name, `7` for a tampered claim; and nothing on disk
   but the age container.
+* `tests/select_cli.rs` — `gitiup select` as command lines: five seats filled under the
+  default policy, the author and their second box excluded and *seen* to be excluded, a
+  second harness with an empty keystore reproducing the published selection byte for byte
+  (from a store, and from two files with no store at all), a round that let an author in
+  refused on audit, one round per architecture, a change with two rounds refusing to guess
+  which, and a pool too small for five saying `Insufficient` instead of shrinking.
+* `tests/participant_cli.rs` — the roster round trip: register, approve, list, revoke, and
+  a published epoch that re-verifies from the store's own bytes.
 * `tests/doc_examples.rs` — the worked report in `docs/run-report.md`, parsed and
   digested: the documentation example is the pinned example.
 * `tests/cli_hygiene.rs` — the dependency list stays at three crates, no network or

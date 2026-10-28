@@ -224,13 +224,14 @@ impl Round {
         Selection::promote(roster, &self.inputs, self.seed.clone(), voided)
     }
 
-    /// Verify a round: structurally sound, signed by a trusted selector, and *the
-    /// selection it publishes is the one its own inputs derive*.
+    /// Re-check a published round against its own inputs, without deciding who to trust.
     ///
-    /// The last part is what makes the record evidence rather than an assertion: a
-    /// selector that published a hand-picked five gets exit 8 here, and so does one
-    /// whose roster quietly changed since.
-    pub fn verify(&self, selector_trust: &Trust, roster: &Roster) -> Result<RoundFacts> {
+    /// This is the half of [`Round::verify`] that needs no trust root: the record's
+    /// structure, the roster pin, and the rule that *the seats it publishes are the
+    /// seats its seed derives*. A stranger auditing a selection they were not invited to
+    /// has the round, the roster and the seed and nobody's signature, and this is the
+    /// check that makes their answer mean something.
+    pub fn verify_selection(&self, roster: &Roster) -> Result<Selection> {
         self.validate()?;
         let selection = self.selection(roster)?;
         if let Err(diff) = published_matches(&self.selected, &selection.selected) {
@@ -248,6 +249,17 @@ impl Round {
                 ),
             ));
         }
+        Ok(selection)
+    }
+
+    /// Verify a round: structurally sound, signed by a trusted selector, and *the
+    /// selection it publishes is the one its own inputs derive*.
+    ///
+    /// The last part is what makes the record evidence rather than an assertion: a
+    /// selector that published a hand-picked five gets exit 8 here, and so does one
+    /// whose roster quietly changed since.
+    pub fn verify(&self, selector_trust: &Trust, roster: &Roster) -> Result<RoundFacts> {
+        let selection = self.verify_selection(roster)?;
         let selectors = check_signatures(
             &self.signatures,
             ROUND_PAYLOAD_TYPE,

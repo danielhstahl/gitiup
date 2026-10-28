@@ -116,7 +116,10 @@ pub use roster::{
     EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
 };
 pub use round::{Round, RoundFacts};
-pub use select::{CandidateRow, Greedy, Reserve, RoundInputs, Seat, Selection, SelectionPolicy};
+pub use select::{
+    CandidateRow, Greedy, ProposerExclusion, Reserve, RoundInputs, Seat, Selection,
+    SelectionPolicy, proposer_family, proposer_family_exclusions,
+};
 pub use verdict::{
     CountedVote, DivergentResult, Evaluation, QuorumState, ReasonCode, Rejection, VerdictRecord,
 };
@@ -136,7 +139,7 @@ pub mod prelude {
         EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
     };
     pub use crate::round::Round;
-    pub use crate::select::{RoundInputs, Seat, Selection, SelectionPolicy};
+    pub use crate::select::{ProposerExclusion, RoundInputs, Seat, Selection, SelectionPolicy};
     pub use crate::verdict::{Evaluation, QuorumState, ReasonCode, VerdictRecord};
     pub use gitiup_attest::{SigningKey, TimeUs, Trust};
 }
