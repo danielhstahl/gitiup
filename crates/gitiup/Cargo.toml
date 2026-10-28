@@ -49,6 +49,11 @@ gitiup-host-github = { path = "../gitiup-host-github", optional = true }
 # `SignatureEntry` bytes. The CLI is where a passphrase and a key name get typed, so
 # it is the only crate that needs the keystore at all.
 gitiup-keys = { path = "../gitiup-keys" }
+# `gitiup participant`: the roster commands. Not a second opinion about who may verify —
+# `gitiup-quorum` owns the roster document, the epoch rule and the admission gate, and the
+# CLI only signs, publishes and prints what that crate decided. It writes to the same host
+# traits every other command uses, so a roster lives in the store and not next to it.
+gitiup-quorum = { path = "../gitiup-quorum" }
 serde_json = "1"
 
 [features]

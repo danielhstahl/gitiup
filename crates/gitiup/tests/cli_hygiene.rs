@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// What the binary may depend on directly.
 // `gitiup-run` is the planning and tier-choosing crate behind `gitiup run`; it is
 // itself kept network-free by its own `tests/no_side_effects.rs`.
-const ALLOWED_DEPENDENCIES: [&str; 8] = [
+const ALLOWED_DEPENDENCIES: [&str; 9] = [
     "gitiup-attest",
     "gitiup-normalise",
     "gitiup-run",
@@ -48,6 +48,12 @@ const ALLOWED_DEPENDENCIES: [&str; 8] = [
     // as a `gitiup_attest::Signer`, so the signature bytes come from the format crate
     // whoever holds the key.
     "gitiup-keys",
+    // `gitiup participant`. The roster is not a second digest implementation and not a
+    // second storage layer: `gitiup-quorum` builds records, checks them, and writes them
+    // through `gitiup-host`'s traits, which is the dependency the line above already
+    // licenses. What it adds is the roster document and the epoch rule, which the CLI must
+    // not re-implement in a place a verifier never looks.
+    "gitiup-quorum",
     "serde_json",
 ];
 

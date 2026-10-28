@@ -1220,6 +1220,7 @@ dependencies = [
  "gitiup-host-github",
  "gitiup-keys",
  "gitiup-normalise",
+ "gitiup-quorum",
  "gitiup-run",
  "gitiup-sandbox",
  "serde_json",

@@ -1,6 +1,8 @@
 # The quorum verification network
 
-Status: **the mechanism exists**; the CLIs around it are open tickets.
+Status: **the mechanism exists, and so do the roster commands** (`gitiup participant
+register|withdraw|list|verify-roster`, plus the owner's `approve` and `revoke`); the
+selection, job and verdict CLIs are open tickets.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -35,6 +37,7 @@ decision, and neither changes what a plain local run produces.
 | [`select`](../crates/gitiup-quorum/src/select.rs) | the selection proper: score ordering, the greedy pass over tier and identity caps, reserves, promotion, and `explain()`, the audit trail. |
 | [`round`](../crates/gitiup-quorum/src/round.rs) | the signed record that pins a round to a roster epoch and digest and publishes the seats and the seed. |
 | [`store`](../crates/gitiup-quorum/src/store.rs) | the ref names and CAS writes. The store is the broker: compare-and-swap does the locking, so there is no coordinator to bribe. |
+| [`gate`](../crates/gitiup-quorum/src/gate.rs) | admission at submission time: is *this key* approved, for *this epoch*, in *this round*, and is *this document* its own? Every refusal has its own code. |
 | [`participate`](../crates/gitiup-quorum/src/participate.rs) | the volunteer's fail-closed checklist (ADR-0002 D11). |
 | [`verdict`](../crates/gitiup-quorum/src/verdict.rs) | the tally: `verified` / `failed` / `insufficient`, every rejection with its reason, and the divergent results. |
 | [`ledger`](../crates/gitiup-quorum/src/ledger.rs) | the volunteer's memory of the highest epoch a store has offered — the rollback guard. |
@@ -77,22 +80,86 @@ different CPU, a slow mirror — does not sink a change; the dissent is recorded
 Silence is never reported as failure: "nobody turned up" is `insufficient`, and that is a
 different operational signal from "the machines disagree".
 
-Refusals keep the exit codes of `gitiup attest` where they correspond (3 signature, 4
-digest mismatch, 5 policy, 6 revoked, 7 store), so a script can branch on a quorum
-failure the same way it branches on a single-run failure.
+Refusals keep the exit codes of [ADR-0001 D7](adr/0001-attestation-encoding-hash-and-signature.md)
+that the format crate already uses — `6` refused (policy, an unparseable or untrusted
+record), `7` a signature that does not verify, `8` bytes that are not their own canonical
+form, `3` an unreachable store — so a script branches on the same number whether the
+refusal came from a quorum check or from `gitiup verify attestation`.
+
+## Registering, approving, and refusing
+
+Membership is four command lines and no protocol. A volunteer proves a key and describes
+a machine; the owner decides whether that is on the roster and what it is worth; the
+store refuses anything nobody approved.
+
+```sh
+# volunteer: claim what the box can actually do, signed by the key being registered
+gitiup participant register --ram-mb 32768 --disk-mb 262144 \
+    --sandbox docker --sandbox-level 2 --arch x86_64 --out signup.json
+
+# owner: carry it into a new epoch, vouch for it, publish
+gitiup participant approve --from signup.json --tier endorsed --store ./store --publish
+
+# anyone: read the epoch the owner signed, and what each entry qualifies for
+gitiup participant list --store ./store --require-arch x86_64 --require-ram-mb 16384
+gitiup participant verify-roster --store ./store
+
+# volunteer: leave from an epoch you name (default: the next one)
+gitiup participant withdraw --store ./store --publish
+
+# owner: a key is dead, and the reason says what that voids; the epoch bump that always
+# accompanies a revocation is the next `approve`
+gitiup participant revoke <key-id> --reason compromised --store ./store --publish
+```
+
+Four decisions live in this surface, and each is a refusal somewhere rather than a rule in
+prose:
+
+* **a sign-up claims capabilities, never a tier.** The entry's self-signature is a key
+  ownership proof, so it covers the key, the principal and the capability claim — and
+  deliberately *not* `tier`, which is the owner's statement about the box
+  ([D5](adr/0002-roster-verifier-selection-and-sybil-resistance.md)). A volunteer that
+  could grade itself would be a roster with no owner in it; an owner who retypes a
+  claimed figure breaks the proof and is refused.
+* **nothing is published unless the flag says so.** Every record command writes to
+  `--out <path|->`; only `--publish` touches a store. An epoch approved by accident is a
+  trust change.
+* **a roster is only a trust root after it is checked.** `list` and `verify-roster` run
+  `Roster::verify` first — canonical bytes, every ownership proof, a trusted owner
+  signature, not expired — against the owners named by `--owner`, and say in the output
+  where that trust came from.
+* **the store refuses unapproved submissions, with a code that says which kind of
+  "not approved".** [`gate::admit`](../crates/gitiup-quorum/src/gate.rs) runs before the
+  slot write, in a fixed order, and each refusal names itself: `unsigned`,
+  `many_signers`, `bad_signature`, `roster_expired`, `not_in_roster`, `expired`,
+  `revoked`, `not_selected`, `wrong_commit`, `wrong_round`. `not_in_roster` ("the owner
+  never said yes") and `expired` ("said yes for epochs that have passed") are different
+  advice to a volunteer, so they are different codes; and `bad_signature` is checked
+  before any lookup, so claiming an approved key id is a signature failure and not a
+  policy accident. `store::publish_attestation` is the entry point that does this, and the
+  same tokens reappear in a verdict's `rejected` list: a refusal at the door and a
+  rejection at the tally have to be one vocabulary.
 
 ## Where the documents live in the store
 
 ```
-refs/roster/current                     the roster epoch in force
-refs/roster/epoch/<n>                   every epoch ever published (the audit trail)
-refs/signup/<key_slot(slot)>            a volunteer's application, signed by its key
-refs/withdrawal/<key_slot(key_id)>      a volunteer leaving, signed by its key
-refs/revocation/<key_slot(key_id)>      the owner's revocation (or the key's own)
-refs/round/<change>/<job>/<attempt>     the round record
-refs/reveal/<change>/<job>/<slot>       one attestation per seat, claimed CAS
-refs/verdict/<change>/<job>             the owner's verdict
+refs/gitiup/roster                      the epoch in force
+refs/gitiup/roster/<epoch:08x>          every epoch ever published (the audit trail)
+refs/gitiup/signup/<slot>               a volunteer's application, signed by its key
+refs/gitiup/withdrawal/<slot>           a volunteer leaving, signed by its key
+refs/gitiup/revocation/<slot>           the owner's revocation (or the key's own)
+refs/gitiup/round/<change>/<job>/<attempt>  the round record
+refs/gitiup/reveal/<change>/<job>/<slot>    one attestation per seat, claimed CAS
+refs/gitiup/verdict/<change>/<job>      the owner's verdict
 ```
+
+`<slot>` is `hex(SHA256("gitiup-keyslot-1" ‖ 0x00 ‖ key_id))`, because a key id is
+`SHA256:<base64>`, which is hostile in a ref name; every human-facing listing prints the
+slot and the fingerprint side by side (`gitiup participant list --json` prints both). The
+blobs live in the host's content-addressed store under the namespace the ref names —
+`kv/roster/<hex>` on a bucket or a git host, `cas/roster/<hex>` in the reference `fs`
+host: one namespace per record class, one layout per host, see
+[host abstraction](host-abstraction.md).
 
 Every one of those is a CAS write, so a double submission is *refused* rather than
 counted twice, and a roster rewrite produces a different digest rather than a quiet
@@ -132,9 +199,10 @@ that already exists:
   is the input; `SelectionPolicy` is the knob.
 * **disagreement handling** ([giti-msi.8](../README.md)) — `divergent`, `rejected` and
   `missing` are the dispute report's body; an escalation is `attempt + 1`, a fresh seed.
-* **the CLIs** ([giti-msi.2](../README.md), [giti-msi.3](../README.md),
-  [giti-msi.5](../README.md)) — every command in ADR-0002's "storage" sketch is a
-  function in this crate already; `store` is the layer they will call.
+* **the rest of the CLIs** ([giti-msi.3](../README.md), [giti-msi.5](../README.md)) —
+  every command in ADR-0002's "storage" sketch is a function in this crate already, and
+  `store` is the layer they call; `gitiup participant` (giti-msi.2) is the first of them,
+  and is how that layer is driven today.
 * **quarantine and reputation decay** ([giti-msi.9](../README.md)) — the exclusions are
   inputs to selection, so quarantine is a policy that writes them.
 

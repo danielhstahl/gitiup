@@ -12,10 +12,8 @@
 //! name of the adapter that serves it, which is what makes the refusal possible in a
 //! build that cannot reach one.
 
-#[cfg(feature = "hosts-github")]
-use gitiup_host::Host;
 use gitiup_host::{
-    Config, CredentialProfile, HostError, HostErrorKind, RemoteConfig, RemoteScheme,
+    Config, CredentialProfile, FsHost, Host, HostError, HostErrorKind, RemoteConfig, RemoteScheme,
 };
 
 use crate::CliError;
@@ -192,6 +190,41 @@ pub fn classify(remote: &RemoteConfig) -> Result<Served, HostError> {
         implemented_by: format!("gitiup-host {}", env!("CARGO_PKG_VERSION")),
         summary: summary.to_string(),
     })
+}
+
+/// The host that serves a remote, opened for real.
+///
+/// The composition root's other half: [`classify`] says what *would* serve a remote
+/// without touching it, and this opens it. Every command that reads or writes a store
+/// goes through here, so no command gets to invent its own storage or reach a forge
+/// behind the host traits. `profile` is the credential profile named by the remote, if
+/// any — the caller resolves it from the config, because only the config knows whether
+/// a missing profile is an error.
+pub fn open(
+    remote: &RemoteConfig,
+    profile: Option<&CredentialProfile>,
+) -> Result<Box<dyn Host>, HostError> {
+    if wants_forge(remote) {
+        #[cfg(feature = "hosts-github")]
+        {
+            let transport = gitiup_host_github::curl::default_transport(remote)?;
+            return Ok(Box::new(gitiup_host_github::GitHubHost::with_transport(
+                remote, transport, profile,
+            )?));
+        }
+        #[cfg(not(feature = "hosts-github"))]
+        {
+            let _ = profile;
+            return Err(forge_without_adapter(remote));
+        }
+    }
+    match remote.scheme() {
+        RemoteScheme::File => Ok(Box::new(FsHost::open_or_create(remote.url.file_path())?)),
+        RemoteScheme::S3 => Ok(Box::new(gitiup_host::S3Host::open_or_init_remote(remote)?)),
+        RemoteScheme::Https | RemoteScheme::Http | RemoteScheme::Ssh => Ok(Box::new(
+            gitiup_host::hosts::git::GitHost::open_or_init_remote(remote)?,
+        )),
+    }
 }
 
 /// The report for one remote: what serves it, and what that host warns about.

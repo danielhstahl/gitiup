@@ -93,6 +93,7 @@
 pub mod capability;
 pub mod derive;
 pub mod error;
+pub mod gate;
 pub mod ledger;
 pub mod participate;
 pub mod record;
@@ -107,6 +108,7 @@ pub mod sample;
 pub use capability::{Capabilities, Exclusion, Requirements, RosterTier, exclusion_of};
 pub use derive::{ROUND_KIND, SelectionSecret};
 pub use error::{Error, Result};
+pub use gate::{admit, approval};
 pub use gitiup_attest::{Digest, GitOid};
 pub use ledger::RosterLedger;
 pub use participate::{Invitation, JobBrief, ServeOutcome, Served, check_invitation};

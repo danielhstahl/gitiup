@@ -197,18 +197,46 @@ const VALUED: &[&str] = &[
     "--annotate",
 ];
 
+/// The switches `gitiup key` and `gitiup identity` accept. `--json`/`-j` are accepted
+/// by the parser itself, because every sub-surface has them.
+const KEY_SWITCHES: &[&str] = &[
+    "--force",
+    "--public-line",
+    "--canonical",
+    "--check",
+    "--quiet",
+];
+
 /// A second pass over argv, in the same hand-rolled style as `digest`: a map of
 /// valued flags, a set of switches, and the positionals in order.
 #[derive(Debug, Default)]
-struct Args {
-    positional: Vec<String>,
-    values: BTreeMap<String, String>,
-    annotations: Vec<String>,
-    switches: BTreeSet<String>,
+pub(crate) struct Args {
+    pub(crate) positional: Vec<String>,
+    pub(crate) values: BTreeMap<String, String>,
+    /// Every valued flag in the order it appeared, including repeats.
+    ///
+    /// `values` keeps the last (which is what a single-valued flag means); this keeps
+    /// all of them, which is what a repeatable one means.
+    pub(crate) repeats: Vec<(String, String)>,
+    pub(crate) annotations: Vec<String>,
+    pub(crate) switches: BTreeSet<String>,
 }
 
 impl Args {
-    fn parse(args: &[String], valued: &[&str]) -> Result<Args, CliError> {
+    pub(crate) fn parse(args: &[String], valued: &[&str]) -> Result<Args, CliError> {
+        Self::parse_with(args, valued, KEY_SWITCHES)
+    }
+
+    /// The parser, with the vocabulary supplied by the caller.
+    ///
+    /// A flag is either valued or a switch, and the pair is what makes a typo an error
+    /// instead of a silently ignored word — so each sub-surface names its own switches,
+    /// rather than sharing one list that accepts everything every command understands.
+    pub(crate) fn parse_with(
+        args: &[String],
+        valued: &[&str],
+        switches: &[&str],
+    ) -> Result<Args, CliError> {
         let mut out = Args::default();
         let mut index = 0usize;
         while index < args.len() {
@@ -230,17 +258,18 @@ impl Args {
                     }
                 };
                 if name == "--annotate" {
-                    out.annotations.push(value);
+                    out.annotations.push(value.clone());
                 } else {
-                    out.values.insert(name, value);
+                    out.values.insert(name.clone(), value.clone());
                 }
+                out.repeats.push((name, value));
+                continue;
+            }
+            if switches.contains(&name.as_str()) || name == "--json" || name == "-j" {
+                out.switches.insert(name);
                 continue;
             }
             match name.as_str() {
-                "--json" | "-j" | "--force" | "--public-line" | "--canonical" | "--check"
-                | "--quiet" => {
-                    out.switches.insert(name);
-                }
                 "-h" | "--help" => {
                     out.switches.insert(name);
                 }
@@ -253,37 +282,48 @@ impl Args {
         Ok(out)
     }
 
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
     }
 
-    fn on(&self, name: &str) -> bool {
+    /// Every value given for a repeatable flag, in order, de-duplicated.
+    pub(crate) fn all(&self, name: &str) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for (key, value) in &self.repeats {
+            if key == name && !seen.contains(value) {
+                seen.push(value.clone());
+            }
+        }
+        seen
+    }
+
+    pub(crate) fn on(&self, name: &str) -> bool {
         self.switches.contains(name)
     }
 
     /// `--help`, `-h` anywhere: print the help the caller passes and stop.
-    fn wants_help(&self) -> bool {
+    pub(crate) fn wants_help(&self) -> bool {
         self.on("--help") || self.on("-h")
     }
 
     /// Print `help` and return true when `--help` was given, so each command reads
     /// as `if help(args, KEY_HELP) { return Ok(()); }`.
-    fn help(&self, text: &str) -> Option<()> {
+    pub(crate) fn help(&self, text: &str) -> Option<()> {
         self.wants_help().then(|| {
             print!("{text}");
         })
     }
 
-    fn json(&self) -> bool {
+    pub(crate) fn json(&self) -> bool {
         self.on("--json") || self.on("-j")
     }
 
-    fn force(&self) -> bool {
+    pub(crate) fn force(&self) -> bool {
         self.on("--force")
     }
 
     /// The first positional, or a usage error naming the command.
-    fn need(&self, what: &str) -> Result<&str, CliError> {
+    pub(crate) fn need(&self, what: &str) -> Result<&str, CliError> {
         self.positional
             .first()
             .map(String::as_str)
@@ -292,7 +332,7 @@ impl Args {
 }
 
 /// Where the keystore and the identity claims live for this run.
-fn paths() -> Result<Paths, CliError> {
+pub(crate) fn paths() -> Result<Paths, CliError> {
     Ok(Paths::from_env()?)
 }
 
@@ -301,7 +341,7 @@ fn paths() -> Result<Paths, CliError> {
 /// Note the order, and that a *prompt* is the last resort: a file or a pipe is the
 /// documented scripted route precisely because a passphrase on the command line is
 /// visible in `ps` to every user on the machine.
-fn passphrase_source(args: &Args) -> PassphraseSource {
+pub(crate) fn passphrase_source(args: &Args) -> PassphraseSource {
     if let Some(text) = args.get("--passphrase") {
         return PassphraseSource::given(text);
     }
@@ -331,7 +371,7 @@ fn annotations(args: &Args) -> Result<BTreeMap<String, String>, CliError> {
 /// first `identity publish` — a keystore holding exactly one key is unambiguous, so
 /// it is used. With two keys it is a refusal, not a guess: choosing the wrong key to
 /// publish a claim with is the mistake this whole area exists to make impossible.
-fn signing_key(
+pub(crate) fn signing_key(
     args: &Args,
     keystore: &Keystore,
     config: &Config,
@@ -360,7 +400,7 @@ fn signing_key(
     }
 }
 
-fn print_json(value: Value) {
+pub(crate) fn print_json(value: Value) {
     // One line, keys sorted: `gitiup key list --json | jq` is the script's view, and
     // serde_json's default map ordering is already sorted for `Map`.
     println!("{}", serde_json::to_string(&value).unwrap_or_default());

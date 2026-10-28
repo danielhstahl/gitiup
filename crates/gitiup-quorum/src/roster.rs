@@ -122,12 +122,21 @@ pub struct RosterEntry {
 }
 
 impl RosterEntry {
-    /// The bytes the entry's self-signature covers: canonical, without
-    /// `self_signature`.
+    /// The bytes the entry's self-signature covers: canonical, without `self_signature`
+    /// and without `tier`.
+    ///
+    /// The tier is outside the signature because it is the owner's statement about the
+    /// box, not the key's statement about itself ([ADR-0002 D5](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)):
+    /// a proof that covered it would either make a volunteer grade its own trust or force
+    /// a second signing round for a field that cannot change what the proof attests. What
+    /// the proof attests is *this key, this principal, these claimed capabilities* — and
+    /// the tier becomes a vouch only under the owner's signature on the whole epoch, which
+    /// [`Roster::verify`] insists on. A store that rewrote a tier would be editing a
+    /// document it cannot re-sign.
     pub fn body_bytes(&self) -> Result<Vec<u8>> {
         let mut unsigned = self.clone();
         unsigned.self_signature = None;
-        body_bytes(&unsigned)
+        crate::record::body_bytes_without(&unsigned, &["self_signature", "tier"])
     }
 
     /// Attach a key-ownership proof, made by `key`.
@@ -443,6 +452,84 @@ impl Roster {
         self.entries.iter().find(|e| e.key_id == key_id)
     }
 
+    /// Edit an entry in place — the owner's capability re-declaration (D8's rotation
+    /// table: "capacity/claim change → re-submit the entry; new epoch").
+    ///
+    /// Deliberately narrow: this edits a claim the owner is already making, it cannot
+    /// add or remove an entry (that is [`Roster::next_epoch_from`], which bumps the
+    /// epoch), and the caller owes [`Roster::validate`] afterwards, exactly as the
+    /// owner owes a signature.
+    pub fn entry_mut(&mut self, key_id: &str) -> Option<&mut RosterEntry> {
+        self.entries.iter_mut().find(|e| e.key_id == key_id)
+    }
+
+    /// The owner's next epoch: this one's entries, plus `additions`, minus `removals`,
+    /// with the epoch rule and the hash chain applied
+    /// ([ADR-0002 D8](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+    ///
+    /// This is what "the owner approves the sign-up" means mechanically: there is no
+    /// protocol and no mutable list, there is a new signed document whose predecessor is
+    /// named by digest. Additions *replace* an entry with the same key id rather than
+    /// sitting beside it (a re-submitted capability claim is an update).
+    ///
+    /// Nothing here edits a field a key signed. The ownership proof covers the whole
+    /// entry — capabilities, identity and its claimed epoch window — so an owner who
+    /// retyped one byte would be publishing a roster whose entry does not verify, which
+    /// is exactly the corruption this command must make impossible. The owner's leverage
+    /// is the thing that matters: *whether* to carry an entry into the epoch, and at
+    /// which tier. A window an owner dislikes is a reason to decline the sign-up, not to
+    /// edit it.
+    ///
+    /// The result is unsigned: the owner signs it ([`Roster::sign`]) when the human has
+    /// actually looked at it, which is the step this whole design exists to make
+    /// deliberate.
+    pub fn next_epoch_from(
+        prev: &Roster,
+        now_us: i64,
+        additions: impl IntoIterator<Item = RosterEntry>,
+        removals: &std::collections::BTreeSet<String>,
+    ) -> Result<Roster> {
+        let epoch = Roster::next_epoch(prev.epoch, now_us, prev.epoch_interval_us)?;
+        let mut added: std::collections::BTreeMap<String, RosterEntry> = Default::default();
+        for entry in additions {
+            entry.verify_key()?;
+            if !entry.has_ownership_proof() {
+                return Err(Error::policy(
+                    "roster",
+                    format!(
+                        "{} arrives without a key-ownership proof, so it is a claim about a \
+                         key and cannot be carried into an epoch",
+                        entry.key_id
+                    ),
+                ));
+            }
+            if added.insert(entry.key_id.clone(), entry).is_some() {
+                return Err(Error::invalid(
+                    "roster",
+                    "two additions name the same key id: one entry per key per epoch",
+                ));
+            }
+        }
+        let mut entries: Vec<RosterEntry> = prev
+            .entries
+            .iter()
+            .filter(|e| !removals.contains(&e.key_id) && !added.contains_key(&e.key_id))
+            .cloned()
+            .collect();
+        entries.extend(added.into_values());
+        // `Roster::new` sorts, validates and rejects a duplicate key id, which is all
+        // this has to guarantee: an addition arrives self-signed by the key it names, and
+        // an entry kept from `prev` carries the ownership proof it already had — an
+        // owner may not edit a signed entry, only decline to carry it into the next epoch.
+        Roster::new(
+            epoch,
+            prev.digest()?,
+            now_us,
+            prev.epoch_interval_us,
+            entries,
+        )
+    }
+
     /// Entries belonging to one principal.
     pub fn family(&self, identity: &str) -> Vec<&RosterEntry> {
         self.entries
@@ -720,6 +807,40 @@ impl RevocationReason {
             RevocationReason::Removed => "removed",
             RevocationReason::Superseded => "superseded",
         }
+    }
+
+    /// Every reason, for `--help` and for parsing.
+    pub const ALL: [RevocationReason; 4] = [
+        RevocationReason::Retired,
+        RevocationReason::Compromised,
+        RevocationReason::Removed,
+        RevocationReason::Superseded,
+    ];
+
+    /// Parse a reason name (tolerant of case and padding, because these are typed by
+    /// a human in an incident), naming the vocabulary when wrong — a mistyped
+    /// `compromised` must not silently become `retired`, because the two disagree about
+    /// whether old attestations stand.
+    pub fn parse(text: &str) -> Result<RevocationReason> {
+        let trimmed = text.trim().to_ascii_lowercase();
+        RevocationReason::ALL
+            .iter()
+            .find(|r| r.as_str() == trimmed)
+            .copied()
+            .ok_or_else(|| {
+                Error::invalid(
+                    "revocation reason",
+                    format!("'{text}' is not a revocation reason"),
+                )
+                .with_hint(format!(
+                    "reasons are {}",
+                    RevocationReason::ALL
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
     }
 }
 

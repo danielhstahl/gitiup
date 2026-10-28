@@ -17,6 +17,7 @@
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
+//! gitiup participant …                  volunteering to verify: register, withdraw, list
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -42,6 +43,7 @@ mod doctor;
 mod env;
 mod keys;
 mod normalise;
+mod participant;
 mod remotes;
 mod run;
 
@@ -63,6 +65,8 @@ COMMANDS:
                                    list, show, delete, probe)
     identity [COMMAND] [OPTIONS]   who this machine signs as (publish, list, show,
                                    verify, endorse, use, whoami, import)
+    participant [COMMAND] [OPTS]   the quorum roster: register, withdraw, list,
+                                   verify-roster, approve, revoke
     help                        print this text
     version                     print the version of this build
 
@@ -80,6 +84,11 @@ not verify — a claim whose self-signature is broken is a different event from 
 claim you merely cannot parse. `gitiup key help` and `gitiup identity help` list
 their flags; both are scriptable end to end, with `--passphrase-file -` for a
 passphrase and `--json` on anything a script reads.
+
+`participant` is the roster side of the optional quorum network (docs/quorum.md):
+`register` publishes what your machine can honestly do, `withdraw` leaves at an epoch you
+name, `list` and `verify-roster` read the epoch the owner signed, and `approve` and
+`revoke` are the owner's acts. Same exit table, same passphrase rules as `key`.
 
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
@@ -182,6 +191,20 @@ impl From<gitiup_attest::Error> for CliError {
     }
 }
 
+/// The same rule for the quorum: a roster refused by the library is refused with the
+/// library's code (6 refused, 7 bad signature, 8 bytes that are not their canonical
+/// form, 3 an unreachable store), so `gitiup participant verify-roster` and a merge gate
+/// calling `Roster::verify` cannot disagree about the same document.
+impl From<gitiup_quorum::Error> for CliError {
+    fn from(error: gitiup_quorum::Error) -> CliError {
+        CliError {
+            code: error.exit_code(),
+            message: error.message(),
+            hint: error.hint().map(str::to_string),
+        }
+    }
+}
+
 fn dispatch(args: &[String]) -> Result<(), CliError> {
     let Some(command) = args.first().map(String::as_str) else {
         print!("{USAGE}");
@@ -203,6 +226,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "normalise" => normalise::run(&args[1..]),
         "key" => keys::key(&args[1..]),
         "identity" => keys::identity(&args[1..]),
+        "participant" => participant::participant(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }

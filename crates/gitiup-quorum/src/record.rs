@@ -45,11 +45,23 @@ pub const VERDICT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.verdict+json";
 /// This is the *body*: what a signature covers and, for a roster, what the digest
 /// that a round pins is taken over.
 pub fn body_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    body_bytes_without(value, &["signatures", "self_signature"])
+}
+
+/// The canonical bytes of `value` with `fields` removed, one canonical encoding.
+///
+/// Separate because "what a signature covers" is the definition of the signature, and
+/// two records in this crate remove different fields: a document drops its own signature
+/// list, a roster entry also drops the owner's tier (see
+/// [`RosterEntry::body_bytes`](crate::roster::RosterEntry::body_bytes)). Writing that as
+/// a parameter keeps one canonicaliser instead of two.
+pub fn body_bytes_without<T: serde::Serialize>(value: &T, fields: &[&str]) -> Result<Vec<u8>> {
     let mut body = serde_json::to_value(value)
         .map_err(|e| Error::invalid("record", format!("cannot serialise: {e}")))?;
     if let Some(map) = body.as_object_mut() {
-        map.remove("signatures");
-        map.remove("self_signature");
+        for field in fields {
+            map.remove(*field);
+        }
     }
     Ok(canon::to_value_bytes(&body)?)
 }

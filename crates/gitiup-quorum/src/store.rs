@@ -264,6 +264,27 @@ pub fn publish_withdrawal(host: &dyn Host, withdrawal: &Withdrawal) -> Result<Oi
     )
 }
 
+/// Every withdrawal the store holds, for the owner composing the next epoch.
+///
+/// Each one is re-verified on the way in: a withdrawal is a *claim by a key*, and an
+/// owner who applied an unsigned one would be removing participants at the store's
+/// say-so rather than the key's.
+pub fn list_withdrawals(host: &dyn Host) -> Result<Vec<Withdrawal>> {
+    let mut out = Vec::new();
+    for entry in host
+        .list(&ns::WITHDRAWAL)
+        .map_err(|e| Error::store("list withdrawals", &e))?
+    {
+        if let Some(bytes) = host
+            .get(&entry.oid)
+            .map_err(|e| Error::store("get withdrawal", &e))?
+        {
+            out.push(Withdrawal::from_canonical_bytes(&bytes)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Publish a revocation. One ref per key: a later revocation moves it with
 /// `Expect::Is`, so a key's history is a chain and not a pile.
 pub fn publish_revocation(host: &dyn Host, revocation: &Revocation) -> Result<Oid> {
@@ -329,6 +350,11 @@ pub fn round_at(host: &dyn Host, change: &str, job: &str, attempt: u64) -> Resul
 /// implement in application code: one submission per key per round, guaranteed by the
 /// store, un-raceable, and it is exactly the slot D10 reserves for commit-reveal — so
 /// giti-msi.6 splits this ref into a commitment and a reveal without moving anything.
+///
+/// The seat is not transferable. The document must be signed by exactly the key that
+/// holds it, which is checked here rather than assumed: a store that let key A publish
+/// key B's signature into A's slot would be a vote-laundering service, and the roster
+/// check downstream could never see the difference.
 pub fn publish_submission(
     host: &dyn Host,
     round: &Round,
@@ -344,6 +370,29 @@ pub fn publish_submission(
             ),
         )
     })?;
+    match attestation.signatures.len() {
+        1 if attestation.signatures[0].key_id == key_id => {}
+        1 => {
+            return Err(Error::signature(
+                "store",
+                format!(
+                    "this attestation is signed by {}, not by the seat key {} it is being \
+                     published for; a slot holds its owner's own claim and nothing else",
+                    short_key(&attestation.signatures[0].key_id),
+                    short_key(key_id)
+                ),
+            ));
+        }
+        n => {
+            return Err(Error::policy(
+                "store",
+                format!(
+                    "a submission slot holds exactly one verifier's signature; this document \
+                     carries {n}",
+                ),
+            ));
+        }
+    }
     let bytes = attestation.canonical_bytes()?;
     let oid = host
         .put_cas(&ns::ATTESTATION, &bytes)
@@ -358,6 +407,37 @@ pub fn publish_submission(
             ))
         })?;
     Ok(oid)
+}
+
+/// The roster-aware submission: refuse first, write second.
+///
+/// This is the entry point a store frontend calls, and the difference from
+/// [`publish_submission`] is everything the slot write cannot see on its own — that the
+/// signing key is in the approved roster for the epoch the round pinned, that its
+/// approval has not lapsed, that a revocation has not voided it, and that the document
+/// is this round's work and not a replay. Each refusal is [`crate::gate::admit`]'s, with its own
+/// code, so a volunteer gets an answer it can act on instead of a rejected write.
+///
+/// `roster` must be the epoch the round pins (a round is only auditable against the
+/// roster it selected from), and it is assumed to have been signature-checked by the
+/// caller — [`Roster::verify`] at fetch time, which is where a trust root belongs.
+pub fn publish_attestation(
+    host: &dyn Host,
+    round: &Round,
+    roster: &Roster,
+    attestation: &AttestationDoc,
+    revocations: &[crate::roster::Revocation],
+    now: gitiup_attest::TimeUs,
+) -> Result<Oid> {
+    let key_id =
+        crate::gate::admit(roster, round, attestation, revocations, now).map_err(|refusal| {
+            Error::policy("store", format!("{}: {}", refusal.code, refusal.detail)).with_hint(
+                "the roster is the owner's approval; `gitiup participant list` shows \
+                        who is on it and `gitiup participant verify-roster` says why an entry \
+                        is not eligible",
+            )
+        })?;
+    publish_submission(host, round, &key_id, attestation)
 }
 
 /// Collect what the selected verifiers published, in seat order.

@@ -118,6 +118,18 @@ impl Error {
         }
     }
 
+    /// `context: detail`, with no hint appended.
+    ///
+    /// `Display` renders the hint inline because a library user printing one line wants
+    /// the whole answer; a CLI prints the message and the hint on separate lines, and
+    /// needs the two parts to stay apart.
+    pub fn message(&self) -> String {
+        match self {
+            Error::Attest(e) => format!("{}: {}", e.context(), e.detail()),
+            Error::Store(s) => format!("{}: {}: {}", s.context, s.kind, s.detail),
+        }
+    }
+
     /// The process exit code (`3` I/O, `6` refused, `7` bad signature, `8` digest
     /// mismatch).
     pub fn exit_code(&self) -> u8 {
