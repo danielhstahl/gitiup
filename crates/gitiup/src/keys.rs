@@ -1121,13 +1121,13 @@ fn short(key_id: &str) -> String {
 // through, so a script sees the same number here as from the library.
 impl From<gitiup_keys::Error> for CliError {
     fn from(error: gitiup_keys::Error) -> CliError {
-        CliError {
-            code: error.exit_code(),
-            // `detail()` already carries the context prefix; adding it again would
-            // print `keystore: keystore: …`.
-            message: error.detail(),
-            hint: error.hint().map(str::to_string),
-        }
+        // `detail()` already carries the context prefix; adding it again would
+        // print `keystore: keystore: …`.
+        CliError::scored(
+            error.exit_code(),
+            error.detail(),
+            error.hint().map(str::to_string),
+        )
     }
 }
 

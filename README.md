@@ -16,12 +16,12 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
-| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc` files a signed attestation in a host store and reads it back, `gitiup select` shows (or opens) the quorum for one change — the only crate that reads files, so the format crate can stay I/O-free |
+| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc` files a signed attestation in a host store and reads it back, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), `gitiup.toml` remote config, and where attestations live — `kv/attestation/<digest>` advertised by `refs/attestations/<subject>/<digest>`, with the retention policy (`max age`, `max per commit`) and the rule above it: an object another live ref still points at is never pruned |
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
 | `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, forgetting one object, `cas = false`), run against the `fs`, plain-git, bucket and forge hosts — in CI, against real backends |
-| `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures and freshness policy — the bytes ADR-0001 decides, and nothing else |
+| `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures, freshness policy and the verification verdict (ladder, reasons, exit codes) — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-keys` | signing keys and identities: an age-encrypted keystore, ssh-agent and gpg-agent backends, and the signed identity claim that says "this key is mine" — every one of them a `gitiup_attest::Signer`, so a key's origin never changes the signature it produces |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
@@ -52,6 +52,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   tickets. Implementation: [`gitiup-quorum`](crates/gitiup-quorum/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
+* [Verification](docs/verification.md) — what `gitiup verify attestation` checks and in
+  which order, the exit codes a hook branches on (`0` accepted, `6` policy, `7` bad
+  signature, `8` digest mismatch), the machine-readable verdict a merge gate reads, and
+  what verification deliberately refuses to do.
 * [Signing keys and identities](docs/signing-keys.md) — where a private key lives
   (`gitiup key gen`, an age + scrypt container), how an existing ssh or gpg key is
   imported without ever being copied, what an identity claim signs and why, and which
@@ -106,6 +110,7 @@ cargo run -p gitiup -- run                  # the same in your own repo (.github
 cargo run -p gitiup -- run --help           # the tiers, and what it takes to earn each
 cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
 cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
+cargo run -p gitiup -- verify attestation --help   # the ladder, and what each exit code means
 cargo run -p gitiup -- key gen --comment ada@laptop          # a new signing key, age-encrypted
 cargo run -p gitiup -- identity publish ada --email ada@example.com --passphrase-file -
 cargo run -p gitiup -- identity whoami --check              # "can this machine still sign?"

@@ -17,6 +17,8 @@
 //! gitiup attest push|list|show|gc        file signed attestations in a host, read them
 //!                                      back, and retire the ones a retention policy
 //!                                      says are old
+//! gitiup verify attestation [DOC]       may this attestation be acted on? one exit
+//!                                      code (0/6/7/8) and a report of every check
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
@@ -28,17 +30,18 @@
 //!
 //! # Exit codes
 //!
-//! The digest command keeps [ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)'s
+//! The digest and verify commands keep [ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)'s
 //! taxonomy, because a merge gate branches on these numbers and must get the same
 //! verdict from the library and from here:
 //!
 //! | exit | meaning |
 //!|------|---------|
-//!| 0 | digest computed (and it is the one we were told to expect) |
+//!| 0 | digest computed (and it is the one we were told to expect); attestation accepted |
 //!| 2 | usage: unknown flag, missing argument |
 //!| 3 | I/O: the report could not be read |
-//!| 6 | the report is not a valid run report, or this build cannot read it |
-//!| 8 | digest mismatch: `--expect` did not match, i.e. a rerun disagreed |
+//!| 6 | refused: not a valid run report or attestation, disallowed tier, wrong machine, untrusted signer, too few signatures, stale |
+//!| 7 | a signature that does not verify |
+//!| 8 | digest mismatch: `--expect` did not match, or an attestation that is not the bytes it claims |
 
 use std::process::ExitCode;
 
@@ -52,6 +55,7 @@ mod participant;
 mod remotes;
 mod run;
 mod select;
+mod verify;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -67,6 +71,10 @@ COMMANDS:
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc
+    verify attestation [DOC|-] [OPTIONS]
+                                   is this attestation good enough to act on?
+                                   (0 accepted · 6 refused · 7 bad signature ·
+                                    8 digest mismatch)
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     key [COMMAND] [OPTIONS]        the signing keys this machine can use (gen, import,
                                    list, show, delete, probe)
@@ -86,7 +94,8 @@ REPORT is a run-report JSON file (see docs/run-report.md), or `-` for stdin.
 Exit codes for `run`, `digest`, `env` and `normalise`: 0 ok · 2 usage · 3 I/O ·
 6 refused (bad run report, disallowed tier, no sandbox, wrong machine class) ·
 8 digest mismatch or divergence (ADR-0001 D7: 6 refused/unsupported, 8 digest
-mismatch — the same codes `gitiup verify attestation` will use).
+mismatch — the codes `gitiup verify attestation` uses too, plus 7 for a signature
+that does not verify).
 
 `key` and `identity` keep the same table and add one code: 7, a signature that does
 not verify — a claim whose self-signature is broken is a different event from a
@@ -114,6 +123,19 @@ fs, a bare repo, a bucket — and refuse anything that does not re-hash to its o
 never touches an attestation another ref still points at, which is what keeps a quorum's
 seat submissions and a merge's recorded proof safe. Without --apply it only prints the plan.
 
+`verify attestation` is the question the whole format exists to answer: may this proof be
+acted on? It checks the canonical bytes re-hash to the digest they claim, that every
+signature verifies and belongs to a key the policy trusts, that enough of them did, that
+the provenance tier and sandbox are allowed, that the run happened on a machine the change
+accepts, and that the claim is fresh — in the fixed order ADR-0001 D7 sets, so the first
+thing wrong is what the exit code says (0 accepted · 6 refused · 7 bad signature · 8 digest
+mismatch). Every failure found is reported, not just the first, and `--json` prints the
+verdict, each check's outcome and the reasons as data, which is what makes it the line a
+merge gate or a `pre-receive` hook runs: `gitiup verify attestation proof.json --policy
+gitiup-policy.json --json`. A verdict is not an error: it is printed on stdout and carried
+in the exit code, so a hook reads one thing. `gitiup verify attestation help` lists the
+flags for tiers, trust, freshness, the environment requirement and the clock.
+
 `run` never runs anything unless you say `--execute`, and what it plans attests as
 `simulated` — a plan, not evidence. Policies say which tiers they accept; the
 default accepts `local` only. There is no way to ask for `quorum`: a single run
@@ -132,6 +154,8 @@ Try:
     gitiup attest list --commit $(git rev-parse HEAD) --store ./store
     gitiup attest show --digest <hex> --store ./store --json
     gitiup attest gc --store ./store --max-age 90d --max-per-commit 5   # the plan
+    gitiup verify attestation proof.json --policy gitiup-policy.json     # the verdict
+    gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
     gitiup normalise run.json                  # what was rewritten, and why
     gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
     gitiup participant list --store ./store --json
@@ -148,9 +172,11 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("gitiup: {}", error.message);
-            if let Some(hint) = error.hint {
-                eprintln!("hint: {hint}");
+            if !error.quiet {
+                eprintln!("gitiup: {}", error.message);
+                if let Some(hint) = error.hint {
+                    eprintln!("hint: {hint}");
+                }
             }
             ExitCode::from(error.code)
         }
@@ -164,6 +190,10 @@ pub(crate) struct CliError {
     code: u8,
     message: String,
     hint: Option<String>,
+    /// True when the command already said everything it has to say on stdout — a
+    /// *verdict*, which is a result and not a fault. `main` still exits with the
+    /// code and stays off stderr.
+    quiet: bool,
 }
 
 impl CliError {
@@ -172,6 +202,7 @@ impl CliError {
             code: 2,
             message: message.into(),
             hint: Some("run `gitiup help` for the whole surface".into()),
+            quiet: false,
         }
     }
 
@@ -180,6 +211,7 @@ impl CliError {
             code: 3,
             message: message.into(),
             hint: None,
+            quiet: false,
         }
     }
 
@@ -191,6 +223,7 @@ impl CliError {
             code: 6,
             message: message.into(),
             hint: Some(hint.into()),
+            quiet: false,
         }
     }
 
@@ -204,6 +237,31 @@ impl CliError {
             code: kind.exit_code(),
             message: message.into(),
             hint: hint.map(str::to_string),
+            quiet: false,
+        }
+    }
+
+    /// An error that arrived already carrying its own exit code, from a library
+    /// whose taxonomy is this same table (`gitiup-keys`, `gitiup-quorum`).
+    pub(crate) fn scored(code: u8, message: impl Into<String>, hint: Option<String>) -> CliError {
+        CliError {
+            code,
+            message: message.into(),
+            hint,
+            quiet: false,
+        }
+    }
+
+    /// A verdict that has already been printed as a report: the exit code *is* the
+    /// verdict (0 accepted · 6 refused · 7 bad signature · 8 digest mismatch), and
+    /// repeating it on stderr would only give a hook two places to read the same
+    /// decision — and one of them is a log line nobody parses.
+    fn verdict(code: u8) -> CliError {
+        CliError {
+            code,
+            message: String::new(),
+            hint: None,
+            quiet: true,
         }
     }
 }
@@ -219,6 +277,7 @@ impl From<gitiup_attest::Error> for CliError {
             code: error.exit_code(),
             message: format!("{}: {}", error.context(), error.detail()),
             hint: error.hint().map(str::to_string),
+            quiet: false,
         }
     }
 }
@@ -233,6 +292,7 @@ impl From<gitiup_quorum::Error> for CliError {
             code: error.exit_code(),
             message: error.message(),
             hint: error.hint().map(str::to_string),
+            quiet: false,
         }
     }
 }
@@ -255,6 +315,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "doctor" => doctor::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
         "attest" => attest::attest(&args[1..]),
+        "verify" => verify::verify(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),
         "key" => keys::key(&args[1..]),
@@ -272,7 +333,7 @@ mod tests {
     #[test]
     fn the_usage_text_documents_the_exit_codes_it_uses() {
         // The table in this module's docs and the text users see must not drift.
-        for code in ["0", "2", "3", "6", "8"] {
+        for code in ["0", "2", "3", "6", "7", "8"] {
             assert!(
                 USAGE.contains(code),
                 "exit code {code} is missing from the usage text"
@@ -282,6 +343,10 @@ mod tests {
         assert!(
             USAGE.contains("run [OPTIONS] [JOB]"),
             "the ticket's own command must be in the usage text"
+        );
+        assert!(
+            USAGE.contains("verify attestation"),
+            "the verdict command must be in the usage text"
         );
     }
 

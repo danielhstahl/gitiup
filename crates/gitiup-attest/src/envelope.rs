@@ -31,6 +31,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::key::{SignatureEntry, Signer};
 use crate::manifest::{ResultDigest, RunManifest};
 use crate::policy::{Freshness, Policy, check_freshness};
+use crate::report::VerdictReport;
 
 /// The DSSE payload type of a run manifest.
 pub const PAYLOAD_TYPE: &str = "application/vnd.gitiup.run-manifest+json";
@@ -267,53 +268,126 @@ impl AttestationDoc {
     /// The order is deliberate — cheap integrity checks first, then integrity of
     /// the signer claim, then policy — so the exit code a caller sees describes
     /// the first thing that is actually wrong ([`crate::error::ErrorKind::exit_code`]).
+    ///
+    /// This is [`Self::verify_report`] with the tail dropped — one set of checks,
+    /// one order, two entry points — so the error returned here is always the
+    /// *first* reason that report lists. A hook that branches on `verify` and a
+    /// command that prints `verify_report` cannot tell different stories about the
+    /// same bytes, which is the property a merge gate is built on.
     pub fn verify(&self, policy: &Policy) -> Result<Verdict> {
-        self.validate()?;
+        let report = self.verify_report(policy);
+        if let Some(verdict) = report.verdict {
+            return Ok(verdict);
+        }
+        // Unreachable in practice: a report with no verdict always has a reason.
+        // The fallback keeps the type honest rather than unwrapping in trust.
+        Err(report.error().unwrap_or_else(|| {
+            Error::new(
+                ErrorKind::Policy,
+                "attestation",
+                "verification refused this document",
+            )
+        }))
+    }
 
-        let payload = self.payload_bytes()?;
+    /// Every check in the order [ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)
+    /// fixes, with every reason found rather than only the first one.
+    ///
+    /// This is what *printing* a verdict needs: a log that says "refused" is a log
+    /// nobody can act on, and an operator who is shown one complaint fixes one
+    /// thing and re-runs. The exit code still comes from the first reason, so
+    /// collecting the rest changes nobody's verdict.
+    pub fn verify_report(&self, policy: &Policy) -> VerdictReport {
+        let mut report = VerdictReport::new();
+
+        // Structure first: if this is not a document this build speaks, nothing it
+        // goes on to say is worth printing.
+        if let Err(error) = self.validate() {
+            report.stop("structure", error);
+            return report;
+        }
+        report.pass("structure");
+
+        // Then integrity of the bytes, before anything reads them.
+        let payload = match self.payload_bytes() {
+            Ok(payload) => payload,
+            Err(error) => {
+                report.stop("digest", error);
+                return report;
+            }
+        };
         let run_digest = Digest::sha256(&payload);
-        policy.check_digest(&run_digest)?;
-        let claimed = self.manifest.digest()?;
+        if let Err(error) = policy.check_digest(&run_digest) {
+            report.stop("digest", error);
+            return report;
+        }
+        let claimed = match self.manifest.digest() {
+            Ok(digest) => digest,
+            Err(error) => {
+                report.stop("digest", error);
+                return report;
+            }
+        };
         if claimed != run_digest {
             // Only reachable if a manifest were mutated in memory after building;
             // a re-encode of parsed bytes is checked in `from_canonical_bytes`.
-            return Err(Error::new(
-                ErrorKind::DigestMismatch,
-                "attestation",
-                "the manifest does not hash to its own claimed content",
-            ));
-        }
-        let result_digest = self.manifest.result_digest()?;
-
-        // Expected bindings first: a wrong-commit attestation must not be able to
-        // fail on freshness instead and be reported as "expired".
-        if let Some(commit) = &policy.expected_commit
-            && commit != &self.manifest.result.source.commit
-        {
-            return Err(Error::new(
-                ErrorKind::DigestMismatch,
-                "attestation",
-                format!(
-                    "attestation is bound to {}, not the expected {}",
-                    self.manifest.result.source.commit, commit
+            report.stop(
+                "digest",
+                Error::new(
+                    ErrorKind::DigestMismatch,
+                    "attestation",
+                    "the manifest does not hash to its own claimed content",
                 ),
-            )
-            .with_hint("the change commit moved after the run; re-run it"));
+            );
+            return report;
         }
-        if let Some(expected) = &policy.expected_result_digest
-            && expected != &result_digest
-        {
-            return Err(Error::new(
-                ErrorKind::DigestMismatch,
-                "attestation",
-                format!("result digest is {result_digest}, not the expected {expected}"),
-            ));
+        let result_digest = match self.manifest.result_digest() {
+            Ok(digest) => digest,
+            Err(error) => {
+                report.stop("digest", error);
+                return report;
+            }
+        };
+        report.pass("digest");
+
+        // Expected bindings next: a wrong-commit attestation must not be able to
+        // fail on freshness instead and be reported as "expired". Each one is a
+        // separate code, because "wrong commit", "wrong result" and "wrong round"
+        // are three different things for a human to go and fix.
+        match &policy.expected_commit {
+            Some(commit) if commit != &self.manifest.result.source.commit => report.fail(
+                "commit",
+                Error::new(
+                    ErrorKind::DigestMismatch,
+                    "attestation",
+                    format!(
+                        "attestation is bound to {}, not the expected {}",
+                        self.manifest.result.source.commit, commit
+                    ),
+                )
+                .with_hint("the change commit moved after the run; re-run it"),
+            ),
+            Some(_) => report.pass("commit"),
+            None => report.not_asked("commit"),
         }
-        if let Some(expected) = &policy.expected_challenge {
-            match &self.manifest.claims.verifier_challenge {
-                Some(got) if got == expected => {}
-                other => {
-                    return Err(Error::new(
+        match &policy.expected_result_digest {
+            Some(expected) if expected != &result_digest => report.fail(
+                "result",
+                Error::new(
+                    ErrorKind::DigestMismatch,
+                    "attestation",
+                    format!("result digest is {result_digest}, not the expected {expected}"),
+                ),
+            ),
+            Some(_) => report.pass("result"),
+            None => report.not_asked("result"),
+        }
+        match &policy.expected_challenge {
+            Some(expected) => match &self.manifest.claims.verifier_challenge {
+                Some(got) if got == expected => report.pass("challenge"),
+                other => report.fail(
+                    "challenge",
+                    Error::new(
                         ErrorKind::DigestMismatch,
                         "attestation",
                         format!(
@@ -323,76 +397,149 @@ impl AttestationDoc {
                                 .map(|d| d.to_string())
                                 .unwrap_or_else(|| "absent".into())
                         ),
-                    ));
-                }
-            }
+                    ),
+                ),
+            },
+            None => report.not_asked("challenge"),
         }
-        if let Some(version) = policy.normalisation_version {
-            let got = self.manifest.result.provenance.normalisation_version;
-            if got != version {
-                return Err(Error::new(
-                    ErrorKind::Policy,
-                    "policy",
-                    format!("normalisation version is {got}, policy requires {version}"),
-                ));
+        match policy.normalisation_version {
+            Some(version) if version != self.manifest.result.provenance.normalisation_version => {
+                report.fail(
+                    "normalisation",
+                    Error::new(
+                        ErrorKind::Policy,
+                        "policy",
+                        format!(
+                            "normalisation version is {}, policy requires {version}",
+                            self.manifest.result.provenance.normalisation_version
+                        ),
+                    ),
+                )
             }
+            Some(_) => report.pass("normalisation"),
+            None => report.not_asked("normalisation"),
         }
         // The machine class (giti-1rs.4), alongside the other bindings: an
         // attestation from the wrong architecture is refused with a sentence about
         // architectures, and only then does anything else get a turn to complain.
-        policy.check_environment(
-            &self.manifest.result.environment,
-            &self.manifest.result.provenance,
-        )?;
+        if policy.environment_requirement().is_some() {
+            match policy.check_environment(
+                &self.manifest.result.environment,
+                &self.manifest.result.provenance,
+            ) {
+                Ok(()) => report.pass("environment"),
+                Err(error) => report.fail("environment", error),
+            }
+        } else {
+            report.not_asked("environment");
+        }
 
         // Signatures. Every entry must be self-consistent (key id derived from the
-        // key offered) before the trust list is consulted at all.
+        // key offered) before the trust list is consulted at all, and an entry that
+        // failed that is not asked about trust — its identity is already a lie.
         let message = pae(&self.payload_type, &payload);
         let mut signers: Vec<String> = Vec::new();
+        if self.signatures.is_empty() {
+            // Nothing signed it: not a failed signature and not an untrusted
+            // signer, just nobody. `min_signatures` is the check that says so.
+            report.not_asked("signature");
+            report.not_asked("trust");
+        }
         for entry in &self.signatures {
-            entry.verify(&message)?;
+            if let Err(error) = entry.verify(&message) {
+                report.fail("signature", error);
+                continue;
+            }
             if !policy.trust.trusts(entry.claimed_key_id()) {
-                return Err(Error::new(
-                    ErrorKind::Policy,
-                    "policy",
-                    format!(
-                        "{} signed it, and that key is not trusted here",
-                        entry.key_id
-                    ),
-                )
-                .with_hint("add the key id to the owner's trust list (giti-1rs.6)"));
+                report.fail(
+                    "trust",
+                    Error::new(
+                        ErrorKind::Policy,
+                        "policy",
+                        format!(
+                            "{} signed it, and that key is not trusted here",
+                            entry.key_id
+                        ),
+                    )
+                    .with_hint("add the key id to the owner's trust list (giti-1rs.6)"),
+                );
+                continue;
             }
             signers.push(entry.key_id.clone());
         }
+        if !self.signatures.is_empty() {
+            report.pass("signature");
+            report.pass("trust");
+        }
         if signers.len() < policy.min_signatures {
-            return Err(Error::new(
-                ErrorKind::Policy,
-                "policy",
-                format!(
-                    "{} trusted signature(s), policy requires {}",
-                    signers.len(),
-                    policy.min_signatures
+            report.fail(
+                "min_signatures",
+                Error::new(
+                    ErrorKind::Policy,
+                    "policy",
+                    format!(
+                        "{} trusted signature(s), policy requires {}",
+                        signers.len(),
+                        policy.min_signatures
+                    ),
                 ),
-            ));
+            );
+        } else {
+            report.pass("min_signatures");
         }
 
         // Provenance tier and sandbox, then freshness. Same call `gitiup run` makes
         // against its own unsigned manifest, so "what the gate will say" and "what
         // the gate says" cannot drift (giti-1rs.7).
-        let tier = self.manifest.result.provenance.tier;
-        policy.check_provenance(&self.manifest.result.provenance)?;
-        let freshness = check_freshness(self.manifest.claims.claimed_at_us, policy)?;
-        if let Some(not_after) = self.manifest.claims.not_after_us
-            && freshness.now.0 > not_after
-        {
-            return Err(Error::new(
-                ErrorKind::Policy,
-                "freshness",
-                "the attestation's own validity window has closed",
-            ));
+        let provenance = &self.manifest.result.provenance;
+        let tier = provenance.tier;
+        match policy.check_provenance(provenance) {
+            Ok(()) => {
+                report.pass("tier");
+                report.pass("sandbox");
+            }
+            Err(error) => {
+                // One call answers both questions, because one implementation
+                // should; the code says which of the two it was.
+                if policy.allows_tier(tier) {
+                    report.pass("tier");
+                    report.fail("sandbox", error);
+                } else {
+                    report.fail("tier", error);
+                    report.not_run("sandbox");
+                }
+            }
         }
 
-        Ok(Verdict {
+        let freshness = check_freshness(self.manifest.claims.claimed_at_us, policy);
+        match &freshness {
+            Ok(_) => report.pass("freshness"),
+            Err(error) => report.fail("freshness", error.clone()),
+        }
+        // The producer's own window, which may be tighter than the policy's.
+        match self.manifest.claims.not_after_us {
+            Some(not_after) => {
+                if policy.now().0 > not_after {
+                    report.fail(
+                        "expiry",
+                        Error::new(
+                            ErrorKind::Policy,
+                            "freshness",
+                            "the attestation's own validity window has closed",
+                        ),
+                    );
+                } else {
+                    report.pass("expiry");
+                }
+            }
+            None => report.not_asked("expiry"),
+        }
+
+        if !report.reasons.is_empty() {
+            return report;
+        }
+        let freshness = freshness.expect("no reasons means freshness passed");
+        report.accept(Verdict {
             run_digest,
             result_digest,
             signers,
@@ -401,7 +548,8 @@ impl AttestationDoc {
             environment_fingerprint: self.manifest.result.environment.fingerprint.clone(),
             environment_match: policy.require_env_match,
             environment_requirement: policy.environment_requirement().cloned(),
-        })
+        });
+        report
     }
 
     // ------------------------------------------------------ DSSE interop ---

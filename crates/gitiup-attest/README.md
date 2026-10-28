@@ -64,7 +64,8 @@ ADR-0001 D4/D5 for the register of what may never enter `result`.
 | [`run`](src/run.rs) | the digest computation: `RunReport` (what a runner hands over), `RunManifest::from_run` / `from_run_with`, `Material` (bytes or their digest), the `Normaliser` seam giti-1rs.3 plugs into |
 | [`digest`](src/digest.rs), [`oid`](src/oid.rs) | `sha256:<hex>` digests and `sha1:<hex>` / `sha256:<hex>` git object ids — algorithm in the string, so a new digest is a policy change, not a format break |
 | [`key`](src/key.rs) | Ed25519 keys in SSH wire form, `SHA256:…` fingerprints as key ids, `SignatureEntry`, and the `Signer` trait ssh-agent/keystore backends plug into |
-| [`envelope`](src/envelope.rs) | `AttestationDoc`, PAE framing, signing, co-signing (`merge_signatures`), `verify`, DSSE import/export |
+| [`envelope`](src/envelope.rs) | `AttestationDoc`, PAE framing, signing, co-signing (`merge_signatures`), `verify`, `verify_report`, DSSE import/export |
+| [`report`](src/report.rs) | the verdict `gitiup verify attestation` prints: the check ladder in ADR-0001 D7's order, every reason found (not only the first), the policy the verdict was judged by, and the facts read out of the document |
 | [`policy`](src/policy.rs) | what a verifier is willing to accept: trust list, freshness window, allowed tiers, expected commit / result digest / challenge, and the environment requirement with its `strict|major|off` knob (`check_environment`) |
 | [`envreq`](src/envreq.rs) | the environment half of giti-1rs.4: `EnvMatch` (`strict`/`major`/`off`), `Arch` (alias-aware: `amd64` ≡ `x86_64`), `EnvironmentRequirement` and the version-rounding rule `major` stands for — the reason a wrong-machine refusal is a sentence and not a diff of two hashes |
 | [`error`](src/error.rs) | the taxonomy behind `gitiup verify attestation`'s exit codes: 6 policy, 7 bad signature, 8 digest mismatch |
@@ -111,6 +112,13 @@ match doc.verify(&policy) {
 `Policy::default()` fails closed: no trusted keys, and only `local` runs accepted —
 `simulated` is a plan, not an execution, and `quorum` is a verdict over several
 attestations rather than something one run may claim about itself.
+
+`verify` runs `verify_report` and keeps only the first error, so a library caller
+branching on `exit_code()` and the CLI printing a verdict walk the same ladder in the
+same order and cannot disagree. `verify_report` is the whole report — every check, every
+reason, and the policy it was judged by — for a gate that wants to log more than one
+line; the ladder, the reason codes and what is deliberately *not* checked are in
+[docs/verification.md](../../docs/verification.md).
 
 ## Interop
 

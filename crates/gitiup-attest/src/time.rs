@@ -147,16 +147,21 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m as i64, d as i64)
 }
 
-/// Human wording for a duration in microseconds (`1.5s`, `3600s`).
+/// Human wording for a duration in microseconds (`1.5s`, `1m30s`, `3d14h`).
+///
+/// Two units at most, largest first: a freshness refusal that reads "94484m57s
+/// old" is a number nobody can compare against "24h", and the whole point of the
+/// sentence is that a human can tell the two apart at a glance.
 pub fn human_duration_us(us: i64) -> String {
     let sign = if us < 0 { "-" } else { "" };
     let us = us.unsigned_abs();
     if us < 1_000 {
-        format!("{sign}{us}us")
-    } else if us < 60_000_000 {
+        return format!("{sign}{us}us");
+    }
+    if us < 60_000_000 {
         let whole = us / 1_000_000;
         let frac = us % 1_000_000;
-        if frac == 0 {
+        return if frac == 0 {
             format!("{sign}{whole}s")
         } else {
             let mut digits = format!("{frac:06}");
@@ -164,14 +169,26 @@ pub fn human_duration_us(us: i64) -> String {
                 digits.pop();
             }
             format!("{sign}{whole}.{digits}s")
-        }
-    } else {
-        format!(
-            "{sign}{}m{}s",
-            us / 60_000_000,
-            (us % 60_000_000) / 1_000_000
-        )
+        };
     }
+    const UNITS: [(&str, u64); 4] = [
+        ("d", 86_400_000_000),
+        ("h", 3_600_000_000),
+        ("m", 60_000_000),
+        ("s", 1_000_000),
+    ];
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    let mut rest = us;
+    for (unit, size) in UNITS {
+        if rest >= size {
+            parts.push(format!("{}{}", rest / size, unit));
+            rest %= size;
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+    format!("{sign}{}", parts.join(""))
 }
 
 #[cfg(test)]
@@ -227,5 +244,9 @@ mod tests {
         assert_eq!(human_duration_us(500), "500us");
         assert_eq!(human_duration_us(2_000_000), "2s");
         assert_eq!(human_duration_us(90 * 1_000_000), "1m30s");
+        assert_eq!(human_duration_us(86_400_000_000), "1d");
+        assert_eq!(human_duration_us(3_600_000_000), "1h");
+        assert_eq!(human_duration_us(90 * 3_600_000_000), "3d18h");
+        assert_eq!(human_duration_us(-2 * 3_600_000_000), "-2h");
     }
 }

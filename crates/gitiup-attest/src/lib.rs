@@ -27,6 +27,7 @@
 //!| claimed time + policy freshness window | D6 | [`policy`], [`time`] |
 //!| provenance tiers, and what each may claim | giti-1rs.7 | [`Tier`], [`Provenance::check`] |
 //!| the environment fingerprint and its match enforcement | giti-1rs.4 | [`Environment`], [`EnvMatch`], [`EnvironmentRequirement`], [`Policy::check_environment`] |
+//!| the verdict report: every check, every reason, one exit code | giti-1rs.8 | [`AttestationDoc::verify_report`], [`report::Check`], [`report::Reason`] |
 //!| the policy file a repo writes (`gitiup-policy.json`) | giti-1rs.7 | [`PolicyFile`] |
 //!| limits, and what a verifier may refuse | D7 | [`canon::MAX_ENCODED_BYTES`], [`RunManifest::validate`] |
 //!| versioning and migration | D8 | [`schema`], [`error::ErrorKind::UnsupportedSchema`] |
@@ -79,6 +80,12 @@
 //! [`ErrorKind::exit_code`] is `gitiup verify attestation`'s documented exit code
 //! (6 policy, 7 bad signature, 8 digest mismatch). Keep it that way: hooks branch
 //! on those numbers.
+//!
+//! [`AttestationDoc::verify`] answers "may I accept this?" with the first thing
+//! wrong; [`AttestationDoc::verify_report`] answers "tell me everything wrong with
+//! it" with the same checks in the same order ([`report`]). One implementation,
+//! two question shapes, so a printed verdict and a branched-on verdict cannot
+//! disagree.
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
@@ -92,6 +99,7 @@ pub mod key;
 pub mod manifest;
 pub mod oid;
 pub mod policy;
+pub mod report;
 pub mod run;
 pub mod sample;
 pub mod schema;
@@ -119,11 +127,12 @@ pub use policy::{
     DEFAULT_MAX_AGE_US, DEFAULT_MAX_CLOCK_SKEW_US, Freshness, POLICY_FILE_NAME, POLICY_PATH_ENV,
     POLICY_SCHEMA_VERSION, Policy, PolicyFile, Trust, check_freshness,
 };
+pub use report::{CHECK_ORDER, Check, CheckOutcome, Reason, VerdictReport};
 pub use run::{
     ArtifactReport, ClaimReport, EnvironmentReport, EventReport, Material, Normaliser, RawText,
     RunReport, StepReport, TimingReport, WorkflowSource, file_set_digest,
 };
-pub use time::TimeUs;
+pub use time::{TimeUs, human_duration_us};
 
 /// The fixture builders and the public fixture key id.
 ///

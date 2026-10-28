@@ -188,7 +188,7 @@ attestation 42ea717b0674b91db76bc2b1640b613617c7fe2cb4100e5cebca862d758d3aae
   claimed   2026-10-27T09:15:02Z (17h old)
   run       sha256:5b71fcfdccb72830d84e1423292ede463d2216fe72c2a4cab2e3b354b8deb819
   result    sha256:28c73827c9a5506837c179128bca275f7f0ef42d84375f1b408573cfd62e82e4
-  note      verification (is any of the above *trusted*?) is `gitiup verify attestation` (giti-1rs.8); this command prints what the store holds
+  note      verification (is any of the above *trusted*?) is `gitiup verify attestation`; this command prints what the store holds
   warning   SIMULATED: nothing was executed. This attestation describes a plan and proves intent, not behaviour: no code ran, no network was used, no artifact was produced.
 ```
 
@@ -212,7 +212,7 @@ Three things are deliberate:
   missing file.
 * **An unsigned attestation is refused.** `push` wants `--sign` (or a document that
   already carries a signature), because filing a proof nobody signed grows a store of
-  rumours. Whether a signature *counts* is `gitiup verify attestation` (giti-1rs.8);
+  rumours. Whether a signature *counts* is `gitiup verify attestation`;
   these commands print signers and the tier's trust warning and claim nothing.
 * **`gc` plans before it prunes, and never prunes what something still points at.**
   It prints the plan and changes nothing without `--apply`, refuses a policy with no
@@ -228,6 +228,70 @@ Three things are deliberate:
 
 The full rules, including what retention cannot do, are in
 [docs/host-abstraction.md](../../docs/host-abstraction.md#attestations-in-the-store).
+
+## `gitiup verify attestation`
+
+The question the format exists to answer, in one exit code: *may this proof be acted
+on?* It re-hashes the manifest, checks every signature and whether the signer is
+trusted, counts distinct trusted signers, checks the tier and sandbox, the environment
+requirement, and the freshness window — in ADR-0001 D7's fixed order, so the first
+thing wrong is what the exit code says, and prints every other thing wrong too.
+
+```console
+$ gitiup verify attestation --store ./store --commit "$(git rev-parse HEAD)" --policy gitiup-policy.json --json
+{"accepted":false,"attestation":{…},"checks":[…],"exit":6,"policy":{…},"reasons":[{"class":"policy","code":"environment","detail":"this run's arch is 'aarch64', which does not match what this change requires: amd64 (canonical x86_64)","exit":6}],"source":"fs store ./store · kv/attestation/f01a…","stored":"f01a8261…","verdict":"policy"}
+
+$ gitiup verify attestation proof.json --trust ada --max-age 1d
+source        file proof.json
+run           sha256:994698a11e4cbe855aedf227980bc75f74342b470e611c519dbe45bb864f1b1f
+result        sha256:fee3b8e9194ff042b5725fd200f3b2360a9ab2b8c57a9b121e1aebb74d2ed88f
+commit        sha1:dddddddddddddddddddddddddddddddddddddddd · job test
+workflow      .github/workflows/ci.yml · pull_request
+tier          local · runner gitiup 0.1.0 · sandbox landlock · normalisation v0
+environment   os macos · arch aarch64 · provider shell · fingerprint sha256:d32af993…
+claimed       2026-10-27T09:15:02Z (1d44m old)
+signed        SHA256:3l7Z…QG3g (ed25519)
+steps         3
+policy        trust: --trust, 1 key(s) · tiers local · min 1 signature(s) · max age 1d · env nothing required
+
+checks
+  structure       ok
+  digest          ok
+  commit          not asked
+  result          not asked
+  challenge       not asked
+  normalisation   not asked
+  environment     not asked
+  signature       ok
+  trust           ok
+  min_signatures  ok
+  tier            ok
+  sandbox         ok
+  freshness       REFUSED    · attestation is 1d44m old, which exceeds the 1d window
+  expiry          not asked
+
+verdict       POLICY (exit 6)
+reason        [freshness] attestation is 1d44m old, which exceeds the 1d window
+              hint: re-run the job, or widen the owner's freshness policy deliberately
+```
+
+| exit | meaning |
+|------|---------|
+| 0 | accepted |
+| 2 | usage (no verdict) |
+| 3 | I/O, store unreachable (no verdict) |
+| 6 | refused: untrusted signer, too few signatures, tier or sandbox not allowed, stale or future-dated, wrong machine class, unreadable document |
+| 7 | a signature that does not verify |
+| 8 | digest mismatch: non-canonical bytes, wrong commit, wrong result digest, a store that returned bytes other than the ones it names |
+
+A verdict is printed on stdout and carried in the exit code — a refusal is a result, not
+a fault, so stdout stays parseable and stderr stays empty. `--policy` reads the
+`gitiup-policy.json` a repo commits; `--trust` names a key (a `SHA256:` fingerprint or
+a keystore name) and, when nothing else names one, this machine's keystore is trusted
+and says so in the output. `--json` is stable: the keys, the check ladder and the
+reason shape are pinned by `tests/verify_cli.rs`. The whole contract — ladder,
+reasons, where trust comes from, what is deliberately not checked — is
+[docs/verification.md](../../docs/verification.md).
 
 ## `gitiup key` and `gitiup identity`
 
@@ -301,11 +365,12 @@ refuses the round afterwards if the check says the author got in anyway. See
 
 ## What is deliberately *not* here yet
 
-`gitiup verify attestation` (giti-1rs.8) — deciding whether a stored attestation's
-signature is *trusted* against a trust root — and the runner that
-writes these reports in the first place. `digest` is the slice that exists once
-the format does, which is the point: the computation is checkable from the command
-line before any of the machinery around it is built.
+The merge gate itself (giti-kd4.5) — `verify attestation` answers "is this attestation
+good enough?" and exits; deciding that a *merge* may proceed (how many proofs, from
+which quorum, recorded where) is that gate's job, and it adds its own reasons to the
+same report. `gitiup pull` (giti-kd4.4), which fetches a stranger's change and
+verifies its attestation before applying it, is the other open half. Both call the
+checks that are already here rather than adding new ones.
 
 ## Tests
 
@@ -336,6 +401,18 @@ line before any of the machinery around it is built.
   an empty policy refused, and — over loopback smart HTTP with nothing but `git` on the
   reading side — a plain `git clone` + `fetch refs/attestations/*` ending up holding the
   exact signed bytes.
+* `tests/verify_cli.rs` — `gitiup verify attestation` as command lines, each in a fresh
+  process, every one with the clock pinned: the acceptance path and the ladder's
+  outcome for each check; exit `6` for an untrusted signer (signature `passed`, so the
+  two are never confused), a disallowed tier, staleness, too few signatures, an
+  unsigned document, an environment the change will not take, and a policy file that
+  argues with itself; exit `7` for a manifest edited after signing and for a key id
+  that is not its key's fingerprint; exit `8` for pretty-printed bytes, a wrong commit
+  binding, a wrong expected `ResultDigest`, and a corrupted CAS blob; the store paths
+  (`--commit`, `--digest`, two attestations refusing to be guessed between); the `--json`
+  shape pinned (top-level keys, the ladder in D7 order, `{code, detail}` reasons) and
+  the table's verdict on stdout with nothing on stderr, while usage and I/O errors are
+  the reverse.
 * `tests/doc_examples.rs` — the worked report in `docs/run-report.md`, parsed and
   digested: the documentation example is the pinned example.
 * `tests/cli_hygiene.rs` — the dependency list stays at three crates, no network or

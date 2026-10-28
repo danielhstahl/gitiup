@@ -251,7 +251,7 @@ normalisation  v0
 `--json` gives the same facts as one sorted-key line for scripts, `--quiet` prints
 the `RunDigest` alone, and `--expect <digest>` / `--expect-result <digest>` turn
 "did this rerun converge?" into an exit status (8 on disagreement — the same class
-`gitiup verify attestation` will report for a digest that does not match).
+`gitiup verify attestation` reports for a digest that does not match).
 
 ## Tests that hold this down
 

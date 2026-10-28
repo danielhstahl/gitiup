@@ -214,7 +214,7 @@ fn read_store(args: &Args) -> Result<Opened, CliError> {
 /// use; bare hex is what a shell has after `$(git rev-parse HEAD)`. The ref component is
 /// always the bare hex, because a ref name may not contain `:` and the length already says
 /// which algorithm it is.
-fn subject(text: &str) -> Result<Oid, CliError> {
+pub(crate) fn subject(text: &str) -> Result<Oid, CliError> {
     let text = text.trim();
     let hex = if text.contains(':') {
         // The algorithm prefix is case-folded because `git rev-parse` output is hex
@@ -882,7 +882,7 @@ fn print_json(value: Value) {
 }
 
 /// A microsecond timestamp as RFC 3339 seconds, the unit humans read.
-fn rfc3339(micros: i64) -> String {
+pub(crate) fn rfc3339(micros: i64) -> String {
     Timestamp::from_unix(micros.div_euclid(1_000_000).max(0) as u64).to_rfc3339()
 }
 
@@ -912,7 +912,7 @@ fn age(claimed_at_us: i64) -> String {
 /// Only long things are shortened: a short hex digest is easier read whole, and a
 /// `SHA256:` fingerprint is exactly the case where the middle is the part nobody
 /// compares.
-fn short(text: &str) -> String {
+pub(crate) fn short(text: &str) -> String {
     let trimmed = text.strip_prefix("sha256:").unwrap_or(text);
     let trimmed = trimmed.strip_prefix("SHA256:").unwrap_or(trimmed);
     if trimmed.len() <= 20 {
