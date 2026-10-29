@@ -38,8 +38,48 @@ use crate::host::GitHubHost;
 /// The change (PR substitute) this adapter publishes attestations under.
 pub const ATTESTATION_CHECK_NAME: &str = "gitiup/attest";
 
+// What the forge will not promise about a change, in the five sentences a listing needs.
+// These are the `GitHubHost::advice` caveats narrowed to the change verbs, and they are
+// `&'static str` so a caller can compare them, print them and put them in JSON without
+// inventing its own words for the same three facts.
+
+/// A pull request with no gitiup record behind it.
+pub const CAVEAT_COPY_ONLY: &str = "no gitiup record is behind this change: the forge \
+    holds a copy of a title and a body, and no signature covers either (`source: pull`)";
+
+/// A `refs/changes/<id>/head` with no pull request.
+pub const CAVEAT_NO_PULL: &str = "no pull request carries this change, so the forge has \
+    nothing for its merge button to act on: the ref is the whole proposal, and gitiup's \
+    store-side merge is the only merge it has";
+
+/// The ref and the pull are two calls, not one transaction.
+pub const CAVEAT_TWO_CALLS: &str = "the change ref and the pull request are two calls \
+    with no transaction between them (`atomic-multi-write` is false): either can exist \
+    without the other, and gitiup reports that rather than rolling back a rollback it \
+    cannot ask for";
+
+/// The forge's copy was cut to its own limit.
+pub const CAVEAT_TRUNCATED: &str = "the forge's copy of this change was cut short by its \
+    own body limit (`copy_truncated: true`); the bytes of record are in the store, and a \
+    gate that needs them reads them from there";
+
+/// CAS is checked before and verified after, not enforced on a rewind.
+pub const CAVEAT_CAS: &str = "a ref move here is checked before it is sent and verified \
+    after: the forge enforces create-only and forward moves conditionally and a rewind \
+    only after the fact, so a concurrent writer on the same ref is detected, not \
+    prevented";
+
 /// The prefix of every check run gitiup publishes.
 pub const ATTESTATION_CHECK_PREFIX: &str = "gitiup/";
+
+/// The forge's own limit on a pull-request body, in characters.
+///
+/// The number belongs to the forge, not to gitiup: a body over it is a `422` from the
+/// API, and gitiup has no business discovering that by exhausting a rate limit. The
+/// limit is on the *forge's copy* of a change; the bytes of record live in the store,
+/// where nothing truncates them, which is what makes truncation reportable rather than
+/// fatal.
+pub const MAX_PULL_BODY_CHARS: usize = 65_536;
 
 /// Where a change came from, which decides what may be done with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +94,43 @@ pub enum ChangeOrigin {
         /// The ref name.
         name: String,
     },
+}
+
+/// Where a change's facts came from, and therefore how much of it anything can vouch
+/// for.
+///
+/// This is [`AttestationSource`] asked of the other forge database, and it is spelled
+/// the same way on purpose: *is this the thing, or a copy of it?* A pull request is a
+/// row in the forge's own tables — a title, a body, two branch names — and no signature
+/// covers any of it. A change ref is gitiup's, and its record is signed. When both
+/// exist they are the same change seen twice, and the store is the authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// `refs/changes/<id>/head` and nothing else: the store's own, with a signed
+    /// record behind it, and no pull request.
+    Ref,
+    /// The forge's pull database and nothing else: a *copy* of somebody's proposal,
+    /// listed and labelled rather than skipped, because there is no record here for a
+    /// reader to check.
+    Pull,
+    /// Both, and they name the same change. The store's copy is the one of record.
+    Both,
+}
+
+impl ChangeSource {
+    /// Stable name for `--json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeSource::Ref => "ref",
+            ChangeSource::Pull => "pull",
+            ChangeSource::Both => "both",
+        }
+    }
+
+    /// Whether the forge is the only thing vouching for this change.
+    pub fn is_copy_only(self) -> bool {
+        self == ChangeSource::Pull
+    }
 }
 
 /// Whether a change is still open, merged, or closed without merging.
@@ -115,6 +192,14 @@ pub struct ChangeRecord {
     pub origin: ChangeOrigin,
     /// The attestation this store holds for the change's head, if any.
     pub attestation: Option<Oid>,
+    /// Which database(s) this change's facts arrived from, and therefore what anything
+    /// can vouch for. `Pull` means the forge is the only witness: there is no signed
+    /// record behind this row.
+    pub source: ChangeSource,
+    /// The forge's copy of the change is not the whole of it: the body was cut to fit
+    /// the forge's own limit, or the forge holds only a copy where the bytes of record
+    /// live in the store. Reported, never guessed away — see [`MAX_PULL_BODY_CHARS`].
+    pub copy_truncated: bool,
 }
 
 impl ChangeRecord {
@@ -166,12 +251,38 @@ impl ChangeRecord {
                 number: pull.number,
             },
             attestation: None,
+            // A pull request on its own is the forge's copy of a proposal: nothing in
+            // it is signed, and nothing here says a gitiup record exists anywhere.
+            source: ChangeSource::Pull,
+            copy_truncated: false,
         }
     }
 
     /// Whether a merge through the forge is possible for this change.
     pub fn mergeable_via_forge(&self) -> bool {
         matches!(self.origin, ChangeOrigin::Pull { .. }) && self.state == ChangeState::Open
+    }
+
+    /// What the forge cannot promise about *this* change, in the adapter's words.
+    ///
+    /// These are the same caveats [`crate::GitHubHost::advice`] states about the host,
+    /// narrowed to the ones a listing has to pass on: a caller printing a change from a
+    /// forge is printing something a bucket never had to qualify, and the difference
+    /// ("the ref and the pull were two calls", "no signature covers a PR body") is the
+    /// difference between a fact and an advertisement. Empty for a change the store
+    /// holds entirely.
+    pub fn caveats(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        match self.source {
+            ChangeSource::Pull => out.push(CAVEAT_COPY_ONLY),
+            ChangeSource::Ref => out.push(CAVEAT_NO_PULL),
+            ChangeSource::Both => out.push(CAVEAT_TWO_CALLS),
+        }
+        if self.copy_truncated {
+            out.push(CAVEAT_TRUNCATED);
+        }
+        out.push(CAVEAT_CAS);
+        out
     }
 }
 
@@ -260,15 +371,21 @@ impl GitHubHost {
             let Some(id) = reference.name.change_id() else {
                 continue;
             };
-            // The same change seen twice: keep the pull, which knows more. Two
-            // ways that happens — the ref is named after the forge's number (the
-            // usual case for a change gitiup opened on this host), or the ref and
-            // the pull propose the same commit, which is the case for a change
-            // whose ref predates the pull request, or was pushed independently.
+            // The same change seen twice: keep the pull, which knows more — but it is
+            // no longer the forge's copy alone, because the store has a ref over the
+            // same head, and that is the difference between "a PR somebody opened" and
+            // "a change gitiup can check".
             let numbered = out.iter().any(|change| change.id == format!("gh-{id}"));
             let same_commit = reference.oid.len() == 20
                 && out.iter().any(|change| change.head == Some(reference.oid));
             if numbered || same_commit {
+                for change in out.iter_mut() {
+                    if change.id == format!("gh-{id}")
+                        || (reference.oid.len() == 20 && change.head == Some(reference.oid))
+                    {
+                        change.source = ChangeSource::Both;
+                    }
+                }
                 continue;
             }
             out.push(ChangeRecord {
@@ -291,6 +408,10 @@ impl GitHubHost {
                     name: reference.name.to_string(),
                 },
                 attestation: None,
+                // A change the adapter did not write: the ref is all there is, and the
+                // listing says so instead of skipping the row.
+                source: ChangeSource::Ref,
+                copy_truncated: false,
             });
         }
         out.sort_by(|a, b| {
@@ -309,6 +430,13 @@ impl GitHubHost {
     /// change still exists and is still verifiable. The forge's merge is then used
     /// rather than imitated — the one place where being on a forge is genuinely
     /// better than being in a bucket.
+    ///
+    /// `head_branch` is a *branch*, because that is what the forge insists on: gitiup's
+    /// own `refs/changes/**` refs cannot be a pull request's head ([`GitHubHost::branches_at`]
+    /// is how a caller finds one that can). The body is the forge's copy and is cut to
+    /// [`MAX_PULL_BODY_CHARS`] when it is over; that is reported as `copy_truncated`
+    /// rather than refused, because the bytes of record are in the store and a limit the
+    /// forge owns should not stop a change from being published.
     pub fn open_change(
         &self,
         title: &str,
@@ -317,8 +445,53 @@ impl GitHubHost {
         body: &str,
         draft: bool,
     ) -> HostResult<ChangeRecord> {
-        let pull = api::create_pull(self.client(), title, head_branch, base_branch, body, draft)?;
-        Ok(ChangeRecord::from_pull(&pull))
+        let (body, copy_truncated) = pull_body(body);
+        let pull = api::create_pull(self.client(), title, head_branch, base_branch, &body, draft)?;
+        let mut change = ChangeRecord::from_pull(&pull);
+        change.copy_truncated = copy_truncated;
+        // The change now exists in both databases: the ref the caller published and the
+        // pull this call opened.
+        change.source = ChangeSource::Both;
+        Ok(change)
+    }
+
+    /// The forge's open branches that point at `head`, as branch names.
+    ///
+    /// A pull request's head has to be a branch, and the change's own refs are not ones,
+    /// so this is the question a caller asks before it can offer the forge a change at
+    /// all. More than one answer is not a coincidence to paper over — two branches over
+    /// one commit is a real state, and the caller picks or asks.
+    pub fn branches_at(&self, head: &Oid) -> HostResult<Vec<String>> {
+        Ok(self
+            .list_refs(&gitiup_host::RefQuery::prefix("refs/heads"))?
+            .into_iter()
+            .filter(|reference| reference.oid == *head)
+            .map(|reference| {
+                reference
+                    .name
+                    .as_str()
+                    .trim_start_matches("refs/heads/")
+                    .to_string()
+            })
+            .collect())
+    }
+
+    /// The open pull requests that propose exactly `head`, which is how a caller learns
+    /// that one of its changes is carried by the forge.
+    ///
+    /// Zero, one and many are all honest answers and are returned as they are: "the store
+    /// holds a change and the forge holds two pulls over the same commit" is not a
+    /// something-the-tool-invents, it is somebody's ambiguity to resolve.
+    pub fn open_pulls_at(&self, head: &Oid) -> HostResult<Vec<ChangeRecord>> {
+        Ok(self
+            .changes("open")?
+            .into_iter()
+            .filter(|change| {
+                change.state == ChangeState::Open
+                    && change.head == Some(*head)
+                    && matches!(change.origin, ChangeOrigin::Pull { .. })
+            })
+            .collect())
     }
 
     /// Merge a change the forge carries, with the forge's own merge (D10).
@@ -546,6 +719,31 @@ impl GitHubHost {
         out.sort_by_key(|record| (!record.verbatim(), record.digest.hex()));
         Ok(out)
     }
+}
+
+/// The line a truncated pull-request body ends with.
+///
+/// The cut has to be visible where a person reads it: a body that is quietly shorter is
+/// a body that misrepresents what it held.
+pub const TRUNCATED_NOTICE: &str = "\n\n> gitiup: the forge's body limit cut this copy \
+    short. The bytes of record are in the store — `gitiup change show <id>` prints them, \
+    and `gitiup change checkout <id>` fetches them.\n";
+
+/// A pull-request body the forge will accept, and whether it had to be cut.
+///
+/// Truncating is allowed here and nowhere else, because this is the one copy of a change
+/// that is not authoritative: the signed bytes are in the store, addressed by digest.
+/// So the answer to "the body is over the forge's limit" is "say so in the body, and say
+/// so to the caller", not "refuse to publish a change over a limit the forge owns".
+pub fn pull_body(body: &str) -> (String, bool) {
+    if body.chars().count() <= MAX_PULL_BODY_CHARS {
+        return (body.to_string(), false);
+    }
+    let keep = MAX_PULL_BODY_CHARS
+        .saturating_sub(TRUNCATED_NOTICE.chars().count())
+        .max(1);
+    let cut: String = body.chars().take(keep).collect();
+    (format!("{cut}{TRUNCATED_NOTICE}"), true)
 }
 
 /// The summary block a check run carries.

@@ -66,6 +66,13 @@ hosts-github = ["dep:gitiup-host-github"]
 
 [dev-dependencies]
 tempfile = "3"
+# The mock forge, so `tests/change_forge_cli.rs` can point a *built binary* at one. Every
+# other store a test in this crate uses can be opened in process; a forge is a URL, and
+# `http://127.0.0.1:<port>` is the only plain-HTTP address the adapter will ever speak to,
+# so the double gets a loopback socket and the command line runs unchanged against it. The
+# `testing` feature brings in the double; the adapter itself stays behind `hosts-github`,
+# and that test is compiled out when the feature is off.
+gitiup-host-github = { path = "../gitiup-host-github", features = ["testing"] }
 
 [lints]
 workspace = true

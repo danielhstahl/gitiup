@@ -411,6 +411,43 @@ impl MockForge {
         self.state.lock().expect("mock state").refs.clone()
     }
 
+    /// Stand a ref at a sha, whatever the forge thinks that sha is.
+    ///
+    /// The forge's refs are normally the forge's to decide, and a test that could put any
+    /// sha anywhere could make a mock say anything. This one is here for the one case a
+    /// test cannot otherwise reach: a repository whose `refs/heads/main` is a commit made
+    /// by *git*, not by the data API — which is every real repository, and the reason a
+    /// change's base has to be able to name a commit the forge never minted.
+    pub fn set_ref(&self, name: &str, sha: &str) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .refs
+            .insert(name.to_string(), sha.to_string());
+    }
+
+    /// Give the forge a commit it did not create, with the parents it should claim.
+    ///
+    /// `git push` puts commits in a forge's object database without a single call to the
+    /// data API, and from then on the API treats them like any other commit. A mock that
+    /// only knows what it minted itself cannot tell a fast-forward from a rewind once real
+    /// git history is involved, which is the difference between passing and failing the
+    /// one promise gitiup gates a merge on.
+    pub fn adopt_commit(&self, sha: &str, parents: &[&str]) {
+        let mut state = self.state.lock().expect("mock state");
+        state.commits.insert(
+            sha.to_string(),
+            StoredCommit {
+                sha: sha.to_string(),
+                message: "adopted by the mock (pushed over git)".to_string(),
+                tree: mint_sha(sha.as_bytes()),
+                parents: parents.iter().map(|parent| parent.to_string()).collect(),
+                author: "git".to_string(),
+                date: "2026-01-01T00:00:00Z".to_string(),
+            },
+        );
+    }
+
     /// Every call answered, as `(method, path)`.
     pub fn seen(&self) -> Vec<(String, String)> {
         self.state.lock().expect("mock state").seen.clone()
@@ -710,7 +747,7 @@ impl MockForge {
                     return self.error(request, 404, "pull numbers are integers");
                 };
                 match state.pulls.iter().find(|pull| pull["number"] == number) {
-                    Some(pull) => json(200, pull.clone()),
+                    Some(pull) => json(200, pull_as_now(state, pull)),
                     None => json(404, serde_json::json!({"message": "Not Found"})),
                 }
             }
@@ -739,7 +776,15 @@ impl MockForge {
                             .map(str::to_string)
                     })
                     .unwrap_or_default();
-                let Some(pull) = state.pulls.iter_mut().find(|pull| pull["number"] == number)
+                // Read the pull as it is now, before anything is written: the head a forge
+                // merges is its branch's current sha, not the sha noted when the pull was
+                // opened, and a merge that chased the old one would refuse work the forge has
+                // already taken.
+                let Some(pull) = state
+                    .pulls
+                    .iter()
+                    .find(|pull| pull["number"] == number)
+                    .map(|pull| pull_as_now(state, pull))
                 else {
                     return json(404, serde_json::json!({"message": "Not Found"}));
                 };
@@ -750,13 +795,17 @@ impl MockForge {
                     );
                 }
                 let head = pull["head"]["sha"].as_str().unwrap_or_default().to_string();
+                let base = pull["base"]["ref"].as_str().unwrap_or("main").to_string();
                 if !want.is_empty() && want != head {
                     return json(
                         409,
                         serde_json::json!({"message": "Head branch was modified. Review and try the merge again."}),
                     );
                 }
-                let base = pull["base"]["ref"].as_str().unwrap_or("main").to_string();
+                let Some(pull) = state.pulls.iter_mut().find(|pull| pull["number"] == number)
+                else {
+                    return json(404, serde_json::json!({"message": "Not Found"}));
+                };
                 pull["state"] = serde_json::Value::String("closed".to_string());
                 pull["merged_at"] = serde_json::Value::String("2026-01-01T00:00:00Z".into());
                 pull["merge_commit_sha"] = serde_json::Value::String(head.clone());
@@ -1185,7 +1234,10 @@ impl MockForge {
                 .unwrap_or("")
                 .cmp(a["updated_at"].as_str().unwrap_or(""))
         });
-        let items: Vec<serde_json::Value> = pulls.into_iter().cloned().collect();
+        let items: Vec<serde_json::Value> = pulls
+            .into_iter()
+            .map(|pull| pull_as_now(state, pull))
+            .collect();
         self.page(
             items,
             query,
@@ -1223,7 +1275,11 @@ impl MockForge {
             .get("base")
             .and_then(|value| value.as_str())
             .unwrap_or(&self.config.default_branch);
-        let head_sha = mint_sha(head.as_bytes());
+        let head_sha = state
+            .refs
+            .get(&format!("refs/heads/{head}"))
+            .cloned()
+            .unwrap_or_else(|| mint_sha(head.as_bytes()));
         let base_sha = state
             .refs
             .get(&format!("refs/heads/{base}"))
@@ -1489,6 +1545,207 @@ impl Transport for ForgeTransport {
     fn send(&self, request: &Request) -> Result<Response, TransportError> {
         Ok(self.forge.answer(request))
     }
+}
+
+/// A forge on a loopback socket, for the one test that cannot call
+/// [`MockForge`] directly.
+///
+/// Everything inside this crate reaches the forge through a [`Transport`], which is a
+/// function, and a test that can call a function should not open a socket. The
+/// exception is the command line: `gitiup` is a separate program, and a separate program
+/// reaches a forge the way everything else does — over a URL from a config file. So the
+/// CLI's forge tests need a forge at a URL, and `http://127.0.0.1:<port>` is the only
+/// plain-HTTP address this adapter will ever speak to ([`crate::auth`] refuses plain HTTP
+/// anywhere else), which makes this the same test double wearing a socket rather than a
+/// second implementation of it.
+///
+/// Every request is handed to [`MockForge::answer`] unchanged, so create-only refusal,
+/// fast-forward checking, `Link` pagination, rate limits and the 401-on-a-write-without-
+/// a-token all come from the same place. One connection per request, because that is
+/// what `curl` does anyway and keeping a connection alive is not what is being tested.
+pub struct ForgeServer {
+    /// `http://127.0.0.1:<port>`.
+    pub base: String,
+    /// What a `[remote] url` should say: this forge, this repository.
+    pub url: String,
+    /// What `[remote.options] api-base` should say.
+    pub api_base: String,
+    /// The forge answering, so a test can seed it and read it back.
+    pub forge: Arc<MockForge>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ForgeServer {
+    /// Answer on a free loopback port until the server is dropped.
+    pub fn start(forge: Arc<MockForge>) -> std::io::Result<ForgeServer> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let base = format!("http://{address}");
+        let forge_for_thread = forge.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let forge = forge_for_thread.clone();
+                        std::thread::spawn(move || {
+                            let _ = serve_one(forge, stream);
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let config = forge.config.clone();
+        Ok(ForgeServer {
+            url: format!("{base}/{}/{}", config.owner, config.repo),
+            api_base: format!("{base}/api/v3"),
+            base,
+            forge,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ForgeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read one HTTP/1.1 request, answer it from the forge, and hang up.
+fn serve_one(forge: Arc<MockForge>, mut stream: std::net::TcpStream) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(());
+    }
+    let mut parts = line.split_whitespace();
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        return Ok(());
+    };
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            break;
+        }
+        let trimmed = header.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    // The mock routes on `/repos/<owner>/<repo>/…`; a real API root sits in front of
+    // that (`/api/v3`), so the root is taken back off before the forge sees the path.
+    let path = match path.find("/repos/") {
+        Some(at) => &path[at..],
+        None => path,
+    };
+    let url = format!(
+        "{}{}{}",
+        forge_base(&headers),
+        path,
+        query.map(|text| format!("?{text}")).unwrap_or_default()
+    );
+    let mut request = Request::new(
+        match method {
+            "POST" => crate::transport::Method::Post,
+            "PATCH" => crate::transport::Method::Patch,
+            "PUT" => crate::transport::Method::Put,
+            "DELETE" => crate::transport::Method::Delete,
+            _ => crate::transport::Method::Get,
+        },
+        url,
+    )
+    .with_body(body);
+    request.headers = headers;
+    let response = forge.answer(&request);
+    let reason = match response.status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        _ => "Status",
+    };
+    let mut out = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        response.body.len()
+    );
+    for (name, value) in &response.headers {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    out.push_str("\r\n");
+    stream.write_all(out.as_bytes())?;
+    stream.write_all(&response.body)?;
+    stream.flush()
+}
+
+/// The host the rewritten URL should claim, taken from the request's own `Host:` so the
+/// mock's rate-limit headers and `Link` URLs stay in the same origin the client asked.
+fn forge_base(headers: &[(String, String)]) -> String {
+    let host = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("127.0.0.1");
+    format!("http://{host}")
+}
+
+/// A pull request as the forge would answer it *now*.
+///
+/// A pull's head is a branch, and its sha is wherever that branch stands today — which is
+/// what lets a force-push move an existing pull instead of stranding it, and what lets a
+/// re-submit find the pull it should reuse instead of opening a second one. The stored
+/// shape keeps the branch name, so the resolution happens on the way out and every reader
+/// (the listing, the single pull, the merge) sees the same moving fact.
+fn pull_as_now(state: &State, pull: &serde_json::Value) -> serde_json::Value {
+    let mut pull = pull.clone();
+    if let Some(branch) = pull["head"]["ref"].as_str()
+        && let Some(sha) = state.refs.get(&format!("refs/heads/{branch}"))
+    {
+        pull["head"]["sha"] = serde_json::Value::String(sha.clone());
+    }
+    pull
 }
 
 #[cfg(test)]

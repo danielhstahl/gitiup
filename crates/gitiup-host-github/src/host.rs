@@ -158,6 +158,20 @@ impl GitHubHost {
              a merge deletes a ref"
                 .to_string(),
         );
+        out.push(
+            "a change is two writes with nothing between them: the `refs/changes/<id>/**` \
+             refs first, then the pull request, so a change with a ref and no pull is a \
+             state this host can be in. It is listed and labelled (`source: ref`) rather \
+             than skipped or rolled back, and re-running the submit finishes it"
+                .to_string(),
+        );
+        out.push(
+            "a pull request is the forge's copy of a change, not the change: its title and \
+             body are unsigned and its body is cut to the forge's own limit, so a listing \
+             says `source: pull` for one with no record behind it and `copy_truncated: \
+             true` for a copy the forge could not hold whole"
+                .to_string(),
+        );
         match self.facts() {
             Ok(facts) => {
                 if let Some(permissions) = &facts.permissions

@@ -266,6 +266,34 @@ attempt; `--bytes` prints the exact stored bytes.
 | `head_tracks_newest` | whether `head` names the newest attempt, or a half-finished submit left it behind |
 | `fetch` | the refspec a reviewer fetches: one `git fetch` on a git host brings the record and every commit it proposes |
 
+## Against a forge remote: the same verbs, one database more
+
+A `https://github.com/owner/repo` remote served by
+[`gitiup-host-github`](../crates/gitiup-host-github) (the `hosts-github` feature, on by
+default) answers `new`, `submit`, `list`, `show` and `merge` with the same rules, the same
+refusals and the same exit codes as a bucket. The difference is that a forge has a second
+database of proposed work — pull requests — and three things it will not promise. Every row
+of `list` and `show` therefore says which database it came from and what that means:
+
+| `source` | what the store holds | what the forge holds | what a caller may do with it |
+|----------|----------------------|----------------------|------------------------------|
+| `ref` | the record, its refs, its proofs | nothing | everything a bucket allows: verify, merge under CAS |
+| `both` | the record | a pull request over the same commit | the forge's merge instead of a ref write (D10) |
+| `pull` | **nothing** | a title and a body | list it, show it, label it: nothing in it is signed, so nothing in it can be verified |
+
+A pull request with no record behind it is **listed**, not skipped: `recorded: false`, an
+`error` naming what is missing, and `change show gh-<n>` prints the forge's answer and says
+outright that there is no record to check. A ref with no pull is the mirror case, and is
+`source: ref` rather than an absence — the question was asked, and no is the answer.
+
+The three limits, and the field each one is reported through:
+
+| what the forge will not promise | the field that says so |
+|---------------------------------|------------------------|
+| the record and the pull are **two calls**: the store has the change before the forge is asked, and the second can fail alone | `pull not opened` and the forge's own reason on `submit`, then `source: ref` until a pull exists. A change with refs and no pull is an outcome, not a failure, and `merge` falls back to the store's CAS because that is all there is |
+| there is **no ref transaction**: ref+ref and ref+blob are separate writes (`atomic_multi_write = false`) | `caveats[]` on every forge row (`CAVEAT_TWO_CALLS`, `CAVEAT_CAS`), `atomicity` in `merge --json`, and `gitiup doctor --remotes` |
+| the forge **truncates what it holds**, including a change's own body | `copy_truncated: true`, with the cut written into the copy: the bytes of record are in the store, so a cut copy loses the discussion and not the proof |
+
 ## Checking it out: one fetch, the change and its proofs (`checkout`)
 
 `submit` answers "how does work get in". `checkout` is the same door from the other side,
@@ -542,12 +570,17 @@ not compiled with is refused **by name**, with `hosts-github` in the hint, befor
 is drafted. Accepting such a remote and then "helpfully" driving it with the plain-git host
 would let `submit` succeed against a remote whose change database the build cannot read.
 
-An adapter — `gitiup change merge`, and GitHub's PR-backed parity in `giti-b2z.7` — has the
-same four verbs against a forge, and the same rules behind them. What a pull request cannot
-carry (a signature, a microsecond timestamp, a 256-bit digest) is listed in
+An adapter — `gitiup change merge`, and GitHub's PR-backed parity (`giti-b2z.7`, written
+up above) — has the same verbs against a forge, and the same rules behind them. What a pull
+request cannot carry (a signature, a microsecond timestamp, a 256-bit digest) is listed in
 [ADR-0003 D10](adr/0003-change-record-format-and-merge-semantics.md); the short version is
 that a pull request is an advertisement of a record, and `origin: {kind:"pull"}` says so
-inside the record rather than leaving it to be inferred from where you read it.
+inside the record rather than leaving it to be inferred from where you read it. The
+command line reaches a forge through one seam and one only
+([`remotes::Forge`](../crates/gitiup/src/remotes.rs)): which changes it carries, how to ask
+it to carry one, which of its branches hold a commit, and how to ask it to merge. No forge
+type crosses into `change.rs`, which is what
+`crates/gitiup/tests/no_forge_calls.rs` exists to keep true.
 
 ## Where this is measured
 
@@ -571,8 +604,9 @@ what was measured.
 ## Not this ticket
 
 Checking a change out (`giti-b2z.5`) is written up above, and the
-change-workflow conformance suite is written up just here (`giti-b2z.6`). Remaining:
-GitHub adapter parity for these verbs (`giti-b2z.7`). Opening quorum rounds on submit is
+change-workflow conformance suite is written up just here (`giti-b2z.6`), and GitHub
+adapter parity for these verbs is written up above
+(`giti-b2z.7`). Remaining:
 `giti-zp1.2` and now happens (step 5 above). `gitiup verify change` (`giti-91m.4`) now gates a
 merge on all of it — the record's bytes, the refs, the attempt and the proof digests are
 exactly what it reads. What this ticket had to get right

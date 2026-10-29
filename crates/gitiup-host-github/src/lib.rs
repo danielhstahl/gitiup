@@ -24,7 +24,8 @@
 //! | what GitHub has | where it lives now | what a caller sees |
 //! |-----------------|--------------------|--------------------|
 //! | refs, branches, the object store | [`store`] — the git data API, with pointer commits so a ref can point at a record | [`RefStore`], unchanged |
-//! | the pull request database | `GitHubHost::changes`, `GitHubHost::open_change` | a [`ChangeRecord`], same as a bucket's `refs/changes/**` |
+//! | the pull request database | `GitHubHost::changes`, `GitHubHost::open_change` | a [`ChangeRecord`], same as a bucket's `refs/changes/**`, with `source` saying which database it came from |
+//! | a change the forge holds alone | the same listing, `source: Pull` | labelled, not skipped: no signature covers a pull request, and `copy_truncated` says when the forge could not hold the whole of it |
 //! | check runs and CI status | `GitHubHost::publish_attestation`, `GitHubHost::attestations_for` | an [`AttestationRecord`], same as `refs/attestations/<subject>/<digest>` on any host |
 //! | webhooks, and `github.event.*` | [`ChangeFeedCursor`] polling | "what is new since I looked", one conditional listing |
 //! | token auth, pagination, rate limits | [`client`], [`auth`] | nothing: they are the adapter's job, and a caller above should not be able to get them wrong |
@@ -72,8 +73,9 @@ pub use auth::{Auth, Environment, FixedEnvironment, Secret, TokenSource};
 pub use client::{ClientOptions, RateBudget, RepoRef};
 pub use curl::CurlTransport;
 pub use forge::{
-    AttestationRecord, AttestationSource, ChangeFeedCursor, ChangeOrigin, ChangeRecord,
-    ChangeState, ForgeMerge,
+    AttestationRecord, AttestationSource, CAVEAT_CAS, CAVEAT_COPY_ONLY, CAVEAT_NO_PULL,
+    CAVEAT_TRUNCATED, CAVEAT_TWO_CALLS, ChangeFeedCursor, ChangeOrigin, ChangeRecord, ChangeSource,
+    ChangeState, ForgeMerge, MAX_PULL_BODY_CHARS, TRUNCATED_NOTICE, pull_body,
 };
 pub use host::GitHubHost;
 pub use transport::{Method, Request, Response, Transport, TransportError};

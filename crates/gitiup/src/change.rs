@@ -100,8 +100,7 @@ use std::process::Command;
 use gitiup_attest::{AttestationDoc, TimeUs};
 use gitiup_host::change::{self, AttemptInfo, ChangeId, ChangeRecord, State, StoredRecord};
 use gitiup_host::{
-    Actor, Config, CredentialProfile, Host, HostKind, Namespace, Oid, PackFormat, PackRequest,
-    RefName, RefQuery, RemoteConfig,
+    Actor, Config, Host, HostKind, Namespace, Oid, PackFormat, PackRequest, RefName, RefQuery,
 };
 use gitiup_quorum::round::Round;
 use gitiup_quorum::store as qstore;
@@ -112,6 +111,7 @@ use crate::CliError;
 use crate::attest::{rfc3339, short};
 use crate::keys::{self, Args};
 use crate::participant::{self, Opened};
+use crate::remotes;
 
 /// Help for `gitiup change`.
 pub const CHANGE_HELP: &str = "\
@@ -172,6 +172,27 @@ submit — publish one attempt:
                              store already holds them
     --out <path|->           also write the exact bytes that were published
 
+submit — on a forge remote (a github remote, with the hosts-github feature):
+    --pull <number>          in new/submit: sign the record as carried by that pull request,
+                             so the change's own bytes say the forge merges it. The number
+                             is signed, so it has to be known before the record is; a change
+                             submitted without it is matched to its pull by head commit
+    --pull-branch <name>     which forge branch to open the pull request from. The forge will
+                             open a pull from a branch and from nothing else, and
+                             refs/changes/** is not one: with no branch over the change head
+                             the forge is not asked, and that is printed
+    --no-pull                file the change and do not ask the forge to carry it. The change
+                             is then listed as one with no pull request (`source: ref`),
+                             which is a state a forge can be in and not a failure
+    --draft                  open the pull request as a draft
+
+A forge is asked after the store has the change, and that is two calls rather than one
+transaction: a change whose refs are filed and whose pull was not opened exists, is listed
+as such, and is merged with the store's compare-and-swap because that is all there is. The
+second call failing does not un-publish the first, does not exit non-zero for that reason,
+and is printed as its own line (`pull not opened` plus the forge's reason) rather than left
+for a reader to infer from a silence.
+
 submit — the quorum rounds a published change needs:
     --no-quorum              publish without opening any round, even when the store's
                              published policy demands a quorum. The change then cannot
@@ -202,14 +223,26 @@ list — every change the store advertises:
     --state <state>          open (default), merged, abandoned or all
     --json                   one line, sorted keys: per change its id, state, attempts,
                              head, base, whether the base is still what the store has,
-                             author, title and both digests
+                             author, title and both digests — and, against a forge remote,
+                             `source` (ref · pull · both), `pull`, `url`, `copy_truncated`
+                             and the forge's `caveats`
+
+A forge answers `list` from two databases and says which one each row came from: a change
+the store holds and the forge has no pull for is `source: ref`; a pull request with no
+gitiup record behind it is `source: pull`, is listed and labelled (no signature covers it,
+and nothing in it can be checked against the store), and is never skipped. Neither row is
+the other's error.
 
 show — one change, read back through the ref that advertises it:
-    ID                       a change id or any unambiguous prefix of its hex (>= 4)
+    ID                       a change id or any unambiguous prefix of its hex (>= 4), or,
+                             against a forge remote, `gh-<n>` for a pull request the store
+                             holds no record of (shown as the forge's answer, labelled)
     --attempt <n>            show attempt n rather than the current one
     --bytes                  the exact stored bytes, and nothing else
     --json                   the record, its digests, its signature, the attempt chain,
-                             and the merge/abandon record if the change has one
+                             the merge/abandon record if the change has one, and — on a
+                             forge — the pull that carries it and what the forge cannot
+                             promise about it
 
 checkout — fetch one change, and its proofs, into a clone:
     ID                       the change to fetch (id, or 4+ hex of one)
@@ -305,6 +338,8 @@ const SWITCHES: &[&str] = &[
     "--no-objects",
     "--new-attempt",
     "--no-quorum",
+    "--no-pull",
+    "--draft",
     "--explain",
     "--bytes",
     "--dry-run",
@@ -338,6 +373,8 @@ const VALUED: &[&str] = &[
     "--via",
     "--landed",
     "--merge-method",
+    "--pull",
+    "--pull-branch",
     "--selector",
     "--seed-file",
     "--trust",
@@ -1303,7 +1340,21 @@ fn draft(args: &Args, store: Option<&Opened>) -> Result<Draft, CliError> {
         change_id,
         created_at_us: TimeUs::now().as_us(),
         head,
-        origin: change::Origin::store(),
+        origin: match args.get("--pull") {
+            // A signed claim, not a lookup: the number has to be known before the record is
+            // signed, because it is part of what the signature covers. A change opened
+            // without it is matched to its pull by head commit instead, which is a fact
+            // about oids and can change under nobody's feet.
+            Some(text) => change::Origin::pull(
+                text.trim()
+                    .trim_start_matches("gh-")
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        CliError::usage(format!("--pull '{text}' is not a pull request number"))
+                    })?,
+            ),
+            None => change::Origin::store(),
+        },
         schema_version: change::SCHEMA_VERSION,
         signatures: Vec::new(),
         title,
@@ -1705,6 +1756,12 @@ fn submit(args: &Args) -> Result<(), CliError> {
     // the volunteers it needs (giti-zp1.1). Each one is read back and re-derived here before
     // this command is allowed to say it succeeded.
     quorum.publish(&store)?;
+    // A forge is asked to carry the change *after* the store has it, and that is two calls
+    // and not one transaction: the second can fail on its own terms without undoing the
+    // first. So this reports what happened instead of pretending the pair is atomic — a
+    // change with a ref and no pull is a state a forge can be in, and `change list`
+    // labels it rather than hiding it.
+    let carried = carry_on_forge(args, forge_remote(args)?.as_ref(), &record)?;
     let catalog = change::list_changes(&*store.host).map_err(|e| host_error("read it back", e))?;
     let state = catalog
         .changes
@@ -1764,6 +1821,10 @@ fn submit(args: &Args) -> Result<(), CliError> {
             "quorum": quorum.json(),
             "note": refitted,
             "other_open_by_same_author": siblings,
+            "pull": carried
+                .as_ref()
+                .map(Carried::json)
+                .unwrap_or(Value::Null),
         }));
         return Ok(());
     }
@@ -1830,6 +1891,9 @@ fn submit(args: &Args) -> Result<(), CliError> {
         short_id(&record.change_digest().unwrap_or_default()),
         short_id(&tagged(published.record_digest))
     );
+    if let Some(carried) = &carried {
+        carried.text();
+    }
     quorum.text();
     if let Some(note) = &refitted {
         eprintln!("note: {note}");
@@ -2161,16 +2225,20 @@ fn merge(args: &Args) -> Result<(), CliError> {
     // ref write a bucket is only ever imitating (ADR-0003 D10). `--json` says which
     // kind of merge happened, because they are not the same promise.
     let forge = forge_remote(args)?;
-    let on_forge = forge.zip(
-        (record.origin.kind == change::OriginKind::Pull)
-            .then_some(record.origin.number)
-            .flatten(),
-    );
-    if let Some((forge, number)) = on_forge {
+    if let Some(number) = carrying_pull(forge.as_ref(), &record)? {
+        let Some(handle) = forge.as_ref() else {
+            return Err(CliError::refused(
+                format!(
+                    "{} is carried by pull request {number}, but no forge remote was named",
+                    record.change_id
+                ),
+                "the forge's merge is the only merge a carried change has (--remote <name>)",
+            ));
+        };
         if args.on("--dry-run") {
             return print_forge_plan(&store, args, &record, &plan, number, &proofs);
         }
-        let outcome = merge_on_forge(&store, args, &plan, request.via_forge(), number, &forge)?;
+        let outcome = merge_on_forge(&store, args, &plan, request.via_forge(), number, handle)?;
         return print_outcome(&store, &record, &outcome, &who, args.json(), Some(number));
     }
     if args.on("--dry-run") {
@@ -2191,10 +2259,34 @@ fn merge(args: &Args) -> Result<(), CliError> {
 
 /// A forge and the credentials it asked for, kept together so the forge path reads as one
 /// thing rather than two tuple elements passed side by side.
-#[derive(Clone)]
-struct RemoteAndProfile {
-    remote: RemoteConfig,
-    profile: Option<CredentialProfile>,
+///
+/// Only a `gitiup.toml` remote can be a forge — `--store` names a directory — and the
+/// classification is the composition root's, so nothing in this file knows what a forge
+/// *is*; it only knows that some remotes have a merge button, a pull-request database and
+/// branches a pull can be opened from, and some do not.
+fn forge_remote(args: &Args) -> Result<Option<remotes::Forge>, CliError> {
+    let named = match args.get("--remote") {
+        Some(name) => name.to_string(),
+        None => return Ok(None),
+    };
+    let Some((_path, config)) =
+        Config::load_default().map_err(|e| CliError::io(format!("gitiup.toml: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let remote = config.remote_or_default(Some(&named)).map_err(|e| {
+        CliError::refused(
+            format!("gitiup.toml: {e}"),
+            "name a remote that exists, or use --store <dir>",
+        )
+    })?;
+    if !crate::remotes::wants_forge(remote) {
+        return Ok(None);
+    }
+    Ok(Some(remotes::Forge::new(
+        remote,
+        config.credential_profile(remote),
+    )))
 }
 
 /// What a merge did, in whichever form was asked for.
@@ -2409,37 +2501,53 @@ fn spell_oid(oid: &Oid, record: &ChangeRecord) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// the forge's own merge (ADR-0003 D10)
+// the forge's own merge, and its own change list (ADR-0003 D10)
 // ---------------------------------------------------------------------------
 
-/// The forge a named `--remote` points at, with the credentials it wants.
+/// Which pull request carries this change, which is what decides which merge runs.
 ///
-/// Only a `gitiup.toml` remote can be a forge — `--store` names a directory — and the
-/// classification is the composition root's, so nothing in this file knows what a forge
-/// *is*; it only knows that some remotes have a merge button and some do not.
-fn forge_remote(args: &Args) -> Result<Option<RemoteAndProfile>, CliError> {
-    let named = match args.get("--remote") {
-        Some(name) => name.to_string(),
-        None => return Ok(None),
-    };
-    let Some((_path, config)) =
-        Config::load_default().map_err(|e| CliError::io(format!("gitiup.toml: {e}")))?
-    else {
+/// There are two ways to know, and they are not equally good. The record can *say*: a
+/// `origin: Pull { number }` is signed, so it outranks any lookup. Otherwise the forge is
+/// asked which of its open pulls proposes this very commit, and exactly one answer is the
+/// only one gitiup will act on — two pulls over one head is somebody's ambiguity to
+/// resolve, not a coin this tool gets to flip.
+fn carrying_pull(
+    forge: Option<&remotes::Forge>,
+    record: &ChangeRecord,
+) -> Result<Option<u64>, CliError> {
+    if record.origin.kind == change::OriginKind::Pull {
+        // The signed claim stands whether or not a forge was named; the caller refuses the
+        // second case, because there is nothing to ask.
+        return Ok(record.origin.number);
+    }
+    let Some(forge) = forge else {
         return Ok(None);
     };
-    let remote = config.remote_or_default(Some(&named)).map_err(|e| {
+    let head = Oid::from_hex(oid_hex(&record.head)).map_err(|e| {
         CliError::refused(
-            format!("gitiup.toml: {e}"),
-            "name a remote that exists, or use --store <dir>",
+            format!("{}'s head is not an oid: {e}", record.change_id),
+            "a pull request is matched to a change by the commit it proposes",
         )
     })?;
-    if !crate::remotes::wants_forge(remote) {
-        return Ok(None);
+    let found = forge.open_pulls_at(&head)?;
+    match found.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(one.pull()),
+        many => Err(CliError::refused(
+            format!(
+                "{}'s head is proposed by {} open pulls: {}",
+                record.change_id,
+                many.len(),
+                many.iter()
+                    .filter_map(|change| change.pull())
+                    .map(|number| number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "gitiup will not guess which of them is the one that merges: say which change \
+             you mean by drafting its record with --pull <number>, or close the other",
+        )),
     }
-    Ok(Some(RemoteAndProfile {
-        remote: remote.clone(),
-        profile: config.credential_profile(remote).cloned(),
-    }))
 }
 
 /// Ask the forge to merge its own change, then write the record of what it did.
@@ -2453,21 +2561,260 @@ fn merge_on_forge(
     plan: &change::MergePlan,
     mut request: change::MergeRequest<'_>,
     number: u64,
-    forge: &RemoteAndProfile,
+    forge: &remotes::Forge,
 ) -> Result<change::MergeOutcome, CliError> {
-    let landing = crate::remotes::forge_merge(
-        &forge.remote,
-        forge.profile.as_ref(),
-        number,
-        &plan.to,
-        &merge_method(args)?,
-    )?;
+    let landing = forge.merge(number, &plan.to, &merge_method(args)?)?;
     // gitiup did not move the branch; the forge did, to a commit no attestation can cover
     // unless the forge fast-forwarded. So the record is a reconcile with `via: forge`, and
     // it names the commit the store now holds rather than the one a fast-forward would
     // have written (ADR-0003 D10).
     request = request.via_forge().with_landing(landing);
     change::record_merge(&*store.host, &request).map_err(store_refusal)
+}
+
+/// What a forge said when it was asked to carry a change.
+///
+/// Three answers are possible and all three are printed: it opened one, it already had
+/// one, or it was not asked / could not / refused. The last is not a failed submit — the
+/// change is in the store, which is the part that carries the signature — but it is not a
+/// success either, and a silent line about a pull request that does not exist would be
+/// both.
+struct Carried {
+    change: Option<remotes::ForgeChange>,
+    note: Option<String>,
+}
+
+impl Carried {
+    /// Nothing was opened, and the reason is said.
+    fn without(note: impl Into<String>) -> Carried {
+        Carried {
+            change: None,
+            note: Some(note.into()),
+        }
+    }
+
+    fn json(&self) -> Value {
+        match (&self.change, &self.note) {
+            (Some(change), None) => change.json(),
+            (Some(change), Some(note)) => {
+                let mut value = change.json();
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("note".to_string(), json!(note));
+                }
+                value
+            }
+            (None, Some(note)) => json!({ "opened": false, "note": note }),
+            (None, None) => Value::Null,
+        }
+    }
+
+    fn text(&self) {
+        match (&self.change, &self.note) {
+            (Some(change), None) => println!(
+                "  pull     {} · {} · [source: {}]{}",
+                change.id,
+                change.state,
+                change.source,
+                change
+                    .url
+                    .as_deref()
+                    .map(|url| format!(" · {url}"))
+                    .unwrap_or_default()
+            ),
+            (Some(change), Some(note)) => {
+                println!(
+                    "  pull     {} · {} · [source: {}]",
+                    change.id, change.state, change.source
+                );
+                eprintln!("note: {note}");
+            }
+            (None, Some(note)) => {
+                println!("  pull     not opened");
+                eprintln!("note: {note}");
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+/// Ask a forge to carry a change the store already holds, and report what it answered.
+///
+/// This is the second of two calls, and the first is not undoable: the change is in the
+/// store before the forge is asked, and nothing here takes that back. So every way this
+/// can end without a pull request is reported as itself — not asked, could not tell which
+/// branch, the forge refused — and the command still exits with the code for "the change
+/// is published", because that is the truth of it. A change with a ref and no pull is a
+/// state a forge can be in: `change list` labels it, and `change merge` merges it with the
+/// store's CAS because that is all there is.
+fn carry_on_forge(
+    args: &Args,
+    forge: Option<&remotes::Forge>,
+    record: &ChangeRecord,
+) -> Result<Option<Carried>, CliError> {
+    let Some(forge) = forge else {
+        return Ok(None);
+    };
+    if args.on("--no-pull") {
+        return Ok(Some(Carried::without(
+            "--no-pull: the change is filed and the forge was not asked to carry it, so it \
+             will be listed as a change with no pull request",
+        )));
+    }
+    let head = Oid::from_hex(oid_hex(&record.head)).map_err(|e| {
+        CliError::refused(
+            format!("{}'s head is not an oid: {e}", record.change_id),
+            "a pull request is opened over a commit, so the head has to be one",
+        )
+    })?;
+    if let change::OriginKind::Pull = record.origin.kind {
+        // The claim outranks any lookup, because it is inside what the author signed, so
+        // nothing is opened. But a claim about a pull the forge does not have is worth
+        // saying while there is still time to fix it: the merge will otherwise chase a pull
+        // that is not there, and "the record said so" is a poor thing to say then.
+        let claimed = record.origin.number;
+        let carried = claimed.is_some_and(|number| {
+            forge
+                .open_pulls_at(&head)
+                .map(|found| found.iter().any(|change| change.pull() == Some(number)))
+                .unwrap_or(false)
+        });
+        let claimed = claimed
+            .map(|number| number.to_string())
+            .unwrap_or_else(|| "(no number given)".to_string());
+        return Ok(Some(Carried::without(if carried {
+            format!(
+                "the record says it is carried by pull request {claimed}, so the forge was \
+                 not asked to open a second one: a new attempt moves that pull's branch, it \
+                 does not open another pull"
+            )
+        } else {
+            format!(
+                "the record claims pull request {claimed}, and the forge has no open pull over \
+                 this commit to carry it: the claim is in the signed record and stays there, \
+                 but `change merge` will look for that pull and not find it"
+            )
+        })));
+    }
+    // A re-submit is not a new proposal. If the forge already has open pulls over this
+    // commit, that is the answer, and opening another would be the tool making work for a
+    // reviewer — one pull or three, the answer is the same, and with more than one the note
+    // says so because which of them merges is still somebody's decision.
+    let carrying = forge.open_pulls_at(&head)?;
+    if let Some((first, rest)) = carrying.split_first() {
+        let mut carried = first.clone();
+        // The adapter saw pulls and no ref it could match to them; the command line knows
+        // better, because it is holding the record whose head this is.
+        carried.source = "both";
+        let numbers = carrying
+            .iter()
+            .filter_map(|change| change.pull())
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>();
+        return Ok(Some(Carried {
+            change: Some(carried),
+            note: Some(if rest.is_empty() {
+                "the forge already has an open pull over this commit, so no second one was \
+                 opened"
+                    .to_string()
+            } else {
+                format!(
+                    "the forge already has {} open pulls over this commit ({}), so none was \
+                     opened; which of them is the one that merges is not gitiup's to guess",
+                    carrying.len(),
+                    numbers.join(", ")
+                )
+            }),
+        }));
+    }
+    let branch = match args.get("--pull-branch") {
+        Some(named) => Some(named.to_string()),
+        None => match forge.branches_at(&head)?.as_slice() {
+            [only] => Some(only.clone()),
+            [] => None,
+            many => {
+                return Ok(Some(Carried::without(format!(
+                    "{} of the forge's branches point at this head ({}), so which one a pull \
+                     request comes from is a decision and not a lookup — name it with  --pull-branch",
+                    many.len(),
+                    many.join(", ")
+                ))));
+            }
+        },
+    };
+    let Some(branch) = branch else {
+        return Ok(Some(Carried::without(format!(
+            "the forge has no branch pointing at {} — a pull request has to be opened from a \
+             branch, and `refs/changes/**` is not one. Push the commit (`git push <remote> {}:refs/heads/<branch>`), then re-run this submit: the attempt is already filed, so it will answer `already`, and the pull opens. Until then the change is listed as one with no pull request",
+            short_id(&record.head),
+            record.head
+        ))));
+    };
+    let opened = forge.open_change(
+        &record.title,
+        &branch,
+        &forge_branch(&record.base.branch),
+        &pull_request_body(record),
+        args.on("--draft"),
+    );
+    Ok(Some(match opened {
+        Ok(change) => Carried {
+            change: Some(change),
+            note: None,
+        },
+        Err(why) => Carried::without(format!(
+            "the change is filed; the forge would not open the pull request ({})",
+            why.message
+        )),
+    }))
+}
+
+/// A change's base branch as the forge names it (`refs/heads/main` is `main` there).
+fn forge_branch(name: &str) -> String {
+    name.replace("refs/heads/", "").to_string()
+}
+
+/// The forge's copy of a change: enough to read, and the bytes a reviewer can hash.
+///
+/// The copy is a copy and says so. What a signature covers is the record in the store, and
+/// this is what makes it acceptable for the forge to cut the copy short when it is over
+/// the forge's own limit ([`remotes`]' adapter truncates it and reports
+/// `copy_truncated`) — a truncated discussion loses the discussion, not the proof.
+fn pull_request_body(record: &ChangeRecord) -> String {
+    let bytes = record
+        .canonical_bytes()
+        .unwrap_or_else(|_| record.title.as_bytes().to_vec());
+    format!(
+        "Proposed with gitiup: change `{}`, attempt {}.\n\
+         \n\
+         head  {}\n\
+         base  {} @ {}\n\
+         jobs  {}\n\
+         author {} ({})\n\
+         \n\
+         The signed bytes of record are in the store, advertised by the change's own ref;\n\
+         the block below is a copy of them, so a reviewer can hash what they are reading.\n\
+         `gitiup change show {}` prints the record as the store returns it, and\n\
+         `gitiup change checkout {}` fetches it with its proofs.\n\
+         \n\
+         ```json\n\
+         {}\n\
+         ```\n",
+        record.change_id,
+        record.attempts.index,
+        record.head,
+        record.base.branch,
+        record.base.oid,
+        if record.workflow.jobs.is_empty() {
+            "(none requested)".to_string()
+        } else {
+            record.workflow.jobs.join(", ")
+        },
+        record.author.key_id,
+        record.author.principal,
+        record.change_id,
+        record.change_id,
+        String::from_utf8_lossy(&bytes),
+    )
 }
 
 /// `--merge-method`, in the words the forge uses.
@@ -2560,6 +2907,8 @@ struct Parsed {
     change_digest: String,
     record_digest: String,
     size: u64,
+    /// The pull request the record itself claims to be carried by, if it said so.
+    pull: Option<u64>,
 }
 
 struct Row {
@@ -2621,6 +2970,9 @@ fn rows(store: &dyn Host, catalog: &change::Catalog) -> Result<Vec<Row>, CliErro
                 change_digest: record.change_digest().unwrap_or_default(),
                 record_digest: record_digest(&record),
                 size: bytes.len() as u64,
+                pull: (record.origin.kind == change::OriginKind::Pull)
+                    .then_some(record.origin.number)
+                    .flatten(),
             }),
             None => Err(CliError::refused(
                 format!("{} has no record to read", summary.change_id),
@@ -2677,6 +3029,7 @@ fn list(args: &Args) -> Result<(), CliError> {
         return Ok(());
     }
     let store = read_store(args)?;
+    let forge = forge_remote(args)?;
     let filter: Option<State> = match args.get("--state").unwrap_or("open") {
         "open" => Some(State::Open),
         "merged" => Some(State::Merged),
@@ -2690,19 +3043,47 @@ fn list(args: &Args) -> Result<(), CliError> {
     };
     let catalog = change::list_changes(&*store.host).map_err(|e| host_error("list changes", e))?;
     let all = rows(&*store.host, &catalog)?;
-    let shown: Vec<&Row> = all
+    // What the forge carries, asked once. A bucket never gets asked, which is why every
+    // forge field below is optional rather than empty: the question was not put.
+    let carried: Vec<remotes::ForgeChange> = match &forge {
+        Some(handle) => handle.changes("all")?,
+        None => Vec::new(),
+    };
+    let mut shown: Vec<Listing> = all
         .iter()
-        .filter(|row| filter.is_none_or(|state| row.summary.state == state))
+        .map(|row| Listing::Stored(row, pairing(&carried, row)))
         .collect();
+    // A pull the listing already paired with a store row is that row's `both`, not a second
+    // row: the same change seen from two databases must read as one line, and the adapter
+    // cannot make that call alone because only the store's record knows the commit under
+    // the ref it advertises.
+    let paired: BTreeSet<String> = shown
+        .iter()
+        .filter_map(|row| match row {
+            Listing::Stored(_, Some(change)) => Some(change.id.clone()),
+            Listing::Stored(_, None) | Listing::Unrecorded(_) => None,
+        })
+        .collect();
+    shown.extend(
+        carried
+            .iter()
+            .filter(|change| change.source == "pull" && !paired.contains(&change.id))
+            .map(Listing::Unrecorded),
+    );
+    shown.sort_by(|a, b| b.stamp().cmp(&a.stamp()).then_with(|| a.id().cmp(&b.id())));
+    let shown: Vec<&Listing> = shown.iter().filter(|row| row.shows(filter)).collect();
 
     if args.json() {
-        let changes: Vec<Value> = shown.iter().map(|row| row_json(row)).collect();
+        let changes: Vec<Value> = shown.iter().map(|row| row.json()).collect();
         print_json(json!({
             "store": store.what,
             "state": args.get("--state").unwrap_or("open"),
             "count": changes.len(),
             "changes": changes,
             "unexpected_refs": catalog.unexpected,
+            // Said out loud, because "the store has no changes" and "nobody asked the
+            // forge" look identical otherwise.
+            "forge": forge.as_ref().map(|_| json!({"asked": true, "rows": carried.len()})),
         }));
         return Ok(());
     }
@@ -2714,36 +3095,24 @@ fn list(args: &Args) -> Result<(), CliError> {
         );
     }
     for row in &shown {
-        let summary = &row.summary;
-        match &row.detail {
-            Ok(parsed) => println!(
-                "{}  {:<9} a{:<3} {:<20} {:<14} {}{}",
-                summary.change_id,
-                summary.state.as_str(),
-                summary.attempts.len(),
-                short_id(&parsed.head),
-                short(&parsed.author.key_id),
-                clip(&parsed.title, 48),
-                if parsed.base_check == "stale" {
-                    "  [stale base]"
-                } else {
-                    ""
-                }
-            ),
-            Err(error) => println!(
-                "{}  {:<9} UNREADABLE  {}",
-                summary.change_id,
-                summary.state.as_str(),
-                error.message
-            ),
-        }
-        if !summary.head_tracks_newest {
+        println!("{}", row.text());
+        if let Listing::Stored(row, _) = row
+            && !row.summary.head_tracks_newest
+        {
             eprintln!(
                 "note: {}'s head ref is behind its newest attempt — a submit died between \
                  the two writes; re-running that submit finishes it (ADR-0003 D6)",
-                summary.change_id
+                row.summary.change_id
             );
         }
+    }
+    if shown
+        .iter()
+        .any(|row| matches!(row, Listing::Unrecorded(_)))
+    {
+        eprintln!(
+            "note: a row above is a pull request with no gitiup record behind it (`source: pull`): a title and a body the forge holds, signed by nobody. Nothing about it can be verified from the store, and `change merge` will not merge it"
+        );
     }
     for name in &catalog.unexpected {
         eprintln!("note: {name} is in the change namespace but not this layout");
@@ -2751,11 +3120,31 @@ fn list(args: &Args) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The forge's row that is the same change as this one, if a forge was asked at all.
+///
+/// Two tests, in order of how much they can be trusted: the record can name the pull it
+/// was signed as (`origin: Pull`), which is a claim the signature covers; or the forge's
+/// pull and the store's change can propose the same commit, which is a fact about oids and
+/// nothing else. No third test is invented — a title match would be a guess dressed up as
+/// a join.
+fn pairing<'a>(carried: &'a [remotes::ForgeChange], row: &Row) -> Option<&'a remotes::ForgeChange> {
+    let Ok(parsed) = row.detail.as_ref() else {
+        return None;
+    };
+    carried.iter().find(|change| {
+        parsed
+            .pull
+            .is_some_and(|number| change.pull() == Some(number))
+            || change.head.as_deref() == Some(oid_hex(&parsed.head))
+    })
+}
+
 fn row_json(row: &Row) -> Value {
     let summary = &row.summary;
     let base = json!({
         "change": summary.change_id.as_str(),
         "state": summary.state.as_str(),
+        "recorded": true,
         "attempts": summary.attempts,
         "head_digest": summary.head.map(tagged),
         "head_tracks_newest": summary.head_tracks_newest,
@@ -2794,15 +3183,259 @@ fn row_json(row: &Row) -> Value {
     Value::Object(out)
 }
 
+/// The same row, plus what a forge said about it (`None` when no forge was asked, which is
+/// the bucket case and the reason the field is optional rather than empty).
+fn row_json_carried(row: &Row, carried: Option<&remotes::ForgeChange>) -> Value {
+    let mut value = row_json(row);
+    forge_fields(&mut value, carried);
+    value
+}
+
+/// Add the forge's fields to a row: which database it came from, whether a pull request
+/// carries it, and what the forge cannot promise about it.
+///
+/// A store-backed row with no pull is `source: ref`, and that is stated rather than left
+/// as an absence: on a forge the question was asked, and "no" is the answer.
+fn forge_fields(value: &mut Value, carried: Option<&remotes::ForgeChange>) {
+    let (source, pull, url, truncated) = match carried {
+        Some(change) => (
+            "both",
+            json!(change.pull()),
+            json!(change.url.clone()),
+            json!(change.copy_truncated),
+        ),
+        None => ("ref", Value::Null, Value::Null, json!(false)),
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.insert("source".to_string(), json!(source));
+        map.insert("pull".to_string(), pull);
+        map.insert("url".to_string(), url);
+        map.insert("copy_truncated".to_string(), truncated.clone());
+        map.insert(
+            "caveats".to_string(),
+            json!(remotes::caveats(
+                source,
+                truncated.as_bool().unwrap_or(false)
+            )),
+        );
+    }
+}
+
+/// The forge's own row as JSON, for a pull request with no gitiup record behind it.
+fn unrecorded_json(change: &remotes::ForgeChange) -> Value {
+    let mut value = change.json();
+    if let Some(map) = value.as_object_mut() {
+        map.insert("recorded".to_string(), json!(false));
+        map.insert("attempts".to_string(), json!(Vec::<u32>::new()));
+        map.insert(
+            "error".to_string(),
+            json!(
+                "no gitiup record is behind this change: the forge's pull database is the \
+                 only thing describing it, and nothing in it is signed"
+            ),
+        );
+    }
+    value
+}
+
+/// One line of `gitiup change list`.
+enum Listing<'a> {
+    /// A change the store's own refs advertise, and what the forge says about it when a
+    /// forge was asked.
+    Stored(&'a Row, Option<&'a remotes::ForgeChange>),
+    /// A change only the forge knows about. Listed and labelled: silently skipping it is
+    /// how "there is nothing here" becomes a lie.
+    Unrecorded(&'a remotes::ForgeChange),
+}
+
+impl Listing<'_> {
+    /// The change's name, whichever database it came from.
+    fn id(&self) -> String {
+        match self {
+            Listing::Stored(row, _) => row.summary.change_id.as_str().to_string(),
+            Listing::Unrecorded(change) => change.id.clone(),
+        }
+    }
+
+    /// Its state, in the one vocabulary the listing uses.
+    fn state(&self) -> &'static str {
+        match self {
+            Listing::Stored(row, _) => row.summary.state.as_str(),
+            Listing::Unrecorded(change) => change.state,
+        }
+    }
+
+    /// Whether `--state` keeps this row.
+    fn shows(&self, filter: Option<State>) -> bool {
+        let state = match self.state() {
+            "merged" => State::Merged,
+            "closed" | "abandoned" => State::Abandoned,
+            _ => State::Open,
+        };
+        filter.is_none_or(|wanted| wanted == state)
+    }
+
+    /// What to sort by: newest first, and a row with no timestamp last.
+    fn stamp(&self) -> i64 {
+        match self {
+            Listing::Stored(row, _) => match &row.detail {
+                Ok(parsed) => parsed.created_at_us / 1_000_000,
+                Err(_) => row
+                    .summary
+                    .updated_at
+                    .map(|at| at.as_unix() as i64)
+                    .unwrap_or(0),
+            },
+            Listing::Unrecorded(change) => change.updated_at.map(|at| at as i64).unwrap_or(0),
+        }
+    }
+
+    fn json(&self) -> Value {
+        match self {
+            Listing::Stored(row, carried) => row_json_carried(row, *carried),
+            Listing::Unrecorded(change) => unrecorded_json(change),
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Listing::Stored(row, carried) => {
+                let summary = &row.summary;
+                match &row.detail {
+                    Ok(parsed) => format!(
+                        "{}  {:<9} a{:<3} {:<20} {:<14} {}{}{}",
+                        summary.change_id,
+                        summary.state.as_str(),
+                        summary.attempts.len(),
+                        short_id(&parsed.head),
+                        short(&parsed.author.key_id),
+                        clip(&parsed.title, 48),
+                        if parsed.base_check == "stale" {
+                            "  [stale base]"
+                        } else {
+                            ""
+                        },
+                        carried_mark(*carried),
+                    ),
+                    Err(error) => format!(
+                        "{}  {:<9} UNREADABLE  {}{}",
+                        summary.change_id,
+                        summary.state.as_str(),
+                        error.message,
+                        carried_mark(*carried)
+                    ),
+                }
+            }
+            Listing::Unrecorded(change) => format!(
+                "{:<16}  {:<9} {:<5} {:<20} {:<14} {}  [{}{}]",
+                change.id,
+                change.state,
+                "-",
+                change
+                    .head
+                    .as_deref()
+                    .map(short_id)
+                    .unwrap_or_else(|| "-".to_string()),
+                change.author.as_deref().unwrap_or("-"),
+                clip(&change.title, 48),
+                if change.copy_truncated {
+                    "copy truncated, "
+                } else {
+                    ""
+                },
+                "no gitiup record"
+            ),
+        }
+    }
+}
+
+/// The tag on a store-backed row that says what the forge does with it.
+fn carried_mark(carried: Option<&remotes::ForgeChange>) -> &'static str {
+    match carried {
+        Some(change) if change.copy_truncated => "  [pull, copy truncated]",
+        Some(_) => "  [pull]",
+        None => "",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // show
 // ---------------------------------------------------------------------------
+
+/// Show the forge's answer about a change the store has no record for.
+///
+/// This is a listing of what the forge holds, printed rather than refused: "no such
+/// change" is the wrong answer about something plainly there, and printing it without the
+/// label would be the other wrong answer. Nothing on this page can be checked against the
+/// store, says so, and exits 0 like any other listing.
+fn show_unrecorded(
+    store: &Opened,
+    change: &remotes::ForgeChange,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        print_json(unrecorded_json(change));
+        return Ok(());
+    }
+    println!("change  {}  ·  {}", change.id, change.state);
+    println!("  store     {}", store.what);
+    println!(
+        "  source    {} — the forge's pull database, and nothing else",
+        change.source
+    );
+    if let Some(head) = &change.head {
+        println!("  head      {head}");
+    }
+    if let Some(base) = &change.base {
+        println!("  base      {base}");
+    }
+    println!(
+        "  author    {}",
+        change
+            .author
+            .as_deref()
+            .unwrap_or("(the forge did not say)")
+    );
+    println!("  title     {}", change.title);
+    if let Some(url) = &change.url {
+        println!("  url       {url}");
+    }
+    if change.copy_truncated {
+        println!("  copy      the forge could not hold the whole of it (`copy_truncated`)");
+    }
+    println!("  record    none — nothing here is signed, so nothing here can be verified");
+    for caveat in &change.caveats {
+        eprintln!("note: {caveat}");
+    }
+    Ok(())
+}
+
+/// The forge row that answers a handle the store cannot: `gh-7`, or a bare `7`.
+fn forge_handle(
+    forge: Option<&remotes::Forge>,
+    handle: &str,
+) -> Result<Option<remotes::ForgeChange>, CliError> {
+    let Some(forge) = forge else {
+        return Ok(None);
+    };
+    let bare = handle.trim().to_string();
+    let numbered = bare
+        .trim_start_matches("gh-")
+        .parse::<u64>()
+        .ok()
+        .map(|number| format!("gh-{number}"));
+    Ok(forge
+        .changes("all")?
+        .into_iter()
+        .find(|change| change.id == bare || Some(change.id.clone()) == numbered))
+}
 
 fn show(args: &Args) -> Result<(), CliError> {
     if let Some(()) = args.help(CHANGE_HELP) {
         return Ok(());
     }
     let store = read_store(args)?;
+    let forge = forge_remote(args)?;
     let handle: Option<String> = args
         .positional
         .first()
@@ -2816,7 +3449,18 @@ fn show(args: &Args) -> Result<(), CliError> {
             ));
         }
     };
-    let found = resolve_handle(&*store.host, &handle)?;
+    let found = match resolve_handle(&*store.host, &handle) {
+        Ok(found) => found,
+        Err(why) => {
+            // The store does not hold it. A forge might, and "no such change" said about a
+            // change the forge is holding is not an answer worth leaving — but it is the
+            // forge's answer, labelled as one, and not a record.
+            if let Some(change) = forge_handle(forge.as_ref(), &handle)? {
+                return show_unrecorded(&store, &change, args.json());
+            }
+            return Err(why);
+        }
+    };
     let id = found.change_id.clone();
     let reference = match args.get("--attempt") {
         Some(text) => {
@@ -2849,6 +3493,25 @@ fn show(args: &Args) -> Result<(), CliError> {
         Some(_) => state_record(&*store.host, &change::abandoned_ref(&id)).ok(),
         None => None,
     };
+    // What the forge says about this change, asked once. `show` reads through the store's
+    // ref by default, and the forge's answer is an annotation on it — except when there is
+    // no ref at all, which is the case above.
+    let carried: Option<remotes::ForgeChange> = match &forge {
+        Some(handle) => {
+            let signed = (record.origin.kind == change::OriginKind::Pull)
+                .then_some(record.origin.number)
+                .flatten();
+            handle.changes("all")?.into_iter().find(|change| {
+                // Only a pull can be the answer here: the adapter also lists the store's
+                // own refs, and matching one of those by absence (`None == None`) would
+                // report a change as carried by the thing it already is.
+                change.pull().is_some()
+                    && (signed.is_some_and(|number| change.pull() == Some(number))
+                        || change.head.as_deref() == Some(oid_hex(&record.head)))
+            })
+        }
+        None => None,
+    };
 
     if args.on("--bytes") {
         std::io::stdout()
@@ -2879,6 +3542,13 @@ fn show(args: &Args) -> Result<(), CliError> {
             "title": record.title,
             "jobs": record.workflow.jobs,
             "origin": record.origin,
+            "source": if carried.is_some() { "both" } else { "ref" },
+            "pull": carried.as_ref().map(|change| change.json()),
+            "copy_truncated": carried.as_ref().map(|change| change.copy_truncated).unwrap_or(false),
+            "caveats": json!(remotes::caveats(
+                if carried.is_some() { "both" } else { "ref" },
+                carried.as_ref().map(|change| change.copy_truncated).unwrap_or(false),
+            )),
             "author": { "key_id": record.author.key_id, "principal": record.author.principal },
             "signatures": record.signatures.iter().map(|entry| json!({
                 "key_id": entry.key_id,
@@ -2931,6 +3601,28 @@ fn show(args: &Args) -> Result<(), CliError> {
         }
     );
     println!("  title     {}", record.title);
+    match &carried {
+        Some(change) => println!(
+            "  pull      {} · {} · [source: {}]{}",
+            change.id,
+            change.state,
+            // The CLI's own answer, not the adapter's: the adapter cannot see that the
+            // record behind this ref and this pull name one change, because the ref points
+            // at a record and the pull at a commit. The command line can, and says `both`.
+            if forge.is_some() { "both" } else { "ref" },
+            change
+                .url
+                .as_deref()
+                .map(|url| format!(" · {url}"))
+                .unwrap_or_default()
+        ),
+        // Said rather than left out: on a forge the question was asked, and "no" is the
+        // answer the caller needs.
+        None if forge.is_some() => {
+            println!("  pull      none — no pull request over this head [source: ref]")
+        }
+        None => {}
+    }
     println!(
         "  jobs      {}",
         if record.workflow.jobs.is_empty() {

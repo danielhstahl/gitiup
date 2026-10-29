@@ -291,12 +291,21 @@ What each one promises, in the order the promises matter:
   checks (bytes hash to the name they are filed under, the record is about the change its
   ref says, `head` names the newest attempt) happen on the way in and not as an extra
   command.
+* Against a **forge remote** (a github remote, with the `hosts-github` feature) the same
+  verbs answer, with one database more and three limits more — each reported in a field
+  rather than left to be inferred. Every row gains `source`: `ref` (the store's own, no pull
+  request), `pull` (the forge's, no gitiup record, and so nothing signed) or `both`. A pull
+  with no record is listed and labelled, never skipped, and `show gh-<n>` prints it as the
+  forge's answer. `submit` asks the forge to carry the change *after* the store has it, so a
+  change with refs and no pull is a printed outcome (`pull not opened`, and the forge's
+  reason) rather than a failure; `merge` uses the forge's merge for a change the forge
+  carries, and says `via: forge` when it did. The
+  [adapter's README](../gitiup-host-github/README.md) has the table of what a forge will not
+  promise and which field says so.
 
 The rules, the refusal table and the exit codes are in
 [docs/changes.md](../../docs/changes.md); the record format itself is
-[ADR-0003](../../docs/adr/0003-change-record-format-and-merge-semantics.md). Merging and
-checking out (`gitiup change merge`, `gitiup change checkout`) are separate tickets and
-not here yet.
+[ADR-0003](../../docs/adr/0003-change-record-format-and-merge-semantics.md).
 
 ## `gitiup verify attestation`
 

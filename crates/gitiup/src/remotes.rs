@@ -373,6 +373,265 @@ struct Opened {
     advice: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// the forge, as the change verbs need it
+// ---------------------------------------------------------------------------
+
+/// One change as a forge described it, in the command line's own words.
+///
+/// The adapter hands over a translated record; this is the same facts with the forge's
+/// type name taken off, so `change.rs` can label a listing without importing anything
+/// from a forge adapter — which is the rule `tests/no_forge_calls.rs` enforces, and the
+/// reason this struct exists rather than a re-export.
+#[derive(Debug, Clone)]
+pub struct ForgeChange {
+    /// The forge's own number, when it has one (`source: pull` or `both`).
+    pub number: Option<u64>,
+    /// How the forge names it (`gh-12`), or the change id when it came from a ref. Same
+    /// key, same meaning as a store-backed row's `change`, so one script can read either.
+    pub id: String,
+    /// Its title.
+    pub title: String,
+    /// `open`, `merged` or `closed`.
+    pub state: &'static str,
+    /// Who opened it, as the forge spells the name.
+    pub author: Option<String>,
+    /// The branch it wants to land on.
+    pub base: Option<String>,
+    /// The commit it proposes, hex.
+    pub head: Option<String>,
+    /// Where a human can look at it.
+    pub url: Option<String>,
+    /// Labels, shown as read and never interpreted.
+    pub labels: Vec<String>,
+    /// When it last moved, seconds since the epoch.
+    pub updated_at: Option<u64>,
+    /// `ref` · `pull` · `both`: which database this came from, and so whether anything
+    /// can vouch for it. A forge's `source`, spelled the same way in `--json`.
+    pub source: &'static str,
+    /// The forge could not hold the whole copy of this change.
+    pub copy_truncated: bool,
+    /// What the forge cannot promise about this change, in its own words.
+    pub caveats: Vec<String>,
+}
+
+impl ForgeChange {
+    /// The forge's number, if it has one.
+    pub fn pull(&self) -> Option<u64> {
+        self.number
+    }
+
+    /// The same facts as JSON, with the vocabulary the rest of `--json` uses.
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "change": self.id,
+            "pull": self.number,
+            "title": self.title,
+            "state": self.state,
+            "author": self.author,
+            "base": self.base,
+            "head": self.head,
+            "url": self.url,
+            "labels": self.labels,
+            "source": self.source,
+            "copy_truncated": self.copy_truncated,
+            "caveats": self.caveats,
+        })
+    }
+}
+
+/// A remote that has a merge button, opened.
+///
+/// The change verbs need exactly four things of a forge: what it carries, how to ask it
+/// to carry one, which of its branches hold a commit, and how to ask it to merge. Those
+/// four are answered here and nowhere else in the command line, so that a change verb can
+/// be forge-agnostic in fact and not only in intention. Every method refuses, naming the
+/// feature, in a build compiled without the adapter — the same answer [`classify`] gives
+/// for the remote as a whole, at the same code.
+pub struct Forge {
+    remote: RemoteConfig,
+    profile: Option<CredentialProfile>,
+}
+
+impl Forge {
+    /// A forge handle for a remote that is one.
+    pub fn new(remote: &RemoteConfig, profile: Option<&CredentialProfile>) -> Forge {
+        Forge {
+            remote: remote.clone(),
+            profile: profile.cloned(),
+        }
+    }
+}
+
+#[cfg(feature = "hosts-github")]
+impl Forge {
+    fn host(&self) -> Result<gitiup_host_github::GitHubHost, CliError> {
+        let transport = gitiup_host_github::curl::default_transport(&self.remote)
+            .map_err(|e| CliError::io(format!("remote '{}': {e}", self.remote.name)))?;
+        gitiup_host_github::GitHubHost::with_transport(
+            &self.remote,
+            transport,
+            self.profile.as_ref(),
+        )
+        .map_err(|e| CliError::io(format!("remote '{}': {e}", self.remote.name)))
+    }
+
+    /// Every change the forge and the store together know about (`all` · `open` ·
+    /// `closed`), each labelled with where it came from.
+    pub fn changes(&self, state: &str) -> Result<Vec<ForgeChange>, CliError> {
+        let host = self.host()?;
+        Ok(host
+            .changes(state)
+            .map_err(|e| store_says(&e))?
+            .into_iter()
+            .map(describe)
+            .collect())
+    }
+
+    /// Ask the forge to carry a change: open the pull request over `head_branch`.
+    pub fn open_change(
+        &self,
+        title: &str,
+        head_branch: &str,
+        base_branch: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<ForgeChange, CliError> {
+        let host = self.host()?;
+        host.open_change(title, head_branch, base_branch, body, draft)
+            .map(describe)
+            .map_err(|e| store_says(&e))
+    }
+
+    /// The forge's branches that point at `head` — the only refs it will accept as a
+    /// pull request's head.
+    pub fn branches_at(&self, head: &gitiup_host::Oid) -> Result<Vec<String>, CliError> {
+        let host = self.host()?;
+        host.branches_at(head).map_err(|e| store_says(&e))
+    }
+
+    /// The forge's open pulls that propose exactly `head`.
+    pub fn open_pulls_at(&self, head: &gitiup_host::Oid) -> Result<Vec<ForgeChange>, CliError> {
+        let host = self.host()?;
+        Ok(host
+            .open_pulls_at(head)
+            .map_err(|e| store_says(&e))?
+            .into_iter()
+            .map(describe)
+            .collect())
+    }
+
+    /// Ask the forge to merge its own change (ADR-0003 D10).
+    pub fn merge(
+        &self,
+        number: u64,
+        expect: &gitiup_host::Oid,
+        method: &str,
+    ) -> Result<gitiup_host::Oid, CliError> {
+        forge_merge(&self.remote, self.profile.as_ref(), number, expect, method)
+    }
+}
+
+#[cfg(not(feature = "hosts-github"))]
+impl Forge {
+    /// Every method answers this way in such a build: the flag to rebuild with, at the
+    /// code the rest of the tool uses for "this build cannot".
+    fn refused(&self) -> CliError {
+        CliError::refused(
+            format!(
+                "remote '{}': {}",
+                self.remote.name,
+                plain(&forge_without_adapter(&self.remote))
+            ),
+            format!("rebuild with `--features {FORGE_FEATURE}`"),
+        )
+    }
+
+    pub fn changes(&self, _state: &str) -> Result<Vec<ForgeChange>, CliError> {
+        Err(self.refused())
+    }
+
+    pub fn open_change(
+        &self,
+        _title: &str,
+        _head_branch: &str,
+        _base_branch: &str,
+        _body: &str,
+        _draft: bool,
+    ) -> Result<ForgeChange, CliError> {
+        Err(self.refused())
+    }
+
+    pub fn branches_at(&self, _head: &gitiup_host::Oid) -> Result<Vec<String>, CliError> {
+        Err(self.refused())
+    }
+
+    pub fn open_pulls_at(&self, _head: &gitiup_host::Oid) -> Result<Vec<ForgeChange>, CliError> {
+        Err(self.refused())
+    }
+
+    pub fn merge(
+        &self,
+        number: u64,
+        expect: &gitiup_host::Oid,
+        method: &str,
+    ) -> Result<gitiup_host::Oid, CliError> {
+        forge_merge(&self.remote, self.profile.as_ref(), number, expect, method)
+    }
+}
+
+/// The forge's caveats for a change it was asked about, in the adapter's own words.
+///
+/// The vocabulary is the adapter's (`CAVEAT_*`) so the words a human reads and the words
+/// the forge admits are one set, not two that drift; the *decision* about which applies is
+/// made here, because it is the command line that knows whether it also holds a record.
+#[cfg(feature = "hosts-github")]
+pub fn caveats(source: &str, copy_truncated: bool) -> Vec<String> {
+    let mut out: Vec<String> = match source {
+        "pull" => vec![gitiup_host_github::CAVEAT_COPY_ONLY.to_string()],
+        "both" => vec![gitiup_host_github::CAVEAT_TWO_CALLS.to_string()],
+        _ => vec![gitiup_host_github::CAVEAT_NO_PULL.to_string()],
+    };
+    if copy_truncated {
+        out.push(gitiup_host_github::CAVEAT_TRUNCATED.to_string());
+    }
+    out.push(gitiup_host_github::CAVEAT_CAS.to_string());
+    out
+}
+
+/// There is no forge to quote, so there is nothing for it to disclaim.
+#[cfg(not(feature = "hosts-github"))]
+pub fn caveats(_source: &str, _copy_truncated: bool) -> Vec<String> {
+    Vec::new()
+}
+
+/// The adapter's record, with the adapter's type name taken off.
+#[cfg(feature = "hosts-github")]
+fn describe(change: gitiup_host_github::forge::ChangeRecord) -> ForgeChange {
+    let caveats: Vec<String> = change.caveats().into_iter().map(str::to_string).collect();
+    let labels = change.labels.clone();
+    ForgeChange {
+        number: match change.origin {
+            gitiup_host_github::ChangeOrigin::Pull { number } => Some(number),
+            gitiup_host_github::ChangeOrigin::Ref { .. } => None,
+        },
+        id: change.id.clone(),
+        title: change.title,
+        state: change.state.as_str(),
+        author: change.author,
+        base: change
+            .base
+            .map(|name| name.as_str().trim_start_matches("refs/heads/").to_string()),
+        head: change.head.map(|oid| oid.hex()),
+        url: change.url,
+        labels,
+        updated_at: change.updated_at,
+        source: change.source.as_str(),
+        copy_truncated: change.copy_truncated,
+        caveats,
+    }
+}
+
 /// `gitiup doctor --remotes`.
 pub fn run(args: &[String]) -> Result<(), CliError> {
     let mut json = false;

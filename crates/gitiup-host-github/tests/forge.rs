@@ -14,7 +14,10 @@ use gitiup_host::{
     RefUpdate, RemoteConfig,
 };
 use gitiup_host_github::testing::MockForge;
-use gitiup_host_github::{ChangeOrigin, ChangeState, GitHubHost};
+use gitiup_host_github::{
+    CAVEAT_COPY_ONLY, CAVEAT_NO_PULL, ChangeOrigin, ChangeSource, ChangeState, GitHubHost,
+    pull_body,
+};
 
 const TOKEN_ENV: &str = "GITIUP_HOST_GITHUB_FORGE_TEST_TOKEN";
 
@@ -126,6 +129,16 @@ fn the_pull_list_and_the_change_refs_are_one_list() {
         "with no pull there is nothing for the forge to merge; landing it is the \
          host-neutral path, exactly as on a bucket"
     );
+    assert_eq!(
+        only_refs[0].source,
+        ChangeSource::Ref,
+        "a ref the forge has no pull for is its own kind of change, and says so"
+    );
+    assert!(
+        only_refs[0].caveats().contains(&CAVEAT_NO_PULL),
+        "and the row carries the reason that matters: {:?}",
+        only_refs[0].caveats()
+    );
 
     // Now the pull request for the same commit arrives.
     forge.open_pull(
@@ -142,6 +155,135 @@ fn the_pull_list_and_the_change_refs_are_one_list() {
     );
     assert_eq!(both[0].id, "gh-7", "the pull wins: it knows the state");
     assert_eq!(both[0].origin, ChangeOrigin::Pull { number: 7 });
+    assert_eq!(
+        both[0].source,
+        ChangeSource::Both,
+        "one change, two databases: the store's ref and the forge's pull"
+    );
+    assert!(
+        !both[0].caveats().contains(&CAVEAT_COPY_ONLY),
+        "a change the store holds is not merely a copy: {:?}",
+        both[0].caveats()
+    );
+}
+
+#[test]
+fn a_pull_the_store_has_no_record_for_is_a_copy_and_says_so() {
+    // The other half of the pair: the forge has a pull request and gitiup's store has
+    // nothing behind it. Listing it is the ticket; describing it as a change like the
+    // others is how a reviewer ends up trusting a title somebody typed.
+    let forge = forge();
+    let host = hosted(&forge);
+    forge.open_pull(
+        9,
+        "somebody else's proposal",
+        &head_oid(&forge, "main").hex(),
+        "2026-01-05T10:00:00Z",
+    );
+
+    let changes = host.changes("all").expect("changes");
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let change = &changes[0];
+    assert_eq!(change.id, "gh-9");
+    assert_eq!(change.source, ChangeSource::Pull);
+    assert!(change.source.is_copy_only());
+    assert!(
+        change.caveats().contains(&CAVEAT_COPY_ONLY),
+        "the row says what it is: {:?}",
+        change.caveats()
+    );
+    assert!(
+        !change.caveats().contains(&CAVEAT_NO_PULL),
+        "and not the opposite of what it is: {:?}",
+        change.caveats()
+    );
+}
+
+#[test]
+fn a_body_over_the_forge_limit_is_cut_and_says_so() {
+    // The forge truncates at its own limit; gitiup truncates first and says it did, so
+    // "the copy is not the whole thing" is a fact a caller reads instead of a detail a
+    // reviewer discovers by scrolling.
+    let (whole, truncated) = pull_body("a short body");
+    assert_eq!(whole, "a short body");
+    assert!(!truncated, "what fits is passed through unchanged");
+
+    let (cut, truncated) = pull_body(&"x".repeat(gitiup_host_github::MAX_PULL_BODY_CHARS * 2));
+    assert!(truncated, "twice the limit does not fit");
+    assert!(
+        cut.chars().count() <= gitiup_host_github::MAX_PULL_BODY_CHARS,
+        "and the result fits the limit it was cut to: {} chars",
+        cut.chars().count()
+    );
+    assert!(
+        cut.contains("cut this copy short"),
+        "the cut is visible in the copy itself"
+    );
+}
+
+#[test]
+fn opening_a_change_reports_the_copy_it_had_to_cut() {
+    let forge = forge();
+    let host = hosted(&forge);
+    let change = host
+        .open_change(
+            "A very long story",
+            "gitiup/change-long",
+            "main",
+            &"once upon a time ".repeat(8_000),
+            false,
+        )
+        .expect("the forge still takes the change");
+    assert!(
+        change.copy_truncated,
+        "the forge's limit bit, and the adapter says it instead of swallowing it"
+    );
+    assert_eq!(
+        change.source,
+        ChangeSource::Both,
+        "a change opened through the forge now exists in both databases"
+    );
+    assert!(
+        host.changes("all")
+            .expect("changes")
+            .iter()
+            .any(|found| found.id == change.id),
+        "and it is listed"
+    );
+}
+
+#[test]
+fn a_pull_is_matched_to_a_change_by_the_commit_it_proposes() {
+    // `open_pulls_at` is how a caller learns a change it already has is carried: the only
+    // fact the two databases share is the commit, so that is the join, and an ambiguous
+    // join comes back ambiguous rather than chosen.
+    let forge = forge();
+    let host = hosted(&forge);
+    let commit = head_oid(&forge, "main");
+    forge.open_pull(3, "carries it", &commit.hex(), "2026-01-05T10:00:00Z");
+    forge.open_pull(4, "also does", &commit.hex(), "2026-01-05T11:00:00Z");
+
+    let found = host.open_pulls_at(&commit).expect("pulls at that head");
+    assert_eq!(
+        found.len(),
+        2,
+        "zero, one and many are all honest answers: {found:?}"
+    );
+    let elsewhere = forge.seed_branch("other", b"different");
+    assert_eq!(
+        host.open_pulls_at(&Oid::from_hex(&elsewhere).expect("an oid"))
+            .expect("nothing at that commit")
+            .len(),
+        0,
+        "a commit no pull proposes has no pull, which is an answer"
+    );
+
+    forge.set_ref("refs/heads/feature", &commit.hex());
+    assert_eq!(
+        host.branches_at(&commit).expect("branches at that head"),
+        vec!["feature".to_string(), "main".to_string()],
+        "the forge's branches over a commit, which is what a pull can be opened from"
+    );
 }
 #[test]
 fn opening_a_change_writes_the_ref_and_asks_the_forge_to_merge_it() {

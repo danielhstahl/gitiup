@@ -473,6 +473,7 @@ vocabulary, so a forge's own nouns have to become gitiup's:
 |-------------------|---------|-------------------------------------|
 | the pull request database | `ChangeRecord`, like a bucket's `refs/changes/**` | `origin: Pull { number }`, plus base/head as `RefName`/`Oid`, never a `base.ref` string |
 | a change gitiup wrote | the same `ChangeRecord`, `origin: Ref { name }` | a pull and a ref over the same commit are one change, listed once |
+| which database a change came from | `ChangeRecord.source`: `Ref` · `Pull` · `Both` | a pull with no gitiup record behind it is `Pull` and is **listed and labelled**, not skipped — nothing in it is signed; a ref with no pull is `Ref`, which is an answer and not a failure. `copy_truncated` says when the forge could not hold the whole of it |
 | check runs, CI status | `AttestationRecord`, like `refs/attestations/<subject>/<digest>` anywhere else | `source: Store | CheckRun | Both` and `copy_truncated`: a check run's copy is an advertisement, not the bytes a signature covers |
 | webhooks, `github.event.*` | `poll_changes(cursor)` | "what is new" is one conditional read of existing state; a workflow's event context comes from the runner that started it, not from a delivery |
 | opening a change | the ref first, then the pull request | the ref is the part the contributor owns; the forge's merge is used rather than imitated |
@@ -488,13 +489,22 @@ brings the proof with the ref here too.
 **Where a forge genuinely promises less, the adapter says so** rather than
 emulating a guarantee it does not have. `capabilities()` reports
 `cas = true, immutable = true, atomic_multi_write = false`, and `advice()` — printed
-by `gitiup doctor --remotes` — states the four caveats a caller needs: a multi-ref
+by `gitiup doctor --remotes` — states the caveats a caller needs: a multi-ref
 write is applied one ref at a time with best-effort rollback (no ref transaction
 exists on the API); a CAS is checked before it is sent and verified after, and a
 *rewind* is the one move the forge will not make conditionally, which gitiup refuses
 to force silently; a delete is check-then-delete, so a write racing the delete is not
 caught; a 404 conflict is reported as a conflict without the forge's "expected value",
-because the API does not say what it had.
+because the API does not say what it had; and a change's ref and its pull request are
+two calls, so a change with refs and no pull is a state this host can be in.
+
+The same facts reach a listing as fields, because a caveat in prose is not a report a
+caller can act on: `caveats[]` on every change row, `copy_truncated` on a change or
+attestation the forge could not hold whole, and `pull not opened` with the forge's own
+reason when the second call failed. The verbs themselves are written up in
+[docs/changes.md](changes.md#against-a-forge-remote-the-same-verbs-one-database-more);
+what `gitiup` may ask of a forge is four methods on one struct
+(`src/remotes.rs::Forge`), and no forge type crosses into the command.
 
 | `[remote.options]` | meaning (default) |
 |--------------------|-------------------|
