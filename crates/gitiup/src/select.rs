@@ -849,7 +849,7 @@ fn derive(
 /// — will not hand it out. The explicit alternative is a delegated selector with its own
 /// 32-byte secret, which is what `--seed-file` is for and what the ADR allows for a selector
 /// who is not the roster signer.
-fn selection_secret(
+pub(crate) fn selection_secret(
     args: &Args,
     selector: &gitiup_keys::signer::Key,
 ) -> Result<SelectionSecret, CliError> {
@@ -873,7 +873,7 @@ fn selection_secret(
 }
 
 /// 32 raw bytes, or 64 hex characters, from a file or a pipe.
-fn read_secret_file(path: &str) -> Result<SelectionSecret, CliError> {
+pub(crate) fn read_secret_file(path: &str) -> Result<SelectionSecret, CliError> {
     let bytes = read_maybe_stdin(path)?;
     secret_from_bytes(&bytes).map_err(|error| {
         CliError::refused(

@@ -19,7 +19,8 @@
 //!                                      says are old
 //! gitiup change new|submit|list|show     propose work to any host: draft a signed
 //!                                      change from local commits, publish it as an
-//!                                      attempt, and read it back
+//!                                      attempt, and read it back. `submit` also opens the
+//!                                      quorum rounds the store's published policy asks for
 //! gitiup verify attestation [DOC]       may this attestation be acted on? one exit
 //!                                      code (0/6/7/8) and a report of every check
 //! gitiup verify change <ID>             may this change merge? every attestation its
@@ -62,6 +63,7 @@ mod keys;
 mod normalise;
 mod participant;
 mod policy;
+mod quorum;
 mod remotes;
 mod run;
 mod select;
@@ -83,7 +85,8 @@ COMMANDS:
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc
     change new [OPTIONS]           draft a signed change record from local commits
-    change submit [OPTIONS]        publish one attempt of it to the store you name
+    change submit [OPTIONS]        publish one attempt of it to the store you name, and
+                                   open the quorum rounds its published policy demands
     change list [OPTIONS]          the changes a store advertises (--state open)
     change show <ID> [OPTIONS]     one change, its attempts, and its merge record
     change merge <ID> [OPTIONS]    the owner's merge: compare-and-swap the branch, then

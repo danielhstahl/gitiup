@@ -786,7 +786,7 @@ fn print_report(resolved: &ResolvedPolicy, store: Option<&Opened>) {
 
 /// A refusal keeps the library's taxonomy: the token is printed, the code is the code,
 /// and a hook reading `$?` gets what ADR-0004 D9 says it gets.
-fn refused(error: PolicyError) -> CliError {
+pub(crate) fn refused(error: PolicyError) -> CliError {
     CliError::scored(
         error.exit_code(),
         format!("{}: {}", error.token(), error.detail),

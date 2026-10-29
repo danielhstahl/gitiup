@@ -152,6 +152,32 @@ submit — publish one attempt:
                              store already holds them
     --out <path|->           also write the exact bytes that were published
 
+submit — the quorum rounds a published change needs:
+    --no-quorum              publish without opening any round, even when the store's
+                             published policy demands a quorum. The change then cannot
+                             pass `gitiup verify change` until a selector opens one
+                             (`gitiup select --change <id> … --publish`)
+    --selector <key>         which keystore key derives and signs the round seeds
+                             (default: --key). The seed is keyed on that key's Ed25519
+                             seed (ADR-0002 D2), so an agent-held key cannot be a selector
+    --seed-file <path|->     32 raw bytes (or 64 hex characters) as the selection secret,
+                             for a delegated selector that holds no seed to derive from
+    --trust <key|id>         whose policy signature counts here (repeatable; default: this
+                             keystore). A policy this machine does not trust is reported
+                             and never applied — a fork cannot set the rules (ADR-0004 D3)
+    --explain                print each round's audit table: one row per roster entry with
+                             its score, the first eligibility filter that rejected it, and
+                             what the caps decided
+
+A change whose published policy allows the `quorum` tier gets one round per job per matrix
+arm, planned from the workflow files by the same planner `gitiup run` uses. The seat count,
+the agreements required and the capability floor come from the policy's `quorum` block and
+nowhere else — the tier a repository demands is data its owner signed, not a flag somebody
+had to remember (ADR-0004 C4). The author's whole key family is excluded from every round,
+and the exclusion is re-checked against the store's own bytes before the command says
+success. A round that could not fill its `n` seats is published as `sufficient: false` with
+the reasons its eligibility filters gave, is not advertised, and never lowers `n`.
+
 list — every change the store advertises:
     --state <state>          open (default), merged, abandoned or all
     --json                   one line, sorted keys: per change its id, state, attempts,
@@ -199,8 +225,8 @@ says \"via\": \"forge\" and what that promise is, because the two kinds of merge
 same guarantee and a script should not have to guess which one it got.
 
 All: -j, --json on anything a script reads. Passphrases follow `gitiup key`:
---passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a script cannot
-answer.
+--passphrase <text>, --passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a
+script cannot answer.
 
 A re-submit is never an overwrite. Amending the commits is attempt n+1 of the same
 change (say which change with --change, because your amended head cannot recompute its
@@ -217,7 +243,9 @@ error.
 Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable, a refusal the store owns (a denied
 write) · 6 refused (no store, no key, unsigned record, stale base naming both oids,
 attempt conflict, an id you cannot sign for, not a fast-forward, ancestry the tool cannot
-check, --proof-required) · 7 a signature that does not verify · 8 bytes that are not the
+check, --proof-required, a demanded quorum that cannot be opened: no roster, no
+`quorum.requirements`, no derivable selector, no job, a round that seated its author) ·
+7 a signature that does not verify · 8 bytes that are not the
 record's own canonical form, or a digest that does not match its name.
 ";
 
@@ -226,6 +254,8 @@ const SWITCHES: &[&str] = &[
     "--no-jobs",
     "--no-objects",
     "--new-attempt",
+    "--no-quorum",
+    "--explain",
     "--bytes",
     "--dry-run",
     "--proof-required",
@@ -256,6 +286,9 @@ const VALUED: &[&str] = &[
     "--via",
     "--landed",
     "--merge-method",
+    "--selector",
+    "--seed-file",
+    "--trust",
 ];
 
 /// `gitiup change …`
@@ -1491,6 +1524,11 @@ fn submit(args: &Args) -> Result<(), CliError> {
     record.verify().map_err(|e| host_error("the record", e))?;
     let (record, refitted) = fit_attempt(&*store.host, args, &record)?;
     let base = check_base(&*store.host, &record)?;
+    // The quorum this change's published policy asks for, decided and derived before a
+    // single byte is written (giti-zp1.2). A round that cannot stand up to a reader must not
+    // be half-published any more than a record that cannot, and the author's exclusion is
+    // checked here — while refusing still means nothing was written — rather than after.
+    let mut quorum = crate::quorum::plan(args, &store, &record)?;
     let objects = if args.on("--no-objects") {
         ObjectReport {
             form: "skipped",
@@ -1512,6 +1550,11 @@ fn submit(args: &Args) -> Result<(), CliError> {
                 .map_err(|e| host_error("canonicalise", e))?,
         )?;
     }
+    // The rounds pin the change, so they are written after it: an advertisement that points
+    // at no round is an invitation to nothing, and a round nobody advertises is invisible to
+    // the volunteers it needs (giti-zp1.1). Each one is read back and re-derived here before
+    // this command is allowed to say it succeeded.
+    quorum.publish(&store)?;
     let catalog = change::list_changes(&*store.host).map_err(|e| host_error("read it back", e))?;
     let state = catalog
         .changes
@@ -1568,6 +1611,7 @@ fn submit(args: &Args) -> Result<(), CliError> {
             "jobs": record.workflow.jobs,
             "author": { "key_id": record.author.key_id, "principal": record.author.principal },
             "objects": objects.json(),
+            "quorum": quorum.json(),
             "note": refitted,
             "other_open_by_same_author": siblings,
         }));
@@ -1636,6 +1680,7 @@ fn submit(args: &Args) -> Result<(), CliError> {
         short_id(&record.change_digest().unwrap_or_default()),
         short_id(&tagged(published.record_digest))
     );
+    quorum.text();
     if let Some(note) = &refitted {
         eprintln!("note: {note}");
     }
@@ -2972,6 +3017,13 @@ mod tests {
             "--state",
             "--record",
             "--attempt",
+            // The quorum half of `submit` (giti-zp1.2), which a person has to be able to
+            // find without reading the source.
+            "--no-quorum",
+            "--selector",
+            "--seed-file",
+            "--trust",
+            "--explain",
         ] {
             assert!(
                 CHANGE_HELP.contains(word),
@@ -2980,6 +3032,38 @@ mod tests {
         }
         for code in ["0 ok", "2 usage", "3 I/O", "6 refused", "7", "8"] {
             assert!(CHANGE_HELP.contains(code), "{code} is missing");
+        }
+    }
+
+    /// A flag in the help that the parser does not know is a lie, and a flag the parser knows
+    /// that the help does not mention is a flag nobody will ever use. Both are the same
+    /// mistake — two lists edited apart — so they are checked against each other.
+    #[test]
+    fn the_help_and_the_parser_agree_on_every_flag() {
+        for flag in VALUED.iter().chain(SWITCHES.iter()) {
+            assert!(
+                CHANGE_HELP.contains(flag),
+                "{flag} is accepted but not documented"
+            );
+        }
+        let known = SWITCHES
+            .iter()
+            .chain(VALUED.iter())
+            .copied()
+            .collect::<BTreeSet<&str>>();
+        // `--json` and `--help` are accepted by the parser everywhere and spelled in the
+        // closing paragraph rather than in a flag list.
+        let prose = ["--json", "--help"];
+        for word in CHANGE_HELP
+            .split_whitespace()
+            .map(|word| word.split('=').next().unwrap_or(word))
+            .filter(|word| word.starts_with("--") && word.len() > 2)
+            .filter(|word| word.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        {
+            assert!(
+                known.contains(word) || prose.contains(&word),
+                "`gitiup change help` documents {word}, which the parser does not accept"
+            );
         }
     }
 }

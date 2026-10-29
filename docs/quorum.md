@@ -1,8 +1,11 @@
 # The quorum verification network
 
-Status: **the mechanism exists, and so do the roster and selection commands** —
+Status: **the mechanism exists, the roster and selection commands exist, and a submitted
+change opens its own rounds** —
 `gitiup participant register|withdraw|list|verify-roster` (plus the owner's `approve` and
-`revoke`) and `gitiup select`, which opens a round or re-derives a published one. The
+`revoke`) and `gitiup select`, which opens a round or re-derives a published one; and
+`gitiup change submit`, which does that for every job of a change whose published policy
+asks for a quorum ([`quorum`](../crates/gitiup/src/quorum.rs)). The
 store side of jobs and leases exists too — an advertised round, a paged listing of open
 rounds, and TTL leases on seats ([`store`](../crates/gitiup-quorum/src/store.rs),
 [`job`](../crates/gitiup-quorum/src/job.rs)). The volunteer and verdict **CLIs** are open
@@ -210,6 +213,12 @@ A round that could not fill its seats is not advertised either — a quorum that
 happen is `insufficient`, and recruiting volunteers for it is a worse answer than
 escalating.
 
+Who publishes the advertisement is the other half of "automatic": `gitiup change submit`
+advertises every round it opens that filled its seats
+([below](#submitting-opens-the-rounds-gitiup-change-submit)), so a volunteer polling
+`refs/gitiup/job` sees the work a change created without anybody having to run a second
+command.
+
 A **lease** is the second half: `store::claim_lease` puts `{holder, acquired_at, ttl,
 attempt}` at `refs/gitiup/lease/<change>/<job>/<slot>` so two volunteers do not burn two
 machines on one seat. It is claimed by CAS, refused while alive with the holder's name
@@ -303,6 +312,66 @@ failed it, and what the greedy pass decided (`take`, `skip:identity`, `skip:tier
 reproduce it — `inputs`, `seed`, roster epoch and digest — beside it, so two auditors'
 output differs in provenance and never in the answer.
 
+## Submitting opens the rounds: `gitiup change submit`
+
+`gitiup select` is a command somebody has to remember, and a quorum nobody remembers is a
+quorum that never happened. So the command that publishes a change also opens its rounds
+([`quorum`](../crates/gitiup/src/quorum.rs)):
+
+```sh
+# publish the change and open one round per job per matrix arm, then advertise them
+gitiup change submit --repository . --base main --store ./store
+
+# …or publish the change alone, and say so out loud
+gitiup change submit --store ./store --no-quorum
+
+# a delegated selector, holding a secret and no Ed25519 seed
+gitiup change submit --store ./store --selector selector --seed-file /run/secrets/round
+```
+
+Five rules decide what happens, and each is a refusal or a printed line rather than a
+paragraph of advice:
+
+* **the numbers are the policy's.** Whether a quorum is demanded is the resolved
+  `gitiup-policy-1`'s (`allowed_tiers` contains `quorum`, and `protects` covers the branch
+  the change merges into); the seats, the agreements required and the eligibility floor are
+  `quorum.by_job[<glob>]` or `quorum.default` and `quorum.requirements` —
+  [`SelectionPolicy`](../crates/gitiup-quorum/src/select.rs) and
+  [`Requirements`](../crates/gitiup-quorum/src/capability.rs) verbatim, per
+  [ADR-0004 D5](adr/0004-published-policy-format-signing-and-resolution.md). `submit` has no
+  `--n` and no `--require-arch`, on purpose: the tier a repository demands is data its owner
+  signed, and a flag would be a fork's way to weaken it. A policy this machine does not trust
+  is **reported and never applied** (D3), and a change into such a store still publishes.
+* **the job set is the planner's.** The workflow files go through `gitiup-run`'s planner, so
+  a matrix is one round per arm — `build/matrix/linux-x86_64`, `build/matrix/linux-aarch64`
+  — each with its own seed, because one seed for two architectures would be one jury asked
+  to judge machines one of them cannot run on (D7). With no workflow file the record's own
+  `workflow.jobs` hint is the job set; with no jobs at all, the submit is refused rather
+  than answered with an empty quorum.
+* **the submitter is the selector.** The seed is keyed on the key that signs the change
+  (D2), so whoever publishes a change can derive its ordering — which is only not
+  self-refereeing because **the author's whole key family is out of the pool**
+  (`RoundInputs::excluding`, re-checked with `ProposerExclusion::check` before the round is
+  written *and* again against the round that came back from the store). A round that left the
+  author's second box eligible is refused, exit 6, and — because every round is derived
+  before a single byte is written — the refusal means nothing was published, not that a bad
+  round is sitting in the store.
+* **a demanded quorum that cannot be opened is a refusal.** No roster in the store, no
+  `quorum.requirements` to select against, no derivable selector (an agent-held key cannot
+  be one), no job, several workflow files and none named: exit 6, before the change writes,
+  because publishing a change that can never reach a verdict and saying `submitted` is the
+  silent failure the rest of this document exists to avoid. `--no-quorum` is the explicit
+  way out, and it prints what it costs.
+* **an unfilled round is published, not shrunk.** Fewer than `n` eligible volunteers means the
+  round goes out with `sufficient: false`, is *not* advertised (recruiting for a quorum that
+  cannot happen is worse than escalating), and is reported with the tally of which D7 filter
+  rejected whom — `--explain` adds the same audit table `gitiup select` prints. `n` is never
+  lowered, and the exit code is still 0: this is an answer, not a crash.
+
+Everything a submit wrote is checkable by somebody else with nothing but the store:
+`gitiup select --change <id> --store ./store` re-derives each published round, and
+`gitiup verify change <id>` refuses the change until those rounds produce a verdict.
+
 ## Deferred, with the reason
 
 The epic is the mechanism. These are its child tickets, and each has a place to plug in
@@ -342,3 +411,11 @@ five seats filled, each publishing into its own slot, and the verdict coming out
 `job_leases` is the same discipline for finding work and leaning on it: an advertisement
 that pages, a lease that two volunteers race for and only one wins, a steal that leaves a
 trail, and the rule that a lease never displaces an attestation.
+
+The command line has its own acceptance test, run as the built binary against a real
+keystore, a real store and a real signed policy —
+[`crates/gitiup/tests/change_quorum_cli.rs`](../crates/gitiup/tests/change_quorum_cli.rs):
+a submit opens one round per job per arm and advertises the filled ones, the author's second
+box is out of every round that came back from the store, `--no-quorum` opens nothing and says
+so, and a round that cannot fill its `n` reports `sufficient: false` with the filters that
+emptied the pool.

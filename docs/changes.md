@@ -124,7 +124,17 @@ ADR-0003 D5, and the order is the contract:
 2. put_cas              kv/change/<record_digest>            (idempotent by content)
 3. update_ref_cas       refs/changes/<id>/attempt/<n>  Expect::Absent
 4. update_ref_cas       refs/changes/<id>/head         Expect::Is(what step 3 read)
+5. publish_round        refs/changes/<id>/round/<job>/<attempt>  (one per job, per arm)
+6. advertise_round      refs/gitiup/job/<change>/<job>           (the rounds that filled)
 ```
+
+Steps 5 and 6 are the quorum ([`quorum`](../crates/gitiup/src/quorum.rs),
+[docs/quorum.md](quorum.md)): they happen only when the store's published policy asks for a
+`quorum` tier on the branch this change merges into, they take their seats and eligibility
+floor from that policy and never from a flag, and everything they need is derived *before*
+step 1 runs — so a round that would have left the author's own key family in the pool is a
+refusal that wrote nothing, not a bad round sitting in the store. `--no-quorum` stops at
+step 4 and prints what that costs.
 
 Objects before bytes before refs, so a ref never promises bytes the store cannot return.
 The pack is `git rev-list --objects <head> --not <base.oid>` — exactly the objects the
@@ -458,8 +468,8 @@ inside the record rather than leaving it to be inferred from where you read it.
 
 Checking a change out (`giti-b2z.5`), the
 change-workflow conformance suite run against MinIO and `git-http-backend` (`giti-b2z.6`),
-GitHub adapter parity for these verbs (`giti-b2z.7`), opening quorum rounds on submit
-(`giti-zp1.2`). `gitiup verify change` (`giti-91m.4`) now gates a
+GitHub adapter parity for these verbs (`giti-b2z.7`). Opening quorum rounds on submit is
+`giti-zp1.2` and now happens (step 5 above). `gitiup verify change` (`giti-91m.4`) now gates a
 merge on all of it — the record's bytes, the refs, the attempt and the proof digests are
 exactly what it reads. What this ticket had to get right
 for all of them is the byte identity of the record, the ref names, the attempt rule and the
