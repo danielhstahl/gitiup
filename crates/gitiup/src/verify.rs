@@ -68,7 +68,7 @@ use std::collections::BTreeSet;
 
 use gitiup_attest::{
     AttestationDoc, CheckOutcome, Digest, Error as AttestError, ErrorKind, GitOid, OidAlgorithm,
-    POLICY_PATH_ENV, Policy, PolicyFile, ResultDigest, Tier, TimeUs, Trust, VerdictReport,
+    POLICY_PATH_ENV, Policy, PolicyFile, Reason, ResultDigest, Tier, TimeUs, Trust, VerdictReport,
     human_duration_us,
 };
 use gitiup_host::Oid;
@@ -87,6 +87,13 @@ gitiup verify — is this attestation good enough to act on?
 
 USAGE:
     gitiup verify attestation [DOC|-] [OPTIONS]
+    gitiup verify change      <ID> [OPTIONS]   (the merge gate over a whole change)
+
+`verify attestation` answers a question about one document. `verify change` answers the
+merge question about a change: every attestation the store advertises for its head, plus
+the quorum verdict, judged by the policy that was in force when each run happened. Same
+exit taxonomy, same report shape, one document per decision — `gitiup verify change help`
+lists its flags.
 
 DOC is an attestation document in canonical form — the bytes `gitiup attest push`
 stored — or - for stdin. A document that is merely valid JSON is refused: a
@@ -186,8 +193,9 @@ pub fn verify(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         "attestation" | "attest" | "doc" => attestation(&args[1..]),
+        "change" => crate::verify_change::change(&args[1..]),
         other => Err(CliError::usage(format!(
-            "unknown `gitiup verify` command '{other}'; `gitiup verify help` lists attestation"
+            "unknown `gitiup verify` command '{other}'; `gitiup verify help` lists attestation and change"
         ))),
     }
 }
@@ -360,7 +368,7 @@ impl PolicySpec {
 }
 
 /// Insert into a JSON map only when there is something to say.
-fn insert(out: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+pub(crate) fn insert(out: &mut Map<String, Value>, key: &str, value: Option<Value>) {
     if let Some(value) = value {
         out.insert(key.to_string(), value);
     }
@@ -568,7 +576,7 @@ fn nonempty(values: &[String]) -> Option<Vec<String>> {
 
 /// A commit id in whichever spelling the caller has: `sha1:<hex>`, `sha256:<hex>`,
 /// or bare hex whose length says the algorithm.
-fn commit_id(text: &str) -> Result<GitOid, CliError> {
+pub(crate) fn commit_id(text: &str) -> Result<GitOid, CliError> {
     let text = text.trim();
     if text.contains(':') {
         return Ok(text.to_ascii_lowercase().parse::<GitOid>()?);
@@ -636,7 +644,25 @@ impl Input {
 }
 
 /// Read the document from wherever the flags point.
+///
+/// The order is deliberate, because the common case is a merge gate: a repository
+/// that has a `gitiup.toml` (so a default remote exists, so `store_from` answers
+/// `Some` for anyone) and a document handed over on the command line.
+///
+/// * a store named explicitly with `--store`/`--remote` wins: the caller said where;
+/// * otherwise a positional document (a path, or `-` for stdin) is read: this is
+///   `gitiup verify attestation proof.json`, run in a working copy, and the default
+///   remote has nothing to do with the question;
+/// * otherwise fall back to the configured remote, which is how a hook verifies "the
+///   attestation this commit has" without being told its digest twice.
+///
+/// Reading a file the caller named and then verifying something fetched from a remote
+/// instead is the kind of helpfulness that gates the wrong commit.
 fn read(args: &Args) -> Result<Input, CliError> {
+    let named_store = args.get("--store").is_some() || args.get("--remote").is_some();
+    if !named_store && !args.positional.is_empty() {
+        return from_file(args);
+    }
     match participant::store_from(args)? {
         Some(store) => from_store(args, &store),
         None => from_file(args),
@@ -831,7 +857,7 @@ fn from_store(args: &Args, store: &Opened) -> Result<Input, CliError> {
 }
 
 /// A manifest commit is a store object id: the same bytes, minus the prefix.
-fn store_oid(commit: &GitOid) -> Result<Oid, CliError> {
+pub(crate) fn store_oid(commit: &GitOid) -> Result<Oid, CliError> {
     Oid::from_hex(&commit.hex()).map_err(|e| CliError::io(format!("commit is not an oid: {e}")))
 }
 
@@ -841,7 +867,7 @@ fn store_oid(commit: &GitOid) -> Result<Oid, CliError> {
 /// wrong" — the fs and bucket hosts both say so when a blob does not re-hash to
 /// its content address. Everything else (unreachable, refused, no such scheme) is
 /// the store not answering, which is I/O and no verdict.
-fn corrupt(error: &HostError) -> bool {
+pub(crate) fn corrupt(error: &HostError) -> bool {
     matches!(
         error.kind(),
         HostErrorKind::Storage | HostErrorKind::Invalid
@@ -857,7 +883,11 @@ fn corrupt(error: &HostError) -> bool {
 /// A refusal is exactly when a human needs these: the point of printing the tier,
 /// the signers and the age of a *rejected* attestation is that the reader can see
 /// what they are holding.
-struct Facts {
+///
+/// `pub(crate)` because `gitiup verify change` prints one section per attestation and
+/// must print *this* one: two renderings of "what the document says" is two chances
+/// for them to disagree about what a tier or a signer looks like.
+pub(crate) struct Facts {
     run_digest: Option<String>,
     result_digest: Option<String>,
     record: Option<String>,
@@ -879,7 +909,17 @@ struct Facts {
 }
 
 impl Facts {
-    fn of(doc: &AttestationDoc) -> Facts {
+    /// The `ResultDigest` as the string the report prints, when the document has one.
+    pub(crate) fn result_digest(&self) -> Option<&str> {
+        self.result_digest.as_deref()
+    }
+
+    /// The job this attestation is about, as the document spells it.
+    pub(crate) fn job(&self) -> Option<&str> {
+        self.job.as_deref()
+    }
+
+    pub(crate) fn of(doc: &AttestationDoc) -> Facts {
         let manifest = &doc.manifest;
         Facts {
             run_digest: doc.run_digest().ok().map(|digest| digest.to_string()),
@@ -912,7 +952,7 @@ impl Facts {
         }
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         let mut out = Map::new();
         insert(
             &mut out,
@@ -981,7 +1021,7 @@ impl Facts {
     }
 
     /// The table rows, in the order a reader checks them.
-    fn rows(&self, now: TimeUs, out: &mut Vec<Row>) {
+    pub(crate) fn rows(&self, now: TimeUs, out: &mut Vec<Row>) {
         out.push(Row::new("run", self.run_digest.as_deref().unwrap_or("?")));
         out.push(Row::new(
             "result",
@@ -1047,20 +1087,20 @@ impl Facts {
 }
 
 /// One `label  value` line of the table.
-struct Row {
+pub(crate) struct Row {
     label: String,
     value: String,
 }
 
 impl Row {
-    fn new(label: &str, value: impl Into<String>) -> Row {
+    pub(crate) fn new(label: &str, value: impl Into<String>) -> Row {
         Row {
             label: label.to_string(),
             value: value.into(),
         }
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         format!("{:<14}{}\n", self.label, self.value)
     }
 }
@@ -1072,7 +1112,7 @@ impl Row {
 /// refusal quotes, so "the window" and "how old it is" cannot be spelled two
 /// ways); this adds the two words only a *policy* needs: `never` for a window with
 /// no limit, and `moments` for an age too small to matter.
-fn human_age(micros: i64) -> String {
+pub(crate) fn human_age(micros: i64) -> String {
     if micros >= i64::MAX / 2 {
         return "never".to_string();
     }
@@ -1116,43 +1156,30 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
         return verdict(&report);
     }
     if args.json() {
+        let mut shape = report_shape(&report);
+        insert(
+            &mut shape,
+            "source",
+            Some(Value::String(input.source.clone())),
+        );
+        // Always present, `null` when the document did not come from a store: a script
+        // that reads this shape must find the key whether or not there was a store.
+        shape.insert(
+            "stored".into(),
+            input
+                .stored
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        shape.insert("policy".into(), spec.json());
+        shape.insert(
+            "attestation".into(),
+            facts.as_ref().map(Facts::json).unwrap_or(Value::Null),
+        );
         println!(
             "{}",
-            serde_json::to_string(&json!({
-                "verdict": report.verdict(),
-                "exit": u64::from(report.exit_code()),
-                "accepted": report.accepted(),
-                "source": input.source.clone(),
-                "stored": input.stored.clone(),
-                "reasons": report
-                    .reasons
-                    .iter()
-                    .map(|reason| {
-                        let mut one = Map::new();
-                        one.insert("code".into(), Value::String(reason.code.to_string()));
-                        one.insert(
-                            "class".into(),
-                            Value::String(reason.class().as_str().to_string()),
-                        );
-                        one.insert("detail".into(), Value::String(reason.detail().to_string()));
-                        insert(
-                            &mut one,
-                            "hint",
-                            reason.hint().map(|hint| Value::String(hint.to_string())),
-                        );
-                        one.insert("exit".into(), Value::from(u64::from(reason.exit_code())));
-                        Value::Object(one)
-                    })
-                    .collect::<Vec<Value>>(),
-                "checks": report
-                    .checks
-                    .iter()
-                    .map(|check| json!({"code": check.code, "outcome": check.outcome.as_str()}))
-                    .collect::<Vec<Value>>(),
-                "policy": spec.json(),
-                "attestation": facts.as_ref().map(Facts::json),
-            }))
-            .unwrap_or_else(|_| "{}".into())
+            serde_json::to_string(&Value::Object(shape)).unwrap_or_else(|_| "{}".into())
         );
         return verdict(&report);
     }
@@ -1181,23 +1208,7 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
         text.push_str(&row.render());
     }
     text.push_str("\nchecks\n");
-    for check in &report.checks {
-        let detail = report
-            .reasons
-            .iter()
-            .find(|reason| reason.code == check.code && check.outcome.is_failure())
-            .map_or(String::new(), |reason| {
-                format!(" \u{b7} {}", one_line(reason.detail()))
-            });
-        let state = match check.outcome {
-            CheckOutcome::Passed => "ok",
-            CheckOutcome::Failed => "REFUSED",
-            CheckOutcome::NotAsked => "not asked",
-            CheckOutcome::NotRun => "not run",
-        };
-        text.push_str(format!("  {:<15} {:<10}{}\n", check.code, state, detail).trim_end());
-        text.push('\n');
-    }
+    text.push_str(&render_checks(&report));
     text.push('\n');
     text.push_str(
         &Row::new(
@@ -1241,9 +1252,103 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
     verdict(&report)
 }
 
+/// The report in its machine-readable shape: `verdict`, `exit`, `accepted`, `reasons`,
+/// `checks`.
+///
+/// These are the keys a gate parses, so they are one function and not two: `gitiup
+/// verify change` prints one of these per attestation and one for the change as a
+/// whole, and a script that reads `gitiup verify attestation --json` must be able to
+/// read those sections with the same code and the same vocabulary.
+///
+/// Extra keys are the caller's to add — which is why this hands back an object rather
+/// than a printed line.
+pub(crate) fn report_shape(report: &VerdictReport) -> Map<String, Value> {
+    let mut out = Map::new();
+    out.insert(
+        "verdict".into(),
+        Value::String(report.verdict().to_string()),
+    );
+    out.insert("exit".into(), Value::from(u64::from(report.exit_code())));
+    out.insert("accepted".into(), report.accepted().into());
+    out.insert(
+        "reasons".into(),
+        Value::Array(reasons_json(&report.reasons)),
+    );
+    out.insert(
+        "checks".into(),
+        Value::Array(
+            report
+                .checks
+                .iter()
+                .map(|check| json!({"code": check.code, "outcome": check.outcome.as_str()}))
+                .collect::<Vec<Value>>(),
+        ),
+    );
+    out
+}
+
+/// Every reason, in the order they were found: the first decides the exit code and all
+/// of them are printed, because a report that says "refused" and nothing else is a
+/// report nobody can act on.
+pub(crate) fn reasons_json(reasons: &[Reason]) -> Vec<Value> {
+    reasons
+        .iter()
+        .map(|reason| {
+            let mut one = Map::new();
+            one.insert("code".into(), Value::String(reason.code.to_string()));
+            one.insert(
+                "class".into(),
+                Value::String(reason.class().as_str().to_string()),
+            );
+            one.insert("detail".into(), Value::String(reason.detail().to_string()));
+            insert(
+                &mut one,
+                "hint",
+                reason.hint().map(|hint| Value::String(hint.to_string())),
+            );
+            one.insert("exit".into(), Value::from(u64::from(reason.exit_code())));
+            Value::Object(one)
+        })
+        .collect()
+}
+
+/// The human rendering of the ladder: one line per check, with the reason that made it
+/// fail on the same line.
+pub(crate) fn render_checks(report: &VerdictReport) -> String {
+    let mut text = String::new();
+    for check in &report.checks {
+        let detail = report
+            .reasons
+            .iter()
+            .find(|reason| reason.code == check.code && check.outcome.is_failure())
+            .map_or(String::new(), |reason| {
+                format!(" \u{b7} {}", one_line(reason.detail()))
+            });
+        let line = format!(
+            "  {:<15} {:<10}{}",
+            check.code,
+            state_word(check.outcome),
+            detail
+        );
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text
+}
+
+/// The word one check's outcome prints as.
+pub(crate) fn state_word(outcome: CheckOutcome) -> &'static str {
+    match outcome {
+        CheckOutcome::Passed => "ok",
+        CheckOutcome::Failed => "REFUSED",
+        CheckOutcome::NotAsked => "not asked",
+        CheckOutcome::NotRun => "not run",
+    }
+}
+
 /// A refusal is a verdict, not a crash: the report is already printed, so all that
 /// is left is the number a hook branches on.
-fn verdict(report: &VerdictReport) -> Result<(), CliError> {
+pub(crate) fn verdict(report: &VerdictReport) -> Result<(), CliError> {
     if report.accepted() {
         return Ok(());
     }
@@ -1251,12 +1356,12 @@ fn verdict(report: &VerdictReport) -> Result<(), CliError> {
 }
 
 /// Collapse a multi-line detail: a library hint can carry a wrapped paragraph.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Shorten a stored digest for a message, keeping what identifies it.
-fn short(hex: &str) -> String {
+pub(crate) fn short(hex: &str) -> String {
     crate::attest::short(hex)
 }
 

@@ -366,9 +366,13 @@ the identical attestation.
 Whether a merge is *allowed* is Epic 2's policy engine, which is deliberately not a field of
 the change record (D9: a contributor who could write "no checks needed" into the object being
 merged has written their own gate), and "no policy found, merged anyway" is not an answer
-anyone wants in a log. Until the engine exists the mergeer is the policy engine: run
-`gitiup verify attestation <file> --trust …` — which answers 0/6/7/8 for one proof — and
-cite what you believed with `--proof`.
+anyone wants in a log. The engine is
+[`gitiup verify change <id>`](verification.md#the-merge-question-gitiup-verify-change):
+it resolves the change, reads
+every attestation and verdict the store advertises for its head, applies the published
+policy, and exits 0/6/7/8 — the same taxonomy `gitiup verify attestation <file>` gives for
+one proof. Cite what you believed with `--proof`; the gate's answer is not stored in the
+merge record, because a record that recorded its own gate could edit it.
 
 ### When the record does not land
 
@@ -455,7 +459,9 @@ inside the record rather than leaving it to be inferred from where you read it.
 Checking a change out (`giti-b2z.5`), the
 change-workflow conformance suite run against MinIO and `git-http-backend` (`giti-b2z.6`),
 GitHub adapter parity for these verbs (`giti-b2z.7`), opening quorum rounds on submit
-(`giti-zp1.2`) and `gitiup verify change` (`giti-91m.4`). What this ticket had to get right
+(`giti-zp1.2`). `gitiup verify change` (`giti-91m.4`) now gates a
+merge on all of it — the record's bytes, the refs, the attempt and the proof digests are
+exactly what it reads. What this ticket had to get right
 for all of them is the byte identity of the record, the ref names, the attempt rule and the
 refusal table — each of those is asserted in
 [`crates/gitiup/tests/change_cli.rs`](../crates/gitiup/tests/change_cli.rs).

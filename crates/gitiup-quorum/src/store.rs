@@ -107,12 +107,25 @@ pub fn reveal_ref(change: &str, job: &str, slot: &str) -> Result<RefName> {
     .and_then(|name| name.join(slot).map_err(host_error))
 }
 
+/// `refs/gitiup/verdict/<change>` — the directory every verdict for one change lives
+/// under, relative to `refs/gitiup/`.
+///
+/// The merge gate (giti-91m.4) needs this and cannot be handed the job ids: a change
+/// record's `workflow.jobs` is a hint about what to re-run, not the list of rounds
+/// somebody actually opened, so "what does the store say about this change" has to be
+/// asked of the store — listing this prefix — rather than derived from the change. A
+/// reader that derived it would silently pass a change whose verdict is filed under a
+/// job the record never mentioned.
+pub fn verdict_dir(change: &str) -> Result<String> {
+    check_segment(change, "change id")?;
+    Ok(format!("verdict/{}", escape(change)))
+}
+
 /// `refs/gitiup/verdict/<change>/<job>`.
 pub fn verdict_ref(change: &str, job: &str) -> Result<RefName> {
-    check_segment(change, "change id")?;
     check_segment(job, "job id")?;
     gitiup_ref(
-        &format!("verdict/{}/{}", escape(change), escape(job)),
+        &format!("{}/{}", verdict_dir(change)?, escape(job)),
         "verdict ref",
     )
 }

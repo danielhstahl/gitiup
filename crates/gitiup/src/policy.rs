@@ -628,7 +628,9 @@ fn show(args: &Args) -> Result<(), CliError> {
 /// The same local-trust rule as `verify attestation`, for the same reason: the machine
 /// answering has to say *whose* policy it was willing to apply, and "whoever's store this
 /// is" is not an answer — a fork's store would otherwise be its own authority (D3).
-fn show_trust(args: &Args) -> Result<Trust, CliError> {
+/// `gitiup verify change` applies the identical rule, so the two commands cannot disagree
+/// about whose policy they were willing to read.
+pub(crate) fn show_trust(args: &Args) -> Result<Trust, CliError> {
     let here = participant::keystore()?;
     let named = args.all("--trust");
     if !named.is_empty() {
@@ -672,7 +674,7 @@ fn report(resolved: &ResolvedPolicy, store: Option<&Opened>) -> Value {
 ///
 /// This is the *resolved* policy, not the file: a flag, a tree file and a published
 /// document all end up here as one answer, which is the point of resolving at all (D4).
-fn rules(resolved: &ResolvedPolicy) -> Value {
+pub(crate) fn rules(resolved: &ResolvedPolicy) -> Value {
     let policy = &resolved.policy;
     let mut map = Map::new();
     map.insert(

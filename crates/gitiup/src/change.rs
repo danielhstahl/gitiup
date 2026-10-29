@@ -292,7 +292,7 @@ fn need_store(args: &Args) -> Result<Opened, CliError> {
 }
 
 /// A store to read: the configured default remote is allowed here and not for a write.
-fn read_store(args: &Args) -> Result<Opened, CliError> {
+pub(crate) fn read_store(args: &Args) -> Result<Opened, CliError> {
     participant::store_from(args)?.ok_or_else(|| {
         CliError::refused(
             "no store was named",
@@ -303,7 +303,7 @@ fn read_store(args: &Args) -> Result<Opened, CliError> {
 
 /// A host error keeps the code the library decided, so `gitiup change` and a merge gate
 /// calling the same check cannot disagree about the same store.
-fn host_error(what: &str, error: gitiup_host::HostError) -> CliError {
+pub(crate) fn host_error(what: &str, error: gitiup_host::HostError) -> CliError {
     CliError::scored(
         error.exit_code(),
         format!("{what}: {error}"),
@@ -953,7 +953,10 @@ fn attempts_in(host: &dyn Host, id: &ChangeId) -> Result<Vec<AttemptInfo>, CliEr
 
 /// Resolve a handle the way D3 says to: exact, else an unambiguous prefix of the hex,
 /// and when two changes could be meant, both are named and neither is picked.
-fn resolve_handle(host: &dyn Host, handle: &str) -> Result<change::ChangeSummary, CliError> {
+pub(crate) fn resolve_handle(
+    host: &dyn Host,
+    handle: &str,
+) -> Result<change::ChangeSummary, CliError> {
     let catalog = change::list_changes(host).map_err(|e| host_error("list changes", e))?;
     let matches = catalog.resolve(handle);
     match matches.as_slice() {

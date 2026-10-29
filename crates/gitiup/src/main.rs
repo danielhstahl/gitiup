@@ -22,6 +22,9 @@
 //!                                      attempt, and read it back
 //! gitiup verify attestation [DOC]       may this attestation be acted on? one exit
 //!                                      code (0/6/7/8) and a report of every check
+//! gitiup verify change <ID>             may this change merge? every attestation its
+//!                                      store advertises, the quorum verdict, and the
+//!                                      policy in force when each run happened
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
 //! gitiup key …                          signing keys: gen, import (file, seed, agent, gpg)
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
@@ -63,6 +66,7 @@ mod remotes;
 mod run;
 mod select;
 mod verify;
+mod verify_change;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -88,6 +92,11 @@ COMMANDS:
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·
+                                    8 digest mismatch)
+    verify change <ID> [OPTIONS]   may this change merge? every attestation the store
+                                   advertises for its head, plus the quorum verdict, all
+                                   judged by the policy in force when each run happened
+                                   (0 may merge · 6 refused · 7 bad signature ·
                                     8 digest mismatch)
     normalise [OPTIONS] [REPORT]   show what normalisation rewrote, or --compare two runs
     key [COMMAND] [OPTIONS]        the signing keys this machine can use (gen, import,
@@ -188,6 +197,7 @@ Try:
     gitiup change show chg-6a6a8eab778ba4d0 --store ./store --json
     gitiup verify attestation proof.json --policy gitiup-policy.json     # the verdict
     gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
+    gitiup verify change chg-6a6a8eab778ba4d0 --store ./store --json     # the merge gate
     gitiup normalise run.json                  # what was rewritten, and why
     gitiup normalise --compare run-a.json run-b.json   # exit 8 if they diverge
     gitiup participant list --store ./store --json
