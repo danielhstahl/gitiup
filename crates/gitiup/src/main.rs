@@ -31,6 +31,9 @@
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
 //! gitiup participant …                  volunteering to verify: register, withdraw, list
 //! gitiup select …                       who verifies one change, and why: derive or audit
+//! gitiup quorum verdict <ID>            what the quorum decided: re-verify every seat's
+//!                                      attestation and print the tally, its reasons and
+//!                                      its exit code; --publish files the signed verdict
 //! gitiup policy publish|show            the policy a merge gate applies: publish it to
 //!                                      the store signed, and ask which one is in force
 //! gitiup work [--once|--watch 30s]      the volunteer's loop: invitation check, lease,
@@ -69,6 +72,7 @@ mod quorum;
 mod remotes;
 mod run;
 mod select;
+mod verdict;
 mod verify;
 mod verify_change;
 mod work;
@@ -113,6 +117,10 @@ COMMANDS:
                                    verify-roster, approve, revoke
     select [OPTIONS]               who verifies one change: re-derive a published
                                    selection, or open a new round and exclude the author
+    quorum verdict <ID> [OPTIONS]  what the quorum decided about a change: re-verify every
+                                   seat's attestation and print verified / failed /
+                                   insufficient with the reason (--publish files the
+                                   signed verdict: 0 · 6 · 7 · 8)
     policy publish [POLICY]        the rule a merge gate applies, in the store and signed:
                                    publish checks it before it writes, and refuses what it
                                    cannot stand behind (ADR-0004)
@@ -215,6 +223,9 @@ Try:
     gitiup select --change chg-1 --store ./store --explain
     gitiup select --change chg-1 --job build/matrix/linux-x86_64 --head sha1:… \
         --proposer ada --require-arch x86_64 --store ./store --publish
+    gitiup quorum verdict chg-6a6a8eab778ba4d0 --store ./store          # the tally
+    gitiup quorum verdict chg-6a6a --store ./store --json --now 2026-10-24T00:01:01Z
+    gitiup quorum verdict chg-6a6a --store ./store --publish --key owner
     gitiup policy publish --store ./store --allow-tier local --trust ada --json
     gitiup policy publish policy.json --store ./store --dry-run
     gitiup policy show --store ./store --gate
@@ -383,6 +394,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "participant" => participant::participant(&args[1..]),
         "select" => select::select(&args[1..]),
         "policy" => policy::policy(&args[1..]),
+        "quorum" => quorum::quorum(&args[1..]),
         "work" => work::work(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }

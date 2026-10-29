@@ -635,6 +635,38 @@ impl VerdictRecord {
         Ok(verdict)
     }
 
+    /// Does this verdict say the *same thing* as `other`?
+    ///
+    /// Every field that states a fact about the round is compared; the two that record
+    /// the *act of writing* — `issued_at_us` and `signatures` — are not, because an owner
+    /// who re-runs the tally an hour later and reaches the same answer has not edited
+    /// history. [`crate::store::file_verdict`] uses this to tell a harmless retry from
+    /// an edit, so a verdict that differs in any way a reviewer could cite must not slip
+    /// through as "the same": if a field appears in a verdict a human would quote, it
+    /// belongs in this comparison.
+    pub fn same_answer(&self, other: &VerdictRecord) -> bool {
+        self.schema_version == other.schema_version
+            && self.verdict_type == other.verdict_type
+            && self.change_id == other.change_id
+            && self.head_oid == other.head_oid
+            && self.job_id == other.job_id
+            && self.attempt == other.attempt
+            && self.round_digest == other.round_digest
+            && self.roster_digest == other.roster_digest
+            && self.policy_digest == other.policy_digest
+            && self.state == other.state
+            && self.reason == other.reason
+            && self.detail == other.detail
+            && self.result_digest == other.result_digest
+            && self.seats == other.seats
+            && self.required_agree == other.required_agree
+            && self.agreeing == other.agreeing
+            && self.counted == other.counted
+            && self.divergent == other.divergent
+            && self.missing == other.missing
+            && self.rejected == other.rejected
+    }
+
     /// Does this verdict speak about `round`'s change, job and head?
     pub fn is_about(&self, round: &Round) -> bool {
         self.change_id == round.inputs.change_id

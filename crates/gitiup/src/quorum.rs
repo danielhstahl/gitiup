@@ -1,4 +1,14 @@
-//! The quorum half of `gitiup change submit` (giti-zp1.2).
+//! The quorum half of the command line.
+//!
+//! Two things live here, because they are the same subject seen from two ends:
+//!
+//! * [`quorum`] is the `gitiup quorum` verb — today one command, `verdict`, whose own
+//!   logic is in [`crate::verdict`];
+//! * [`plan`] is the half of `gitiup change submit` that opens a change's rounds.
+//!
+//! The second is why the first is in this file rather than its own: opening a round and
+//! tallying one are the two ends of one mechanism, and a submit that opened rounds no
+//! command could decide on would be a half-feature.
 //!
 //! "Five random users per PR" is only automatic if the command that publishes the change
 //! also opens its rounds, so this module turns a change about to be published into the
@@ -82,6 +92,56 @@ use crate::CliError;
 use crate::keys::{self, Args};
 use crate::participant::{self, Opened};
 use crate::select;
+use crate::verdict;
+
+/// Help for `gitiup quorum`.
+pub const QUORUM_HELP: &str = "\
+gitiup quorum — the owner's questions about a quorum, asked of a store
+
+USAGE:
+    gitiup quorum <COMMAND> [OPTIONS]
+
+COMMANDS:
+    verdict <CHANGE> [OPTIONS]  tally every round this store holds for a change:
+                                verified / failed / insufficient, with the count, the
+                                threshold, the divergent digests and every rejection
+                                with its reason. --publish signs the verdict and files
+                                it at refs/gitiup/verdict/<change>/<job>.
+                                (0 verified · 6 refused or not yet · 7 bad signature ·
+                                 8 digest mismatch)
+    help                        this text
+
+`gitiup quorum verdict help` lists the flags: which store, which job and attempt, whose
+signature counts, which clock to judge freshness by, and what to accept as a tier.
+
+The other two questions a quorum raises are not here yet: a dispute report and a bounded
+escalation (`gitiup quorum dispute|retry`, giti-zp1.7) are the next tickets, and they are
+the ones that *move* a round. Nothing under `verdict` changes a round, a roster or a
+seat: a verdict is an opinion about evidence, signed, and that is the whole job.
+
+Try:
+    gitiup quorum verdict chg-6a6a8eab778ba4d0 --store ./store
+    gitiup quorum verdict chg-6a6a --store ./store --json
+    gitiup quorum verdict chg-6a6a --store ./store --publish --key owner
+";
+
+/// `gitiup quorum …` — the verdict side of the quorum, from a shell.
+pub fn quorum(args: &[String]) -> Result<(), CliError> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        print!("{QUORUM_HELP}");
+        return Ok(());
+    };
+    match sub {
+        "help" | "--help" | "-h" => {
+            print!("{QUORUM_HELP}");
+            Ok(())
+        }
+        "verdict" => verdict::verdict(&args[1..]),
+        other => Err(CliError::usage(format!(
+            "unknown `gitiup quorum` command '{other}'; `gitiup quorum help` lists what exists"
+        ))),
+    }
+}
 
 /// The path component that marks a round's job id as one matrix arm.
 ///

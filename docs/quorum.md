@@ -8,8 +8,9 @@ change opens its own rounds** —
 asks for a quorum ([`quorum`](../crates/gitiup/src/quorum.rs)). The
 store side of jobs and leases exists too — an advertised round, a paged listing of open
 rounds, and TTL leases on seats ([`store`](../crates/gitiup-quorum/src/store.rs),
-[`job`](../crates/gitiup-quorum/src/job.rs)). The volunteer and verdict **CLIs** are open
-tickets.
+[`job`](../crates/gitiup-quorum/src/job.rs)) — and so do both ends of the loop: `gitiup
+work` serves a seat end to end, and `gitiup quorum verdict` tallies one, publishes it and
+exits on it. Dispute reports and bounded escalation are the open tickets.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -445,6 +446,86 @@ Everything a submit wrote is checkable by somebody else with nothing but the sto
 `gitiup select --change <id> --store ./store` re-derives each published round, and
 `gitiup verify change <id>` refuses the change until those rounds produce a verdict.
 
+## Tallying it: `gitiup quorum verdict`
+
+The rounds are open and the seats are filled, and what an owner asks is one line long.
+[`gitiup quorum verdict`](../crates/gitiup/src/verdict.rs) is that line — the one a human
+types and the one a `pre-receive` hook runs:
+
+```sh
+# the whole change: one block per job, and the exit code is the worst of them
+gitiup quorum verdict chg-6a6a8eab778ba4d0 --store ./store
+
+# one matrix arm, at a clock the caller chose, machine-readable
+gitiup quorum verdict chg-6a6a --store ./store --job build/matrix/linux-x86_64 \
+    --json --now 2026-10-24T00:01:01Z
+
+# …and file the signed answer beside the evidence it describes
+gitiup quorum verdict chg-6a6a --store ./store --publish --key owner
+```
+
+Five rules, each of which is a line of code rather than a paragraph of advice:
+
+* **the store is an index, not a memory.** Nothing is carried over from the last run: the
+  command re-fetches the round, the roster *epoch the round pinned*, every seat's
+  submission (`store::submissions`) and every revocation, and re-checks each attestation
+  from scratch — canonical bytes, signature, the round's own bindings (head oid and the
+  per-key challenge), freshness, tier, and the capability claim against the signed
+  environment. Revocation is evaluated **as of now**
+  ([ADR-0002 D9](adr/0002-roster-verifier-selection-and-sybil-resistance.md)): a key
+  revoked this afternoon voids what it signed last week, and a verdict that remembered the
+  old answer is a verdict nobody can audit.
+* **the round is verified before anything in it is.** `Round::verify` runs first, under a
+  *trusted* selector signature and the epoch it pinned: the round is the one document no
+  attestation can audit, so a record whose seats were hand-picked would otherwise tally
+  `verified` from perfectly good signatures. Seats that are not the ones the published
+  seed derives are exit 8.
+* **the numbers are the round's.** `n`, `required_agree` and the seat list come from the
+  published record; there is no `--n` and no `--threshold` here, exactly as
+  `gitiup change submit` has none. The flags that do exist (`--tier`, `--sandbox`,
+  `--max-age`, `--max-skew`, `--now`) change only what an *attestation* has to be, which
+  is the same split [`gitiup verify change`](verification.md) keeps.
+* **the exit code is not always the state's.**
+  `0` verified · `6` refused or not yet (`failed`, `insufficient`, no rounds, a publish
+  the record refuses) · `7` a signature in this round's evidence that does not verify ·
+  `8` a digest that is not what it names. 7 and 8 come from the *evidence*, and
+  [ADR-0001 D7](adr/0001-attestation-encoding-hash-and-signature.md)'s order — bytes
+  before signatures before policy — lets them outrank the tally: a round whose remaining
+  votes still carried the threshold exits 8 anyway, because a broken thing in the
+  evidence is not made whole by being outvoted, and the discarded pile is precisely what
+  the owner has not yet explained. Usage (`2`) and an unreadable store (`3`) are not
+  verdicts and keep their own codes.
+* **a verdict is stdout, and stderr stays empty.** The report and the exit code are the
+  answer, so a hook reads one stream; `--json` prints the record verbatim — what
+  `--publish` filed is what `--json` printed, field for field — and `--out -` writes the
+  canonical signed bytes and keeps the report off stdout entirely (it refuses to share
+  the stream with `--json`, since one would corrupt the other).
+
+### Filing it: superseded, never edited
+
+`--publish` signs the verdict with this machine's key and CAS-writes it at
+`refs/gitiup/verdict/<change>/<job>` ([`store::file_verdict`](../crates/gitiup-quorum/src/store.rs)).
+The ref moves in exactly two ways — nothing→something, and an earlier attempt→a later one
+— so filing has four outcomes and the command says which one happened: `filed`,
+`unchanged` (the same answer again, which is a retry and not an edit), `superseded` (a
+later attempt's verdict replaces an earlier one's), and `refused`, with both verdicts
+quoted and the ref untouched. A refusal is the point of the function: the way to launder a
+disagreement out of a quorum record would be to re-run the tally after the awkward
+verifier went home and write the tidy answer over the old one, so the evidence — not the
+tally's convenience — decides what stays on the record, and the way out is `attempt + 1`
+with a fresh seed. The verdict already at the ref is *signature-checked before it is
+compared*, so a store cannot plant an unsigned record to force a conflict.
+
+Which rounds get tallied is the same rule as escalation: the **latest attempt per job** by
+default, `--attempt n` to pin one, `--job` to name one — and a job this store never
+opened is a refusal that lists the jobs it did open, because that is the whole difference
+between a typo and a wrong answer.
+
+What the command will not do is as deliberate: it does not open, re-open or void a round
+(that is `gitiup select`, and escalation in giti-zp1.7), and it does not decide what a
+vote is worth from a flag. A verdict is an opinion about evidence, signed. That is the
+whole job.
+
 ## Deferred, with the reason
 
 The epic is the mechanism. These are its child tickets, and each has a place to plug in
@@ -474,6 +555,8 @@ that already exists:
 cargo test -p gitiup-quorum            # vectors, properties, store, end-to-end
 cargo test -p gitiup-quorum --test quorum_end_to_end -- --nocapture
 cargo test -p gitiup-quorum --test job_leases -- --nocapture
+cargo test -p gitiup-quorum --test verdict_filing -- --nocapture
+cargo test -p gitiup --test quorum_verdict_cli -- --nocapture
 ```
 
 The end-to-end test is the acceptance criterion as code: seven volunteers in the roster,
@@ -484,6 +567,18 @@ five seats filled, each publishing into its own slot, and the verdict coming out
 `job_leases` is the same discipline for finding work and leaning on it: an advertisement
 that pages, a lease that two volunteers race for and only one wins, a steal that leaves a
 trail, and the rule that a lease never displaces an attestation.
+
+The verdict has two. The library rule — a verdict is superseded and never edited — is
+[`crates/gitiup-quorum/tests/verdict_filing.rs`](../crates/gitiup-quorum/tests/verdict_filing.rs):
+a first filing, a retry that moves nothing, a different answer at the same attempt
+refused, an older attempt unable to overwrite a newer one, and an incumbent nobody signed
+never believed enough to compare. The command is
+[`crates/gitiup/tests/quorum_verdict_cli.rs`](../crates/gitiup/tests/quorum_verdict_cli.rs),
+run as the built binary against a real store and a real keystore: `verified`, `failed` and
+`insufficient` each with its count and threshold; a tampered signature at 7 and a
+submission bound to another commit at 8 *over* a tally that still carried the threshold; a
+revocation that voids a vote already cast; a capability lie named in the report and not
+counted; every run asserting an empty stderr, because that is the contract a hook reads.
 
 The command line has its own acceptance test, run as the built binary against a real
 keystore, a real store and a real signed policy —

@@ -633,6 +633,161 @@ pub fn verdict_at(
     Ok(Some(verdict))
 }
 
+/// What filing a verdict at `refs/gitiup/verdict/<change>/<job>` did.
+///
+/// Four outcomes, because there are exactly four things that can be true of a ref that
+/// may already hold a signed statement: it is empty, it already says this, it says
+/// something an earlier attempt said, or it says something this write has no business
+/// changing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filing {
+    /// The ref was empty; this verdict is now the record.
+    Filed {
+        /// Where the record went: the `kv/verdict/<hex>` blob the ref now names.
+        oid: Oid,
+    },
+    /// The same verdict was already filed, so nothing moved. A retry is not an edit,
+    /// and saying so is what lets a publish be re-run after a timeout.
+    Unchanged {
+        /// The oid the ref already pointed at — the same verdict, byte for byte.
+        oid: Oid,
+    },
+    /// A verdict from a *later* attempt replaced one from an earlier attempt — the only
+    /// way a filed verdict ever moves.
+    Superseded {
+        /// The new blob the ref names.
+        oid: Oid,
+        /// The attempt the replaced verdict spoke about.
+        previous_attempt: u64,
+    },
+    /// The ref holds a verdict this one may not replace, with the sentence saying why.
+    Refused {
+        /// The verdict that stays on the record (boxed: a record is far bigger than an
+        /// oid, and a refusal is the rare case, not the one every filing pays for).
+        existing: Box<VerdictRecord>,
+        /// Why this write was refused, in the words a human acts on.
+        reason: String,
+    },
+}
+
+impl Filing {
+    /// Was the ref left as it was, and why (`None` when it was written or was already
+    /// right)?
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Filing::Refused { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The oid the ref points at now, when the store has one.
+    pub fn oid(&self) -> Option<&Oid> {
+        match self {
+            Filing::Filed { oid } | Filing::Unchanged { oid } | Filing::Superseded { oid, .. } => {
+                Some(oid)
+            }
+            Filing::Refused { .. } => None,
+        }
+    }
+
+    /// A short token for `--json`: `filed` · `unchanged` · `superseded` · `refused`.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Filing::Filed { .. } => "filed",
+            Filing::Unchanged { .. } => "unchanged",
+            Filing::Superseded { .. } => "superseded",
+            Filing::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// File a signed verdict, under the rule that a verdict is **superseded, never edited**.
+///
+/// A verdict is the owner's signed statement about one round, and a reviewer who cites
+/// it is entitled to the version that was there when they read it. So the ref moves in
+/// exactly two ways: nothing→something, and an earlier attempt→a later one (the
+/// escalation path, attempt + 1 with a fresh seed). Any other difference at the same
+/// attempt is a refusal, and a *good* one: the way to launder a disagreement out of a
+/// quorum record would be to re-run the tally after the awkward verifier went home and
+/// write the tidy answer over the old one. The evidence, not the tally's convenience,
+/// decides what is on the record — which is why the caller reports a refusal instead of
+/// silently keeping the stale verdict.
+///
+/// `owner_trust` is needed because the verdict already there is a *claim*: it is
+/// signature-checked before it is compared, so a store that swapped in an unsigned
+/// verdict to force a conflict is caught here rather than believed.
+pub fn file_verdict(
+    host: &dyn Host,
+    verdict: &VerdictRecord,
+    owner_trust: &gitiup_attest::Trust,
+) -> Result<Filing> {
+    verdict.validate()?;
+    let name = verdict_ref(&verdict.change_id, &verdict.job_id)?;
+    let current = host
+        .get_ref(&name)
+        .map_err(|e| Error::store("read verdict ref", &e))?;
+    let Some(current) = current else {
+        return Ok(Filing::Filed {
+            oid: publish_verdict(host, verdict)?,
+        });
+    };
+    let bytes = host
+        .get(&current.oid)
+        .map_err(|e| Error::store("fetch verdict", &e))?
+        .ok_or_else(|| {
+            Error::store(
+                "fetch verdict",
+                &gitiup_host::HostError::not_found("verdict", current.oid.hex()),
+            )
+        })?;
+    let existing = VerdictRecord::from_canonical_bytes(&bytes, owner_trust)?;
+    if verdict.same_answer(&existing) {
+        return Ok(Filing::Unchanged { oid: current.oid });
+    }
+    if verdict.attempt <= existing.attempt {
+        let reason = if verdict.attempt == existing.attempt {
+            format!(
+                "attempt {} already carries a verdict here, and it says '{}' ({}); this tally \
+                 says '{}', so filing it would edit a signed record in place. A verdict is \
+                 superseded by a later attempt and never rewritten: escalate to attempt {} \
+                 (a fresh seed, a fresh round) if the evidence has genuinely moved, and \
+                 publish nothing here.",
+                existing.attempt,
+                existing.state,
+                existing.detail,
+                verdict.state,
+                existing.attempt + 1
+            )
+        } else {
+            format!(
+                "this store already carries the verdict of attempt {} for this job, which is a \
+                 later attempt than this one ({}). Attempts only move forward: re-evaluating an \
+                 older round cannot overwrite what the newer one decided.",
+                existing.attempt, verdict.attempt
+            )
+        };
+        return Ok(Filing::Refused {
+            existing: Box::new(existing),
+            reason,
+        });
+    }
+    let oid = host
+        .put_cas(&ns::VERDICT, &verdict.canonical_bytes()?)
+        .map_err(|e| Error::store("put verdict", &e))?;
+    let update =
+        RefUpdate::new(name.clone(), Expect::Is(current.oid), oid).with_actor(actor("verdict"));
+    host.update_ref_cas(&update).map_err(|e| {
+        Error::store("supersede verdict", &e).with_hint(
+            "the ref moved between the read and the write: somebody else filed a verdict in \
+             the same instant. Re-read it rather than forcing the write.",
+        )
+    })?;
+    Ok(Filing::Superseded {
+        oid,
+        previous_attempt: existing.attempt,
+    })
+}
+
 /// The blob a ref points at, fetched and parsed, with the digest re-checked by the
 /// record's own reader.
 fn read_record<T: Record>(
