@@ -13,7 +13,7 @@
 //! checked by a third party with a two-line script.
 //!
 //! ```
-//! use gitiup_attest::key::SigningKey;
+//! use gitiup_canon::key::SigningKey;
 //! let key = SigningKey::from_seed(&[7u8; 32]);
 //! // The public key is a line you can paste into `authorized_keys`.
 //! let line = key.public_key().to_openssh();

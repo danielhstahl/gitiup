@@ -381,6 +381,28 @@ impl Expect {
     }
 }
 
+/// Something a git-backed host must make a parent of the pointer commit it writes.
+///
+/// A gitiup ref whose value is a record digest is not a commit, so on a git host it
+/// points at a small **pointer commit** carrying the record bytes
+/// ([`crate::hosts::git`]). Which commits that commit should parent on is knowledge
+/// the record has and the ref does not: a change ref must reach the commits it
+/// proposes, or `git fetch refs/changes/<id>/head` delivers a record describing a
+/// commit the fetch did not carry
+/// ([ADR-0003 D5](../../../docs/adr/0003-change-record-format-and-merge-semantics.md)).
+///
+/// Hosts where a ref is a row rather than a commit (the `fs` host, a bucket) ignore
+/// this: their reads do not go through a packfile, so there is nothing to carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefParent {
+    /// A commit, by its git object id.
+    Commit(Oid),
+    /// Whatever the named ref currently holds — used for a chain of pointer commits,
+    /// where the parent is the previous attempt's pointer and only the host knows its
+    /// git oid.
+    Ref(RefName),
+}
+
 /// A compare-and-swap ref write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefUpdate {
@@ -394,6 +416,9 @@ pub struct RefUpdate {
     pub actor: Option<Actor>,
     /// Free-form reason, for audit trails and reflog-ish messages.
     pub message: Option<String>,
+    /// Extra parents for the pointer commit a git host writes (see [`RefParent`]);
+    /// empty for every write that is not about a record chain.
+    pub parents: Vec<RefParent>,
 }
 
 impl RefUpdate {
@@ -405,6 +430,7 @@ impl RefUpdate {
             new,
             actor: None,
             message: None,
+            parents: Vec::new(),
         }
     }
 
@@ -432,6 +458,15 @@ impl RefUpdate {
     /// Record a message.
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    /// Ask a git-backed host to parent the pointer commit it writes on these.
+    ///
+    /// Ignored by hosts where a ref is not a commit; a caller must never *need* the
+    /// parent, only prefer it (the record still names what it carries).
+    pub fn with_parents(mut self, parents: impl IntoIterator<Item = RefParent>) -> Self {
+        self.parents = parents.into_iter().collect();
         self
     }
 }

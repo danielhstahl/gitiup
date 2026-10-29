@@ -1,0 +1,37 @@
+[package]
+name = "gitiup-canon"
+description = "The parts of ADR-0001 that may have exactly one implementation: the canonicaliser, the digest and SSH key-id primitives, the signature entry, and the exit-code taxonomy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate exists because two crates need *identical* bytes and neither may
+# re-implement them:
+#
+# * `gitiup-attest` is the attestation format (ADR-0001) and was the only owner of
+#   the canonicaliser until [ADR-0003 D11](../../../docs/adr/0003-change-record-format-and-merge-semantics.md)
+#   said a second one is a second digest and therefore a signature over bytes the
+#   verifier never saw;
+# * `gitiup-host` is a *storage* layer and must not depend on the format crate
+#   (which carries a policy engine and a clock in it), yet a change record stored
+#   in a bucket has to be re-hashed by exactly the same rules and verified by
+#   exactly the same key-id derivation as the one that signed it.
+#
+# So the shared half lives here and both sides depend on it. What is in scope is
+# exactly "the things a digest or a signature depends on": canonical JSON (D1),
+# algorithm-tagged digests (D2), Ed25519 + SSH key ids + PAE (D3) and the exit-code
+# taxonomy (D7). Everything else — manifests, freshness policy, trust, verdicts —
+# stays in `gitiup-attest`, and this crate has no idea what an attestation is.
+#
+# Same two rules as the format crate: no I/O, no network, no C toolchain.
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lints]
+workspace = true

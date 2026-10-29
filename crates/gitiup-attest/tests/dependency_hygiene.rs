@@ -18,7 +18,19 @@ use std::path::{Path, PathBuf};
 
 /// Everything this crate may depend on directly. Adding to this list is a
 /// deliberate act: say why in the PR.
-const ALLOWED_DEPENDENCIES: [&str; 4] = ["ed25519-dalek", "serde", "serde_json", "sha2"];
+///
+/// `gitiup-canon` is the half of ADR-0001 that may have exactly one implementation
+/// (the canonicaliser, the digest and SSH key-id primitives, the exit-code
+/// taxonomy), re-exported here unchanged so that `gitiup-host` — which may not
+/// depend on *this* crate — can re-hash and signature-check a change record with the
+/// same code. See ADR-0003 D11.
+const ALLOWED_DEPENDENCIES: [&str; 5] = [
+    "ed25519-dalek",
+    "gitiup-canon",
+    "serde",
+    "serde_json",
+    "sha2",
+];
 
 /// Tokens that must never appear in library code.
 const FORBIDDEN_IN_LIBRARY: &[&str] = &[

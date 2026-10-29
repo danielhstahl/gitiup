@@ -165,8 +165,65 @@ impl HostError {
             message: message.into(),
             hint: None,
             location: None,
+            exit: None,
             source: None,
         }))
+    }
+
+    /// A record whose bytes do not re-hash to the name it is filed under, or that
+    /// are not their own canonical form: exit **8**
+    /// ([ADR-0003 D11](../../../docs/adr/0003-change-record-format-and-merge-semantics.md)).
+    ///
+    /// Distinct from [`HostError::invalid`] because a merge gate branches on the
+    /// difference: `6` means "this record is refused", `8` means "these bytes are
+    /// not what they were named", which is a transport or an attacker question and
+    /// not a policy one.
+    pub fn digest_mismatch(what: impl Into<String>, message: impl Into<String>) -> Self {
+        HostError::invalid(what, message).with_exit_code(8)
+    }
+
+    /// A signature that does not verify, or names a key that is not the key that
+    /// signed: exit **7**.
+    pub fn bad_signature(what: impl Into<String>, message: impl Into<String>) -> Self {
+        HostError::invalid(what, message).with_exit_code(7)
+    }
+
+    /// The process exit code this failure means, in the taxonomy every gitiup tool
+    /// answers with ([ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md),
+    /// restated for changes by
+    /// [ADR-0003 D11](../../../docs/adr/0003-change-record-format-and-merge-semantics.md)):
+    ///
+    /// | code | meaning |
+    /// |------|---------|
+    /// | 2 | usage — including a URI no host speaks |
+    /// | 3 | I/O, and a store refusal this tool does not own |
+    /// | 6 | refused: a bad record, an unknown version, a conflict, a stale base |
+    /// | 7 | a signature that does not verify |
+    /// | 8 | bytes that are not their own canonical form, or a digest that does not match |
+    ///
+    /// A refusal raised by code that knows better says so with
+    /// [`HostError::with_exit_code`]; everything else takes its code from its kind,
+    /// which is the same default `gitiup-quorum` uses for store failures.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            HostError::Invalid(e) => e.exit.unwrap_or(6),
+            HostError::SchemeUnknown(_) => 2,
+            HostError::Unreachable(_) | HostError::Storage(_) | HostError::NotFound(_) => 3,
+            HostError::PermissionDenied(_) => 3,
+            HostError::Conflict(_) | HostError::UnsupportedCas(_) => 6,
+        }
+    }
+
+    /// Say "this failure's exit code is not the one my kind implies".
+    ///
+    /// Only [`HostError::Invalid`] takes the override — a conflict is a conflict and
+    /// an unreachable host is an unreachable host — and the ones that do not are
+    /// returned unchanged rather than quietly rewritten.
+    pub fn with_exit_code(mut self, code: u8) -> Self {
+        if let HostError::Invalid(e) = &mut self {
+            e.exit = Some(code);
+        }
+        self
     }
 
     /// Shorthand for [`HostError::Conflict`] from a CAS expectation failure.
@@ -405,6 +462,9 @@ pub struct Invalid {
     pub hint: Option<String>,
     /// Where the problem is, e.g. `gitiup.toml:12:5`.
     pub location: Option<String>,
+    /// An exit code other than the `6` this kind implies, set by code that knows it
+    /// is a digest (`8`) or a signature (`7`) failure — see [`HostError::exit_code`].
+    pub exit: Option<u8>,
     /// Underlying error, if any.
     pub source: Option<Box<dyn Error + Send + Sync + 'static>>,
 }

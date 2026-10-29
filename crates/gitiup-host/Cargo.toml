@@ -22,6 +22,12 @@ default = []
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
 
 [dependencies]
+# The shared canonicaliser, digests and Ed25519 key ids (ADR-0003 D11). This is the
+# whole of what this crate borrows from the format world — a storage layer must not
+# depend on `gitiup-attest` (wire format, trust, freshness policy, a clock), but a
+# change record it stores has to be re-hashed and signature-checked by exactly the
+# rules the signer used, and "we have our own canonicaliser" is two digests.
+gitiup-canon = { path = "../gitiup-canon" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -18,7 +18,7 @@
 //!
 //! | decision | ADR | in code |
 //!|----------|-----|---------|
-//!| canonical JSON (RFC 8785 narrowed), DSSE PAE envelope | D1 | [`canon`], [`envelope::pae`] |
+//!| canonical JSON (RFC 8785 narrowed), DSSE PAE envelope | D1 | [`canon`], [`pae`] |
 //!| `sha256:` digests, algorithm tagged in the string | D2 | [`digest::Digest`], [`oid::GitOid`] |
 //!| raw Ed25519, SSH public keys, SSH fingerprints as key ids | D3 | [`key`] |
 //!| `result` vs `claims` split; two digests | D4 | [`manifest`] |
@@ -63,10 +63,12 @@
 //! Deliberately, so that the trust-critical code stays small and offline:
 //!
 //! * **no I/O** — storage is `gitiup-host`'s job (giti-1rs.5 writes these bytes to
-//!   `kv/attestation/<hex>` and points `refs/attestations/<oid>` at them); the
+//!   `kv/attestation/<hex>` and points `refs/attestations/<subject>/<digest>` at them); the
 //!   `gitiup` CLI crate is the one place that reads a run report off disk;
 //! * **no keystore** — key generation, encryption, ssh-agent and gpg live in
-//!   giti-1rs.6 and plug in through [`key::Signer`];
+//!   giti-1rs.6 and plug in through [`key::Signer`] (the `Signer` trait itself, the
+//!   canonicaliser and the exit-code taxonomy live in `gitiup-canon`, and this crate
+//!   re-exports them: [ADR-0003 D11](../../../docs/adr/0003-change-record-format-and-merge-semantics.md));
 //! * **no normalisation** — the digests in [`manifest::Step`] are of *normalised*
 //!   output, produced by giti-1rs.3, which plugs into the digest computation
 //!   through [`run::Normaliser`] rather than living here;
@@ -89,13 +91,16 @@
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
-pub mod canon;
-pub mod digest;
-pub mod encoding;
+// The canonicaliser, the digest and key-id primitives and the error taxonomy are
+// re-exports of `gitiup-canon`, not copies of them (ADR-0003 D11): a second
+// implementation of either is a second digest, so `gitiup-host` — which stores and
+// re-hashes signed records but must not depend on this crate — links the same code
+// this one does. The paths below are the public surface of ADR-0001 and are unchanged
+// by the move.
+pub use gitiup_canon::{canon, digest, encoding, error, key};
+
 pub mod envelope;
 pub mod envreq;
-pub mod error;
-pub mod key;
 pub mod manifest;
 pub mod oid;
 pub mod policy;
@@ -111,10 +116,11 @@ pub use canon::{
 };
 pub use digest::{Algorithm, Digest};
 pub use envelope::{
-    AttestationDoc, DOC_SCHEMA_VERSION, MAX_SIGNATURES, PAYLOAD_TYPE, Verdict, doc_from_dsse, pae,
+    AttestationDoc, DOC_SCHEMA_VERSION, MAX_SIGNATURES, PAYLOAD_TYPE, Verdict, doc_from_dsse,
 };
 pub use envreq::{Arch, EnvMatch, EnvironmentRequirement, REQUIREMENT_FIELDS};
 pub use error::{Error, ErrorKind, Result};
+pub use gitiup_canon::pae;
 pub use key::{PublicKey, Signature, SignatureAlgorithm, SignatureEntry, Signer, SigningKey};
 pub use manifest::{
     ActionPin, Artifact, Claims, Environment, EventContext, ImageRef, InputValue, NO_SANDBOX,

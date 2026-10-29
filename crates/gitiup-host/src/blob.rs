@@ -53,6 +53,10 @@ impl Namespace {
 
     /// Change records (the PR substitute).
     pub const CHANGE: Namespace = Namespace::const_new("change");
+    /// Merge records: the signed record of a CAS ref move (ADR-0003 D7).
+    pub const MERGE: Namespace = Namespace::const_new("merge");
+    /// Abandon records: the signed closing of a change (ADR-0003 D7).
+    pub const ABANDON: Namespace = Namespace::const_new("abandon");
     /// Attestations (signed run digests and their manifests).
     pub const ATTESTATION: Namespace = Namespace::const_new("attestation");
     /// Verifier rosters.

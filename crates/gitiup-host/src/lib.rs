@@ -49,12 +49,16 @@
 //! ```text
 //! refs/heads/**            real branches (owner writes)
 //! refs/changes/<id>/head   proposed change head
-//! refs/attestations/<oid>  attestations for a commit, so `git fetch` carries proof
+//! refs/attestations/<subject>/<digest>  attestations for a commit, so `git fetch` carries proof
 //! refs/gitiup/**           roster, job/lease records, quorum state
 //! ```
 //!
 //! The attestation namespace is keyed by the *subject* first and holds one ref per
 //! proof, and [`attest`] owns that layout plus the retention policy that prunes it.
+//! Changes live under `refs/changes/<change_id>/{head,attempt/<n>,merged,abandoned}`,
+//! and [`change`] owns that layout: a change is a signed record in the content-addressed
+//! store, advertised by a ref, whose merge is a compare-and-swap a bucket can honour
+//! ([ADR-0003](../../../docs/adr/0003-change-record-format-and-merge-semantics.md)).
 //!
 //! ```
 //! use gitiup_host::{BlobStore, Host, RefStore, Namespace, RefName, RefUpdate, Expect};
@@ -82,6 +86,8 @@
 pub mod attest;
 pub mod blob;
 pub mod capability;
+/// The change record: its bytes, its refs, and publishing it over CAS (ADR-0003).
+pub mod change;
 pub mod config;
 pub mod conformance;
 pub mod error;

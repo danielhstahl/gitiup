@@ -30,6 +30,7 @@ use crate::envreq::EnvMatch;
 use crate::error::{Error, ErrorKind, Result};
 use crate::key::{SignatureEntry, Signer};
 use crate::manifest::{ResultDigest, RunManifest};
+use crate::pae;
 use crate::policy::{Freshness, Policy, check_freshness};
 use crate::report::VerdictReport;
 
@@ -47,22 +48,9 @@ pub const DOC_SCHEMA_VERSION: u32 = 1;
 /// ([ADR-0001 D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)).
 pub const MAX_SIGNATURES: usize = 64;
 
-/// Pre-Authentication Encoding, exactly as in-toto DSSE defines it.
-pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + payload_type.len() + payload.len());
-    // The lengths are ASCII decimal counts of *bytes*, and the payload is not
-    // parsed at all — that is the whole point of PAE.
-    out.extend_from_slice(b"DSSEv1");
-    out.push(b' ');
-    out.extend_from_slice(payload_type.len().to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload_type.as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload.len().to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload);
-    out
-}
+// `pae` itself lives in `gitiup-canon` and is re-exported from this crate's root,
+// so there is exactly one definition compiled into the format and ADR-0003's
+// change records sign over the same bytes.
 
 /// A signed attestation: manifest + signatures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

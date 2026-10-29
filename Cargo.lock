@@ -1232,6 +1232,17 @@ name = "gitiup-attest"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "gitiup-canon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "gitiup-canon"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1243,6 +1254,7 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "gitiup-canon",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -9,7 +9,7 @@
 //! ```text
 //! refs/heads/**            real branches (owner writes)
 //! refs/changes/<id>/head   proposed change head
-//! refs/attestations/<oid>  attestations for a commit, so `git fetch` carries proof
+//! refs/attestations/<subject>/<digest>  attestations for a commit, so `git fetch` carries proof
 //! refs/gitiup/**           roster, job/lease records, quorum state
 //! ```
 //!
@@ -51,7 +51,7 @@
 //! bytes. So such a ref points at a small **pointer commit** holding
 //! `gitiup-ref.json` (the digest gitiup promised, the actor, the time) and the
 //! record bytes themselves. That is what makes `git fetch` carry proof: fetching
-//! `refs/attestations/<oid>` brings the attestation *in the same packfile* as the
+//! `refs/attestations/<subject>/<digest>` brings the attestation *in the same packfile* as the
 //! ref, with no second protocol. Refs whose value is a git commit stay exactly
 //! what they look like — plain git — so `refs/heads/**` and a change head that is
 //! a real commit are untouched by any of this.
@@ -1195,9 +1195,32 @@ impl GitHost {
             },
         ];
         let tree = plumb::make_tree(&self.inner.cli, &entries)?;
-        let parents: Vec<String> = current
+        // The ref's own previous value is the first parent, so `git log <ref>` is the
+        // audit trail of that ref. Then whatever the caller named: a change ref names
+        // the commit it proposes (so a fetch of the ref carries it) and the previous
+        // attempt's pointer commit (so one fetch of `refs/changes/<id>/*` carries
+        // every attempt) — ADR-0003 D5.
+        let mut parents: Vec<String> = current
             .map(|resolved| vec![resolved.git_oid.clone()])
             .unwrap_or_default();
+        for parent in &update.parents {
+            let named = match parent {
+                crate::refs::RefParent::Commit(oid) => Some(oid.hex()),
+                crate::refs::RefParent::Ref(name) => {
+                    self.probe(name)?.map(|resolved| resolved.git_oid)
+                }
+            };
+            let Some(named) = named else { continue };
+            if parents.contains(&named) {
+                continue;
+            }
+            // A parent git cannot name would fail the whole write for a bit of history
+            // nobody has yet: the record is the promise, the parents are the convenience.
+            if !self.has_git_object(&named)? {
+                continue;
+            }
+            parents.push(named);
+        }
         // The commit message is the audit line a reviewer reads; the caller's own
         // message is inside the ref document, where it cannot be mangled by a
         // line-wrapping tool between here and the remote.

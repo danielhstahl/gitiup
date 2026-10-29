@@ -18,6 +18,11 @@ rust-version.workspace = true
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["std"] }
+# The canonicaliser, the digest/key-id primitives and the exit-code taxonomy are
+# *re-exported* from here, not defined here: ADR-0003 D11 allows exactly one
+# implementation of each, and `gitiup-host` — which stores signed records but must
+# not depend on this crate — links the same code this one does.
+gitiup-canon = { path = "../gitiup-canon" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
