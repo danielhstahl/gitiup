@@ -269,6 +269,16 @@ pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
             "name a remote that exists, or use --store <dir>",
         )
     })?;
+    // A remote that needs a forge adapter this build was not compiled with is refused *by
+    // name*, with the feature to enable in the hint, before anything is opened: the
+    // alternative is a write that "succeeds" against a remote whose records this binary
+    // cannot read. The same answer `gitiup doctor --remotes` gives, at the same code.
+    if let Err(why) = remotes::classify(remote) {
+        return Err(CliError::refused(
+            format!("remote '{}': {why}", remote.name),
+            "the message above names the feature to build with",
+        ));
+    }
     let host = remotes::open(remote, config.credential_profile(remote))
         .map_err(|e| CliError::io(format!("remote '{}': {e}", remote.name)))?;
     let what = if named.is_some() {

@@ -17,6 +17,9 @@
 //! gitiup attest push|list|show|gc        file signed attestations in a host, read them
 //!                                      back, and retire the ones a retention policy
 //!                                      says are old
+//! gitiup change new|submit|list|show     propose work to any host: draft a signed
+//!                                      change from local commits, publish it as an
+//!                                      attempt, and read it back
 //! gitiup verify attestation [DOC]       may this attestation be acted on? one exit
 //!                                      code (0/6/7/8) and a report of every check
 //! gitiup normalise [OPTIONS] [REPORT]   what normalisation rewrote; --compare two runs
@@ -46,6 +49,7 @@
 use std::process::ExitCode;
 
 mod attest;
+mod change;
 mod digest;
 mod doctor;
 mod env;
@@ -71,6 +75,10 @@ COMMANDS:
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc
+    change new [OPTIONS]           draft a signed change record from local commits
+    change submit [OPTIONS]        publish one attempt of it to the store you name
+    change list [OPTIONS]          the changes a store advertises (--state open)
+    change show <ID> [OPTIONS]     one change, its attempts, and its merge record
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·
@@ -123,6 +131,15 @@ fs, a bare repo, a bucket — and refuse anything that does not re-hash to its o
 never touches an attestation another ref still points at, which is what keeps a quorum's
 seat submissions and a merge's recorded proof safe. Without --apply it only prints the plan.
 
+`change` is how work gets *in*, on any host, with no forge: `new` drafts a record from local
+commits (the commit it proposes, the branch it forks from and the oid that branch was at,
+one line of title, the jobs to re-run) and signs it with this machine's identity, so who
+proposed it is a signature and not a filename; `submit` pushes the commits, files the
+record at kv/change/<digest> and moves refs/changes/<id>/head under compare-and-swap. A
+re-submit is a new *attempt* and never an overwrite, and a base the store no longer has is
+refused with both oids and exit 6. `list` and `show` read it back from an fs directory, a
+bare repository or a bucket with the same three flags: `--store`, `--remote`, `--json`.
+
 `verify attestation` is the question the whole format exists to answer: may this proof be
 acted on? It checks the canonical bytes re-hash to the digest they claim, that every
 signature verifies and belongs to a key the policy trusts, that enough of them did, that
@@ -154,6 +171,10 @@ Try:
     gitiup attest list --commit $(git rev-parse HEAD) --store ./store
     gitiup attest show --digest <hex> --store ./store --json
     gitiup attest gc --store ./store --max-age 90d --max-per-commit 5   # the plan
+    gitiup change new --base main --out change.json   # draft and sign, publish nothing
+    gitiup change submit --record change.json --store ./store --json
+    gitiup change list --store ./store --state open --json
+    gitiup change show chg-6a6a8eab778ba4d0 --store ./store --json
     gitiup verify attestation proof.json --policy gitiup-policy.json     # the verdict
     gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
     gitiup normalise run.json                  # what was rewritten, and why
@@ -315,6 +336,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "doctor" => doctor::run(&args[1..]),
         "digest" => digest::run(&args[1..]),
         "attest" => attest::attest(&args[1..]),
+        "change" => change::change(&args[1..]),
         "verify" => verify::verify(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),

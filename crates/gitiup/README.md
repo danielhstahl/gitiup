@@ -229,6 +229,75 @@ Three things are deliberate:
 The full rules, including what retention cannot do, are in
 [docs/host-abstraction.md](../../docs/host-abstraction.md#attestations-in-the-store).
 
+## `gitiup change`
+
+The contributor's half of contributing without a forge: a **change** is one signed
+record in a content-addressed store, advertised by a ref, naming the commit it
+proposes, the branch it is proposed against and the oid that branch was at where the
+work forked. `who proposed this` is a signature and not a username, so a directory, a
+bucket and a bare repository all say the same thing about it. All three hosts answer
+`--store`/`--remote`, and the store has to be named: a typo cannot publish a change
+somewhere else.
+
+```console
+$ gitiup change new --base main --out change.json
+change chg-8a4f0932daec33f2
+  attempt  0 · anchor sha1:2d394df0…7e86
+  base     refs/heads/main @ sha1:1b1cfe58…d9f5 (1 commits)
+  head     sha1:2d394df0…7e86
+  title    Fix the ref parser for peeled refs
+  jobs     build, test (workflow .github/workflows/ci.yml)
+  author   KgCqW9kg…AgNQ (gitiup) · signed
+  digests  change sha256:21cb95bb…a6fd · record sha256:cc9147d1…90ef
+  written  change.json
+  next     gitiup change submit --record change.json --store <dir>
+
+$ gitiup change submit --record change.json --store ../store
+submitted chg-8a4f0932daec33f2 attempt 0
+  store    fs store ../store
+  base     refs/heads/main @ sha1:1b1cfe58…d9f5 [the store agrees]
+  head     sha1:2d394df0…7e86 (5 objects, 523 bytes, as gitiup raw objects)
+  ref      refs/changes/chg-8a4f0932daec33f2/attempt/0
+  head ref refs/changes/chg-8a4f0932daec33f2/head -> sha256:cc9147d1…90ef
+  record   kv/change/cc9147d14075631660af262973b62415dedca83cca08916bffdf1e7c4a2990ef (831 bytes)
+
+$ gitiup change list --store ../store
+chg-8a4f0932daec33f2  open      a1   sha1:2d394df0…7e86   KgCqW9kg…AgNQ  Fix the ref parser for peeled refs
+
+$ gitiup change show chg-8a4f --store ../store --json | jq '.attempt, .base_check, .fetch'
+0
+"ok"
+"git fetch <remote> 'refs/changes/chg-8a4f0932daec33f2/*'"
+```
+
+What each one promises, in the order the promises matter:
+
+* `new` reads a repository with git plumbing and *signs where it drafts*: an unsigned
+  change is a rumour, and the format refuses one, so there is no unsigned intermediate to
+  leak. `--base` is required; a change with nothing on top of the branch is refused rather
+  than filed.
+* `submit` pushes the commits, then the record bytes, then the refs — in that order, so a
+  ref never promises bytes the store cannot return (ADR-0003 D5). On a git store the
+  commits go as a git packfile, so a reviewer's plain `git fetch` of the change carries
+  the proposed work and the record in one transfer; on a store with no git object database
+  it says so out loud instead of letting the gap surface as a missing object.
+* A base that has moved is a refusal (exit `6`) naming **both** oids and the store's own
+  spelling of them, because a change whose base has moved is a change that cannot be
+  merged. `list` and `show` re-check it on every read and print `[stale base]`.
+* A re-submit is an attempt, never an overwrite: attempt *n*'s ref is create-only and its
+  bytes never move, `head` moves under compare-and-swap, and continuing a change is said
+  with `--change <id>` because an amended commit cannot recompute its own change id.
+* `show` reads the record **through the ref that advertises it**, so the store-binding
+  checks (bytes hash to the name they are filed under, the record is about the change its
+  ref says, `head` names the newest attempt) happen on the way in and not as an extra
+  command.
+
+The rules, the refusal table and the exit codes are in
+[docs/changes.md](../../docs/changes.md); the record format itself is
+[ADR-0003](../../docs/adr/0003-change-record-format-and-merge-semantics.md). Merging and
+checking out (`gitiup change merge`, `gitiup change checkout`) are separate tickets and
+not here yet.
+
 ## `gitiup verify attestation`
 
 The question the format exists to answer, in one exit code: *may this proof be acted
@@ -401,6 +470,16 @@ checks that are already here rather than adding new ones.
   an empty policy refused, and — over loopback smart HTTP with nothing but `git` on the
   reading side — a plain `git clone` + `fetch refs/attestations/*` ending up holding the
   exact signed bytes.
+* `tests/change_cli.rs` — `gitiup change` as command lines, against a real local
+  repository and three stores: a draft naming its commits, its author and the merge-base it
+  forked from; submit → list → show round-tripping the *same bytes* (`--bytes` returns what
+  `new` wrote, because a signature covers canonical bytes); a re-submit becoming attempt 1
+  with attempt 0's ref and record unmoved; a stale base refused with both oids in the
+  message and nothing written; a store with branches and none of them yours, refused by
+  name; an unsigned record, an unnamed store, an unknown handle and a 3-hex handle each
+  refused with the right exit code; and — over loopback smart HTTP, with nothing but `git`
+  on the reading side — a change that reaches a plain git remote so that `git fetch` of
+  `refs/changes/<id>/*` brings the record *and* every commit it proposes.
 * `tests/verify_cli.rs` — `gitiup verify attestation` as command lines, each in a fresh
   process, every one with the clock pinned: the acceptance path and the ladder's
   outcome for each check; exit `6` for an untrusted signer (signature `passed`, so the
