@@ -300,7 +300,7 @@ impl Default for VerdictReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AttestationDoc, Policy, sample};
+    use crate::{AttestationDoc, Policy, TimeUs, sample};
 
     #[test]
     fn the_ladder_is_listed_before_anything_runs() {
@@ -335,7 +335,14 @@ mod tests {
 
     #[test]
     fn a_clean_document_reports_no_reasons_and_no_failure() {
-        let report = AttestationDoc::new(sample::local()).verify_report(&Policy::default());
+        // The clock is pinned, as it is everywhere else that judges freshness: the fixture
+        // is a fixed moment, so an unpinned `now` would turn this test into a calendar and
+        // it would start failing one day after it was written.
+        let policy = Policy {
+            now: Some(TimeUs::from_secs(1_793_092_600)),
+            ..Default::default()
+        };
+        let report = AttestationDoc::new(sample::local()).verify_report(&policy);
         // No signatures at all: refused, and the reason is a policy one (exit 6),
         // not a signature one — nothing forged anything, nobody signed anything.
         assert_eq!(report.exit_code(), 6);
