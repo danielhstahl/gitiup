@@ -5,8 +5,11 @@
 //! implementation of each and the host's own test file cannot drift from the
 //! suite. The rest are the edges the shared suite was asked to cover explicitly:
 //! an empty store, a deleted ref, a pack big enough to matter, a listing wide
-//! enough to page, credentials that were refused, and a host that cannot do
-//! compare-and-swap.
+//! enough to page, credentials that were refused, a host that cannot do
+//! compare-and-swap, and the change workflow of ADR-0003 end to end — proposed,
+//! re-attempted, listed, shown, merged once, and refused the second time. Those two
+//! bodies are written in [`crate::changes`], which is also where the cross-host body
+//! lives.
 //!
 //! A body asserts; it does not return `Result`. That is what makes them readable,
 //! and it is why [`crate::runner`] runs each one in its own `#[test]` (so the
@@ -15,12 +18,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use gitiup_host::attest;
 use gitiup_host::conformance;
 use gitiup_host::{
     BlobEntry, Capability, Expect, Host, HostError, HostErrorExt, HostErrorKind, HostKind,
     Namespace, Oid, Pack, PackFormat, PackRequest, RefDeletion, RefName, RefQuery, RefUpdate,
 };
 
+use crate::changes;
 use crate::registration::Denial;
 use crate::registration::Knobs;
 
@@ -761,6 +766,125 @@ fn one_object_is_forgotten_or_the_refusal_says_why(ctx: &Ctx<'_>) {
     let _ = host.purge_cas(&absent);
 }
 
+/// A proof is found by the question a gate asks: *what proves this commit?* — and a
+/// commit may carry more than one.
+///
+/// This is the body that keeps [giti-1rs]'s promise transport-neutral. An
+/// attestation is only evidence if the party that has to act on it can find it
+/// again, and the question they ask is always about the object, never about the
+/// spelling of a ref: "give me the proofs about this commit". Three things are
+/// asserted about every host for it, because each has been broken by some host once:
+///
+/// * the namespace `refs/attestations/<subject>/<digest>` can hold **two** proofs
+///   about one commit, so a second signer, run or tier cannot overwrite the first;
+/// * a listing by subject finds both, fetches the exact signed bytes back (a digest
+///   whose bytes come back re-written is a signature that will not verify), and has
+///   nothing it had to shrug at;
+/// * the store does not file what it is given in the retired single-level shape, and
+///   a re-publish of identical bytes is one proof, not two.
+fn attestations_about_one_subject_are_found_by_subject(ctx: &Ctx<'_>) {
+    let host = ctx.host();
+    let subject = Oid::hash_bytes(b"the commit a change proposes");
+    let proposer = b"{\"signed\":\"proposer\"}".to_vec();
+    let owner = b"{\"signed\":\"owner\"}".to_vec();
+
+    let first = attest::publish(host, &subject, &proposer, "ada").expect("publish a proof");
+    let second =
+        attest::publish(host, &subject, &owner, "bob").expect("a second proof, no overwrite");
+    assert!(
+        !first.already && !second.already,
+        "neither was there before"
+    );
+    assert_ne!(first.digest, second.digest, "two proofs, two digests");
+    assert_ne!(
+        first.reference, second.reference,
+        "and two refs: one commit is not a single-use slot"
+    );
+    assert!(
+        attest::publish(host, &subject, &proposer, "ada")
+            .expect("re-publishing identical bytes is not an error")
+            .already,
+        "the same bytes are the same proof, so they must not be counted twice"
+    );
+
+    let catalog = attest::list_for(host, &subject).expect("list by subject");
+    assert!(
+        catalog.unexpected.is_empty(),
+        "a ref in the attestation namespace this host cannot account for: {:?}",
+        catalog.unexpected
+    );
+    assert!(
+        catalog.legacy().is_empty(),
+        "a store this build writes must not write the retired single-level shape"
+    );
+    let mut got: Vec<String> = catalog
+        .entries
+        .iter()
+        .map(|entry| entry.digest.hex())
+        .collect();
+    let mut want = vec![first.digest.hex(), second.digest.hex()];
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "both proofs about one commit are listed for it");
+    for entry in &catalog.entries {
+        assert_eq!(
+            entry.subject, subject,
+            "a subject listing lists that subject"
+        );
+    }
+    // The bytes come back exactly as published — a signature is only ever over
+    // these bytes, so a host that prettifies on the way in or out is caught here.
+    assert_eq!(
+        attest::fetch(host, &first.digest).unwrap().as_deref(),
+        Some(&proposer[..]),
+        "the first proof's bytes come back verbatim"
+    );
+    assert_eq!(
+        attest::fetch(host, &second.digest).unwrap().as_deref(),
+        Some(&owner[..]),
+        "and the second's"
+    );
+    assert_eq!(
+        attest::list_all(host)
+            .expect("list the store")
+            .entries
+            .len(),
+        2,
+        "the whole-store listing sees the same two and no more"
+    );
+    assert!(
+        attest::legacy_proofs(host)
+            .expect("look for the old shape")
+            .is_empty(),
+        "nothing was filed in the retired shape"
+    );
+}
+
+/// The change workflow, end to end, on this host: propose, re-attempt, list, show,
+/// merge — and a second merge that is refused.
+///
+/// The written half of the body is [`crate::changes::workflow`]; what is here is the
+/// shape, because the assertions are the same for a directory, a bare repository, a
+/// bucket and a forge, and the whole point of a conformance suite is that they are.
+///
+/// This is the body `giti-b2z.6` exists for. A change is the object a stranger publishes
+/// when there is no forge, so every host has to hold the same line about it: an attempt
+/// ref that never moves, a head that is the only ref a re-attempt is allowed to move, a
+/// merge that is a compare-and-swap on the branch and a create-only ref on the record,
+/// and a second merge that is a refusal rather than a surprise.
+fn a_change_goes_from_proposal_to_merge_and_merges_once(ctx: &Ctx<'_>) {
+    changes::workflow(ctx.host());
+}
+
+/// A merge against a branch that moved is refused, the same way everywhere.
+///
+/// The kind is the contract: `invalid`, exit 6, both oids named, nothing written — on the
+/// fs host, on a bare repository over `file://` and over `git-http-backend`, on a bucket
+/// with conditional writes, and on a forge. See [`crate::changes::stale_base`].
+fn a_stale_base_merge_is_refused_the_same_way_everywhere(ctx: &Ctx<'_>) {
+    changes::stale_base(ctx.host());
+}
+
 /// Credentials that were refused come back as a refusal.
 ///
 /// The dangerous failure mode of an expired or revoked credential is not the
@@ -1011,7 +1135,7 @@ pub fn bodies() -> &'static [Body] {
     &BODIES
 }
 
-static BODIES: [Body; 15] = [
+static BODIES: [Body; 18] = [
     Body {
         name: "blobs_round_trip",
         shape: Shape::Single,
@@ -1095,6 +1219,27 @@ static BODIES: [Body; 15] = [
         requires_cas: true,
         note: "retention's delete question gets an honest answer: gone, or why not",
         run: one_object_is_forgotten_or_the_refusal_says_why,
+    },
+    Body {
+        name: "attestations_about_one_subject_are_found_by_subject",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "two proofs about one commit, both found by the commit, bytes verbatim",
+        run: attestations_about_one_subject_are_found_by_subject,
+    },
+    Body {
+        name: "a_change_goes_from_proposal_to_merge_and_merges_once",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "propose, re-attempt, list, show, merge — and the second merge is refused",
+        run: a_change_goes_from_proposal_to_merge_and_merges_once,
+    },
+    Body {
+        name: "a_stale_base_merge_is_refused_the_same_way_everywhere",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "a branch that moved is refused with one kind, one exit code and both oids",
+        run: a_stale_base_merge_is_refused_the_same_way_everywhere,
     },
     Body {
         name: "describe_and_capabilities",

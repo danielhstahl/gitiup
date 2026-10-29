@@ -37,6 +37,10 @@ github = ["dep:gitiup-host-github", "gitiup-host-github/testing"]
 
 [dependencies]
 gitiup-host = { path = "../gitiup-host" }
+# The change bodies sign records, so they need the keys the ADR-0003 fixtures are
+# derived from: the same `SigningKey` a host's own change tests sign with, so a digest
+# here and a digest in `docs/adr/fixtures/change-v1` are the same number.
+gitiup-canon = { path = "../gitiup-canon" }
 gitiup-host-github = { path = "../gitiup-host-github", default-features = false, optional = true }
 tempfile = "3"
 aws-config = { version = "1", optional = true }

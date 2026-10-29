@@ -329,7 +329,8 @@ fn an_attestation_only_the_check_run_has_is_reported_as_such() {
 #[test]
 fn an_attestation_ref_is_the_same_mechanism_any_host_uses() {
     // Nothing about the attestation path is github-specific: it is
-    // `refs/attestations/<oid>` pointing at a record, exactly as on the bucket host.
+    // `refs/attestations/<subject>/<digest>` pointing at a record, exactly as on the
+    // bucket host, filed by the same `gitiup_host::attest::publish` call.
     let forge = forge();
     let host = hosted(&forge);
     let subject = head_oid(&forge, "main");
@@ -342,17 +343,103 @@ fn an_attestation_ref_is_the_same_mechanism_any_host_uses() {
         Some(&bytes[..]),
         "the bytes live in the content-addressed store like any other record"
     );
-    // `refs/attestations/<digest of the attestation>` — the same key the `fs` and
-    // bucket hosts use, so a fetch of the ref carries the proof on any host.
-    let attestation_ref = RefName::attestation(&digest);
+    // `refs/attestations/<subject>/<digest>` — the same key the `fs` and bucket
+    // hosts use, so a fetch of the ref carries the proof on any host, and a second
+    // proof about the same commit has somewhere to go.
+    let attestation_ref = gitiup_host::attest::ref_name(&subject, &digest);
     let read = host
         .get_ref(&attestation_ref)
         .expect("read the ref")
         .expect("the ref is there");
     assert_eq!(read.oid, digest);
     assert!(
-        attestation_ref.as_str().starts_with("refs/attestations/"),
+        attestation_ref.as_str().starts_with("refs/attestations/")
+            && attestation_ref.as_str().contains(&format!("{subject}/")),
         "{attestation_ref}"
+    );
+    // …and the shared listing reads it back as one of the commit's proofs, which is
+    // what `gitiup attest list --commit` runs.
+    let catalog = gitiup_host::attest::list_for(&host, &subject).expect("list");
+    assert!(
+        catalog.unexpected.is_empty(),
+        "a proof this host filed is not a surprise to its own listing: {:?}",
+        catalog.unexpected
+    );
+    assert_eq!(catalog.entries.len(), 1);
+    assert_eq!(catalog.entries[0].digest, digest);
+    assert!(!catalog.entries[0].legacy);
+}
+
+#[test]
+fn a_second_proof_about_one_commit_sits_beside_the_first() {
+    // The one-attestation-per-commit shape had to go for exactly this: two signers,
+    // two runs or two tiers about one commit are the normal case, and neither may
+    // overwrite the other.
+    let forge = forge();
+    let host = hosted(&forge);
+    let subject = head_oid(&forge, "main");
+    let first = b"signed by the proposer".to_vec();
+    let second = b"signed by the owner".to_vec();
+    host.publish_attestation(&subject, &first, None)
+        .expect("publish the first");
+    host.publish_attestation(&subject, &second, None)
+        .expect("publish the second");
+    let found = host.attestations_for(&subject).expect("read them back");
+    let digests: Vec<String> = found
+        .iter()
+        .filter(|record| record.verbatim())
+        .map(|record| record.digest.hex())
+        .collect();
+    for wanted in [Oid::hash_bytes(&first), Oid::hash_bytes(&second)] {
+        assert!(
+            digests.contains(&wanted.hex()),
+            "{} is missing from {digests:?}",
+            wanted.short_default()
+        );
+    }
+    // …and publishing the same bytes twice is not a second proof.
+    let again = host
+        .publish_attestation(&subject, &first, None)
+        .expect("re-publishing is not an error");
+    assert_eq!(again.digest, Oid::hash_bytes(&first));
+    assert_eq!(
+        host.attestations_for(&subject)
+            .expect("read them back again")
+            .iter()
+            .filter(|record| record.verbatim())
+            .count(),
+        2,
+        "the same bytes are one proof, not two"
+    );
+}
+
+#[test]
+fn a_legacy_single_level_proof_is_still_read_by_the_host_that_filed_it() {
+    // Old gitiup filed `refs/attestations/<subject>` -> digest. The bytes and the
+    // ref are both real, so refusing to read them because of the spelling would lose
+    // proofs a merge gate already relied on.
+    let forge = forge();
+    let host = hosted(&forge);
+    let subject = head_oid(&forge, "main");
+    let bytes = b"filed by an older build".to_vec();
+    let digest = Oid::hash_bytes(&bytes);
+    host.put_cas(&gitiup_host::Namespace::ATTESTATION, &bytes)
+        .expect("store the bytes");
+    host.update_ref_cas(&gitiup_host::RefUpdate::create(
+        gitiup_host::attest::legacy_ref_name(&subject),
+        digest,
+    ))
+    .expect("the legacy ref");
+    let found = host.attestations_for(&subject).expect("read them back");
+    assert!(
+        found
+            .iter()
+            .any(|record| record.digest == digest && record.verbatim()),
+        "the legacy proof is found by subject: {:?}",
+        found
+            .iter()
+            .map(|record| (record.digest.hex(), record.verbatim()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -372,9 +459,6 @@ fn a_forge_remote_without_the_adapter_names_the_feature() {
     );
     assert!(error.is_unreachable() || text.contains("github"), "{text}");
 }
-
-#[allow(dead_code)]
-fn unused(_: &dyn BlobStore, _: &Namespace, _: &dyn Host) {}
 
 #[test]
 fn the_forge_merges_its_own_change_and_says_where_it_landed() {
@@ -456,3 +540,5 @@ fn a_forge_that_will_not_merge_is_refused_rather_than_worked_around() {
     );
 }
 
+#[allow(dead_code)]
+fn unused(_: &dyn BlobStore, _: &Namespace, _: &dyn Host) {}

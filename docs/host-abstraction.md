@@ -116,16 +116,31 @@ be an overwrite. A ref named by one digest cannot be both a leaf and a directory
 where the older single-level spelling occupies a subject, gitiup says so rather than
 losing the ref or reporting "no attestation".
 
-The single-level form (`refs/attestations/<digest>`, one ref per attestation) is what
-the github adapter files when it publishes a check run's proof, and a store that
-holds both shapes is fine: a listing reports those refs under `unexpected` rather
-than mis-reading one as the other, `gitiup attest gc` leaves them alone, and a
-`git fetch refs/attestations/*` carries both. What is *not* reconciled yet is the
-question they answer differently — one ref per attestation cannot be listed by
-subject — so an attestation filed by the forge adapter does not appear in
-`gitiup attest list --commit`. Making the two paths agree is follow-up work spanning
-the adapter and the quorum's per-seat storage (giti-1rs.2, giti-msi), not a detail an
-attestation store can decide alone.
+The single-level form (`refs/attestations/<subject>`, one ref, so one proof, per
+subject) is the shape older gitiup — and the forge adapter before it — filed. It is
+still *read*: a listing returns those proofs too, flagged `legacy` (`"shape":
+"legacy"` in `--json`), because refusing to read a proof because of the spelling of
+its ref would strand evidence a merge gate already relied on. Nothing writes it any
+more, including the github adapter, which now publishes through the same
+`gitiup_host::attest::publish` as every other host.
+
+Moving what is already there is `gitiup attest migrate`, dry run by default like `gc`.
+Per proof it notes the intent in `kv/migrate/<digest>`, retires the single-level ref,
+filing it under `<subject>/<digest>`, and puts the old ref back if that filing fails.
+The order looks backwards next to `publish`'s "bytes first, then ref" and has to be: a
+ref cannot be a leaf and a directory at once, so on a git-backed store the old name
+must free the name before the new one can exist. The intent record is what makes the
+window between the two writes safe: every applying run re-files the proofs its own
+earlier records say were mid-move, so a crash leaves a store that the next `migrate`
+fixes rather than one only an audit finds. A proof whose bytes the store cannot return
+is reported `blocked` and left exactly where it was — retiring the only advertisement
+of unreadable bytes is retention's decision, not a migration's.
+
+One spelling no reader can attribute is a ref in this namespace whose hex *is* its own
+value: a digest advertised by digest, which names no subject. It is listed under
+`unexpected_refs` — with a legacy ref that self-references, and with anything else in
+the namespace that is neither shape, because a listing that quietly drops a ref is how
+"there is no proof here" becomes a lie.
 
 ## Store layout
 
@@ -458,7 +473,7 @@ vocabulary, so a forge's own nouns have to become gitiup's:
 |-------------------|---------|-------------------------------------|
 | the pull request database | `ChangeRecord`, like a bucket's `refs/changes/**` | `origin: Pull { number }`, plus base/head as `RefName`/`Oid`, never a `base.ref` string |
 | a change gitiup wrote | the same `ChangeRecord`, `origin: Ref { name }` | a pull and a ref over the same commit are one change, listed once |
-| check runs, CI status | `AttestationRecord`, like `refs/attestations/<oid>` anywhere else | `source: Store | CheckRun | Both` and `copy_truncated`: a check run's copy is an advertisement, not the bytes a signature covers |
+| check runs, CI status | `AttestationRecord`, like `refs/attestations/<subject>/<digest>` anywhere else | `source: Store | CheckRun | Both` and `copy_truncated`: a check run's copy is an advertisement, not the bytes a signature covers |
 | webhooks, `github.event.*` | `poll_changes(cursor)` | "what is new" is one conditional read of existing state; a workflow's event context comes from the runner that started it, not from a delivery |
 | opening a change | the ref first, then the pull request | the ref is the part the contributor owns; the forge's merge is used rather than imitated |
 
@@ -570,8 +585,12 @@ errors so typos surface instead of silently disabling a safety setting
    [`gitiup-host-tests`](../crates/gitiup-host-tests/README.md) holds the bodies
    every host owes — empty store, CAS conflict, pack round-trip, huge pack, paged
    listings, ref deletion, refused credentials, unsupported operations, forgetting
-   one object, the `cas = false` degradation — and one `test_host!` line runs all of
-   them against your host. Anything that genuinely does not apply has to be *said* in the
+   one object, the `cas = false` degradation, the change workflow from proposal to
+   merge, and the stale-base refusal that must be the *same kind* on every host — and
+   one `test_host!` line runs all of them against your host. Changes are also measured
+   *between* hosts: `tests/change_across_hosts.rs` publishes on a bucket and merges
+   through a plain-git repository, and CI runs that pair again against a live MinIO and
+   a real `git-http-backend`. Anything that genuinely does not apply has to be *said* in the
    registration, and a body neither run nor explained fails `tests/coverage.rs`.
    The host is not finished when it passes on your machine: it is finished when CI
    runs it against the backend you claim to be (`.github/workflows/host-conformance.yml`).

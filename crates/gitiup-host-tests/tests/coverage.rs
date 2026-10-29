@@ -64,6 +64,18 @@ const REQUIRED_EDGES: &[(&str, &[&str])] = &[
         &["multi_ref_writes_are_all_or_nothing"],
     ),
     ("capabilities honesty", &["describe_and_capabilities"]),
+    (
+        "attestations findable by subject",
+        &["attestations_about_one_subject_are_found_by_subject"],
+    ),
+    (
+        "the change workflow, propose to merge",
+        &["a_change_goes_from_proposal_to_merge_and_merges_once"],
+    ),
+    (
+        "a stale-base merge refused, identically",
+        &["a_stale_base_merge_is_refused_the_same_way_everywhere"],
+    ),
 ];
 
 /// Every host kind a gitiup build can ship. A new one here means a new host, and a
@@ -151,6 +163,49 @@ fn every_shipped_host_kind_is_measured() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The cross-host claim: a change published on a bucket and merged through a plain-git
+/// host, with the same digests from both.
+///
+/// It is not a body — a body is one host measured once — so it cannot be guarded by the
+/// registry. What can be guarded is the promise being made: that the pair exists, that it
+/// points a bucket at a git host (the direction a contributor without a forge actually
+/// travels), and that some host in the matrix is a bucket and some is git, or the pair is
+/// a pair of nothing.
+#[test]
+fn the_cross_host_claim_is_a_bucket_publishing_and_a_git_host_merging() {
+    let pairs = hosts::cross_pairs();
+    assert!(
+        !pairs.is_empty(),
+        "nothing measures a change crossing from one host to another: that is the claim \
+         the whole change design rests on, and `hosts::cross_pairs` is where it is declared"
+    );
+    let all = registrations();
+    for (name, publisher, merger) in &pairs {
+        for registration in [*publisher, *merger] {
+            assert!(
+                all.iter().any(|host| host.name == registration.name),
+                "`{name}` names {}, which is not in `hosts::all`, so nothing runs its \
+                 bodies either",
+                registration.name
+            );
+        }
+        assert_eq!(
+            publisher.kind,
+            HostKind::S3,
+            "`{name}` publishes on a {}, and the claim is that a *bucket* can be the forge \
+             a change is proposed on",
+            publisher.kind
+        );
+        assert_eq!(
+            merger.kind,
+            HostKind::Git,
+            "`{name}` merges on a {}, and the claim is that the owner's plain-git host is \
+             where the merge happens",
+            merger.kind
+        );
+    }
 }
 
 #[test]

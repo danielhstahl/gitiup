@@ -130,6 +130,49 @@ jobs:
           GITIUP_CONFORMANCE_REQUIRE_CAS: "1"
         run: cargo test -p gitiup-host-tests --features s3,github -j 3
 
+      # The change workflow as its own step, because it is the promise the change design
+      # makes and the one a single host can keep while its neighbours do not: propose →
+      # re-attempt → list → show → merge → merge-again-refused, and a stale base refused
+      # with one kind and one exit code on all six hosts. The same bodies run in "Run the
+      # suite"; naming them here is so a failing host names the half it failed.
+      - name: The change workflow, on every host
+        env:
+          GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080
+          GITIUP_CONFORMANCE_GIT_ROOT: ${{ github.workspace }}/ci-git-root
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          GITIUP_S3_LIVE_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+          GITIUP_CONFORMANCE_REQUIRE_HOSTS: s3-minio,git-http
+          GITIUP_CONFORMANCE_REQUIRE_CAS: "1"
+        run: |
+          cargo test -p gitiup-host-tests --features s3,github -j 3 \
+            --test fs --test git --test s3_memory --test github --test s3_minio \
+            -- --nocapture \
+            a_change_goes_from_proposal_to_merge_and_merges_once \
+            a_stale_base_merge_is_refused_the_same_way_everywhere
+
+      # ...and across two hosts: published on the bucket, read and merged through the
+      # plain-git host, with the same digests from both. Against these services that
+      # means a live MinIO and a real git-http-backend — the pair a contributor and an
+      # owner actually use, and the one place the "a change is a ref, not a place" claim
+      # is checked against the transports nobody controls.
+      - name: A change published on the bucket merges through the plain-git host
+        env:
+          GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080
+          GITIUP_CONFORMANCE_GIT_ROOT: ${{ github.workspace }}/ci-git-root
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          GITIUP_S3_LIVE_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+          GITIUP_CONFORMANCE_REQUIRE_HOSTS: s3-minio,git-http
+          GITIUP_CONFORMANCE_REQUIRE_CAS: "1"
+        run: |
+          cargo test -p gitiup-host-tests --features s3,github -j 3 \
+            --test change_across_hosts -- --nocapture
+
       - name: Report the matrix
         env:
           GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080

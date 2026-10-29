@@ -22,6 +22,11 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
+#[path = "common/mod.rs"]
+mod common;
+
+use common::SmartHttp;
+
 /// The passphrase every harness uses, supplied the only way a script can.
 const PASSPHRASE: &str = "four random words";
 
@@ -750,88 +755,6 @@ fn gc_prunes_by_age_and_purges_on_a_filesystem_store() {
 // The claim only a git-backed host can carry: a plain clone gets the proof.
 // ---------------------------------------------------------------------------
 
-/// The CGI smart-HTTP server from `gitiup-host`'s fixtures, on an ephemeral
-/// port. This is how a repo gets served without a forge, an sshd or nginx:
-/// `git-http-backend` behind any CGI contract, which is exactly the transport the
-/// "a `git fetch` carries proof" claim is about.
-struct SmartHttp {
-    child: std::process::Child,
-    port: u16,
-}
-
-impl SmartHttp {
-    /// Serve `root/*/​.git` over smart HTTP, or `None` when python3 or
-    /// `git-http-backend` is not on this box (the test then skips).
-    fn serve(root: &Path) -> Option<SmartHttp> {
-        let python = which("python3")?;
-        let backend = git_http_backend()?;
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../gitiup-host/tests/fixtures/git-http-backend.py");
-        let mut child = Command::new(python)
-            .arg(&script)
-            .arg("0")
-            .env("GIT_HTTP_BACKEND", &backend)
-            .env("GIT_PROJECT_ROOT", root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        // The fixture prints the port it bound before it serves anything.
-        use std::io::BufRead as _;
-        let announced = std::io::BufReader::new(child.stdout.take()?)
-            .lines()
-            .next()?
-            .ok()?;
-        let port: u16 = announced.trim().parse().ok()?;
-        for _ in 0..1_000 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Some(SmartHttp { child, port });
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        None
-    }
-
-    fn url(&self, repo: &str) -> String {
-        format!("http://127.0.0.1:{}/{repo}.git", self.port)
-    }
-}
-
-impl Drop for SmartHttp {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn which(program: &str) -> Option<PathBuf> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {program}"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-/// `git-http-backend` is not on `PATH`; it lives beside the rest of git.
-fn git_http_backend() -> Option<PathBuf> {
-    let direct = Path::new("/usr/lib/git-core/git-http-backend");
-    if direct.is_file() {
-        return Some(direct.to_path_buf());
-    }
-    let out = Command::new("git").arg("--exec-path").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let exec_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let candidate = exec_dir.join("git-http-backend");
-    candidate.is_file().then_some(candidate)
-}
-
 /// Push an attestation to a plain git remote, then read it back with nothing but
 /// `git`: clone, fetch the attestation namespace, and take the bytes out of the
 /// pointer commit the ref names.
@@ -847,15 +770,7 @@ fn an_attestation_survives_a_plain_git_clone() {
     std::fs::create_dir_all(&served).expect("served dir");
     let repo = served.join("repo.git");
     gitiup_host::hosts::git::init_bare(&repo).expect("init bare repository");
-    // Anonymous receives, because that is what a smart-HTTP endpoint gitiup can
-    // push to needs, exactly as it would on a real server.
-    let config = Command::new("git")
-        .arg("--git-dir")
-        .arg(&repo)
-        .args(["config", "http.receivepack", "true"])
-        .output()
-        .expect("git config");
-    assert!(config.status.success(), "{}", stderr_of(&config));
+    common::allow_anonymous_receives(&repo);
     let Some(server) = SmartHttp::serve(&served) else {
         eprintln!("skipped: python3 or git-http-backend is not available");
         return;
@@ -990,4 +905,258 @@ fn git_in(repo: &Path, args: &[&str]) -> String {
 fn the_binary_under_test_is_this_workspaces_one() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_gitiup"));
     assert!(exe.exists(), "{exe:?} was not built");
+}
+
+// ---------------------------------------------------------------------------
+// The old single-level shape: read, reported, and moved.
+// ---------------------------------------------------------------------------
+
+/// A second fs store in the harness's directory, so one test can hold a store in two
+/// shapes at once without anyone's home directory being involved.
+fn store_in(harness: &Harness, name: &str) -> String {
+    harness
+        .path()
+        .join(name)
+        .to_str()
+        .expect("utf-8")
+        .to_string()
+}
+
+/// The exact canonical bytes of a signed attestation, produced the only way they can
+/// be produced: `attest push --out`, whose whole promise is to write the bytes it
+/// stored verbatim. A hand-written "attestation" would not survive the canonical read,
+/// and the migration's claim is about *real* signed evidence.
+fn signed_bytes(harness: &Harness, store: &str, fixture: &str, subject: &str) -> String {
+    let out = harness
+        .path()
+        .join(format!("doc-{}-{}.json", fixture, &subject[..8]));
+    let report = fixture_path(fixture);
+    let mut args: Vec<&str> = vec![
+        "attest",
+        "push",
+        "--run-report",
+        &report,
+        "--sign",
+        "--store",
+        store,
+        "--out",
+        out.to_str().expect("utf-8"),
+    ];
+    let subject_arg = subject.to_string();
+    args.push("--subject");
+    args.push(&subject_arg);
+    let pushed = harness.run(&args, None);
+    assert!(
+        pushed.status.success(),
+        "{}{}",
+        stdout(&pushed),
+        stderr(&pushed)
+    );
+    String::from_utf8(std::fs::read(&out).expect("the bytes that were stored"))
+        .expect("canonical json is utf-8")
+}
+
+/// File one attestation the way an older gitiup did — `refs/attestations/<subject>`
+/// pointing at the digest, one proof per commit and no room for a second — by writing
+/// the ref directly through the host API. A test that invented the shape in a fixture
+/// would be testing its own imagination of the past.
+fn file_one_the_old_way(store: &str, subject: &str, bytes: &str) -> String {
+    use gitiup_host::{BlobStore, RefStore, RefUpdate};
+    let host = gitiup_host::hosts::fs::FsHost::open_or_create(store).expect("fs host");
+    let oid = gitiup_host::Oid::from_hex(subject).expect("a subject hex");
+    let digest = host
+        .put_cas(&gitiup_host::Namespace::ATTESTATION, bytes.as_bytes())
+        .expect("store the bytes");
+    host.update_ref_cas(&RefUpdate::create(
+        gitiup_host::attest::legacy_ref_name(&oid),
+        digest,
+    ))
+    .expect("the single-level ref");
+    digest.hex()
+}
+
+#[test]
+fn a_legacy_attestation_is_listed_flagged_and_moved_without_losing_its_bytes() {
+    let harness = Harness::new();
+    harness.key("ada");
+    let origin = store_in(&harness, "origin");
+    let legacy = store_in(&harness, "legacy");
+
+    // One real signed document, and a subject of its own so a second proof about the
+    // same commit is possible later.
+    let subject = gitiup_host::Oid::hash_bytes(b"the commit an older build attested").hex();
+    let bytes = signed_bytes(&harness, &origin, "hello", &subject);
+    let digest = file_one_the_old_way(&legacy, &subject, &bytes);
+
+    // Read it, and say which shape it is in. Dropping it would be the lie: a listing
+    // that returns nothing is how "there is no proof here" gets believed.
+    let listed = json(&harness.run(
+        &[
+            "attest", "list", "--commit", &subject, "--store", &legacy, "--json",
+        ],
+        None,
+    ));
+    assert_eq!(listed["count"], 1, "{listed}");
+    assert!(
+        listed["unexpected_refs"].as_array().unwrap().is_empty(),
+        "the old shape is a shape, not a surprise: {}",
+        listed["unexpected_refs"]
+    );
+    assert_eq!(listed["attestations"][0]["digest"], digest.as_str());
+    assert_eq!(
+        listed["attestations"][0]["shape"], "legacy",
+        "and the listing is honest about which layout it is in"
+    );
+    assert_eq!(
+        listed["attestations"][0]["reference"],
+        format!("refs/attestations/{subject}"),
+        "the ref it is actually filed under"
+    );
+    assert_eq!(
+        listed["attestations"][0]["tier"], "simulated",
+        "everything else about it reads normally: it is a proof, merely an old-shaped one"
+    );
+
+    // The migration is a report before it is a change, exactly like `gc`.
+    let planned = json(&harness.run(&["attest", "migrate", "--store", &legacy, "--json"], None));
+    let report = &planned["report"];
+    assert_eq!(report["dry_run"], true, "{planned}");
+    assert_eq!(report["moved"].as_array().unwrap().len(), 1, "{planned}");
+    assert_eq!(report["moved"][0]["digest"], digest.as_str());
+    assert_eq!(report["moved"][0]["retired"], false);
+    assert!(report["blocked"].as_array().unwrap().is_empty());
+    assert!(
+        planned["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nothing changed"),
+        "{planned}"
+    );
+    // …and nothing moved, so listing it again says `legacy` still.
+    let again = json(&harness.run(
+        &["attest", "list", "--all", "--store", &legacy, "--json"],
+        None,
+    ));
+    assert_eq!(again["attestations"][0]["shape"], "legacy");
+
+    let applied = json(&harness.run(
+        &["attest", "migrate", "--store", &legacy, "--apply", "--json"],
+        None,
+    ));
+    let report = &applied["report"];
+    assert_eq!(report["dry_run"], false, "{applied}");
+    assert_eq!(report["moved"].as_array().unwrap().len(), 1);
+    assert_eq!(report["moved"][0]["retired"], true);
+    assert!(
+        report["record"].is_string(),
+        "a move over signed evidence is recorded: {applied}"
+    );
+
+    let moved = json(&harness.run(
+        &[
+            "attest", "list", "--commit", &subject, "--store", &legacy, "--json",
+        ],
+        None,
+    ));
+    assert_eq!(moved["count"], 1, "{moved}");
+    assert_eq!(moved["attestations"][0]["shape"], "current");
+    assert_eq!(moved["attestations"][0]["digest"], digest.as_str());
+    assert_eq!(
+        moved["attestations"][0]["reference"],
+        format!("refs/attestations/{subject}/{digest}"),
+        "the same proof, in the layout that has room for more than one"
+    );
+
+    // The bytes are untouched, which is the whole test: a migration that re-encoded
+    // the document would have destroyed the signature it was moving.
+    let shown = harness.run(
+        &["attest", "show", &digest, "--store", &legacy, "--json"],
+        None,
+    );
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert_eq!(
+        json(&shown)["canonical"],
+        true,
+        "the moved bytes still re-hash to their own name"
+    );
+    assert!(
+        json(&shown)["document"]["signatures"][0]["key_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("SHA256:"),
+        "the signature came along with the bytes: {}",
+        stdout(&shown)
+    );
+
+    // And the reason the shape mattered: a second proof now fits beside the first.
+    // Before the migration this was refused — a ref cannot be a leaf and a directory
+    // at once — which is exactly the wall the two shapes had to be reconciled around.
+    let second = json(&harness.run(
+        &[
+            "attest",
+            "push",
+            "--run-report",
+            &fixture_path("test-failure"),
+            "--subject",
+            &subject,
+            "--sign",
+            "--key",
+            "ada",
+            "--store",
+            &legacy,
+            "--json",
+        ],
+        None,
+    ));
+    let both = json(&harness.run(
+        &[
+            "attest", "list", "--commit", &subject, "--store", &legacy, "--json",
+        ],
+        None,
+    ));
+    assert_eq!(both["count"], 2, "{both}");
+    assert!(
+        both["attestations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["digest"] == second["digest"]),
+        "both proofs are listed: {both}"
+    );
+    assert!(
+        both["attestations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["shape"] == "current"),
+        "and neither is in the old shape any more: {both}"
+    );
+}
+
+#[test]
+fn a_store_with_nothing_legacy_says_so_rather_than_migrating_nothing_quietly() {
+    let harness = Harness::new();
+    harness.key("ada");
+    harness.push("hello");
+    let planned = json(&harness.run(
+        &["attest", "migrate", "--store", &harness.store(), "--json"],
+        None,
+    ));
+    let report = &planned["report"];
+    assert!(
+        report["moved"].as_array().unwrap().is_empty()
+            && report["blocked"].as_array().unwrap().is_empty(),
+        "{planned}"
+    );
+    assert!(
+        report["record"].is_null(),
+        "a run that changed nothing writes no record: {planned}"
+    );
+    let table = harness.run(&["attest", "migrate", "--store", &harness.store()], None);
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert!(
+        stdout(&table).contains("no legacy attestation refs"),
+        "{}",
+        stdout(&table)
+    );
 }

@@ -26,6 +26,9 @@ macro_rules! conformance_body_names {
             "concurrent_ref_writers_never_lose_one",
             "unsupported_operations_are_refused_by_name",
             "one_object_is_forgotten_or_the_refusal_says_why",
+            "attestations_about_one_subject_are_found_by_subject",
+            "a_change_goes_from_proposal_to_merge_and_merges_once",
+            "a_stale_base_merge_is_refused_the_same_way_everywhere",
             "describe_and_capabilities",
             "refused_credentials_are_denied_not_dropped",
             "a_host_without_cas_refuses_cas_writes",
@@ -92,6 +95,27 @@ macro_rules! each_conformance_body {
         fn one_object_is_forgotten_or_the_refusal_says_why() {
             $crate::runner::require_body(
                 "one_object_is_forgotten_or_the_refusal_says_why",
+                &$registration,
+            );
+        }
+        #[test]
+        fn attestations_about_one_subject_are_found_by_subject() {
+            $crate::runner::require_body(
+                "attestations_about_one_subject_are_found_by_subject",
+                &$registration,
+            );
+        }
+        #[test]
+        fn a_change_goes_from_proposal_to_merge_and_merges_once() {
+            $crate::runner::require_body(
+                "a_change_goes_from_proposal_to_merge_and_merges_once",
+                &$registration,
+            );
+        }
+        #[test]
+        fn a_stale_base_merge_is_refused_the_same_way_everywhere() {
+            $crate::runner::require_body(
+                "a_stale_base_merge_is_refused_the_same_way_everywhere",
                 &$registration,
             );
         }

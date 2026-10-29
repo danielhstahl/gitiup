@@ -1280,6 +1280,7 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "gitiup-canon",
  "gitiup-host",
  "gitiup-host-github",
  "tempfile",

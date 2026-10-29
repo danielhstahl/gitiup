@@ -218,6 +218,34 @@ fn execute(body: &Body, setup: &Setup) {
     (body.run)(&ctx);
 }
 
+/// The two stores of a cross-host body, or `None` when this environment cannot offer
+/// both of them.
+///
+/// A cross-host body needs two hosts, so it has two chances to be unable to run, and the
+/// same rule applies to each: a host CI named in [`REQUIRE_HOSTS`] that is not here is a
+/// failure, and anything else is a skip printed out loud. Making the *pair* the unit of
+/// the decision is what stops a live-bucket cross test from passing quietly because one
+/// half of it was missing — which is the failure mode the cross-body exists to catch.
+pub fn pair(from: &'static Registration, to: &'static Registration) -> Option<(Session, Session)> {
+    for registration in [from, to] {
+        if let Some(note) = registration.skip_note() {
+            if required_in_ci(registration) {
+                panic!(
+                    "{REQUIRE_HOSTS} names {}, but it is not available here: {note}",
+                    registration.name
+                );
+            }
+            eprintln!("skip [{} x {}]: {note}", from.name, to.name);
+            return None;
+        }
+    }
+    let make = |registration: &'static Registration| match (registration.make)() {
+        Ok(session) => session,
+        Err(err) => panic!("cannot make a {} store: {err}", registration.name),
+    };
+    Some((make(from), make(to)))
+}
+
 /// Build the refused-credentials variant: a session, or the refusal that stands in
 /// for it. Both are answers; "it worked" would be the failure.
 fn make_denial(registration: &'static Registration) -> Result<Denial, String> {
@@ -233,6 +261,46 @@ fn make_denial(registration: &'static Registration) -> Result<Denial, String> {
         outcome,
         (registration.denied_secret)(),
     ))
+}
+
+/// Every cross-host pair, in one pass, reporting rather than panicking.
+///
+/// [`pair`] is the `#[test]` path and panics when CI demanded a host that is not here;
+/// a report would rather print that as a line, because the report's whole purpose is the
+/// whole picture at once. One entry per pair that did not pass: `"<pair>: <message>"`,
+/// with skips marked `SKIP`.
+pub fn cross_report(
+    name: &str,
+    from: &'static Registration,
+    to: &'static Registration,
+) -> Option<String> {
+    for registration in [from, to] {
+        if let Some(note) = registration.skip_note() {
+            if required_in_ci(registration) {
+                return Some(format!(
+                    "{name}: {REQUIRE_HOSTS} names {}, but it is not available here: {note}",
+                    registration.name
+                ));
+            }
+            return Some(format!("{name}: SKIP ({note})"));
+        }
+    }
+    let outcome = catch(|| {
+        let publisher = match (from.make)() {
+            Ok(session) => session,
+            Err(err) => panic!("cannot make a {} store: {err}", from.name),
+        };
+        let merger = match (to.make)() {
+            Ok(session) => session,
+            Err(err) => panic!("cannot make a {} store: {err}", to.name),
+        };
+        crate::changes::across_hosts(publisher.host(), merger.host());
+    });
+    match outcome {
+        Run::Passed => None,
+        Run::Skipped(why) => Some(format!("{name}: SKIP ({why})")),
+        Run::Failed(why) => Some(format!("{name}: {why}")),
+    }
 }
 
 /// What running one body produced, for the report path.

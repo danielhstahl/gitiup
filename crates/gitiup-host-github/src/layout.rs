@@ -9,7 +9,7 @@
 //! refs/gitiup/kv                 one append-only commit chain
 //!   <namespace>/<sha256hex>      one file per record, content verbatim
 //! refs/changes/<id>/head         pointer commit → gitiup-ref.json + record
-//! refs/attestations/<oid>        pointer commit → gitiup-ref.json + record
+//! refs/attestations/<subject>/<digest>  pointer commit → gitiup-ref.json + record
 //! ```
 //!
 //! which is the same shape the plain-git host uses, so a repository can be moved

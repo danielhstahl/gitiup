@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use gitiup_host::attest::{self, AttestationItem, BlobAction, GcOptions, MICROS, Retention};
 use gitiup_host::{
-    BlobStore, Expect, FsHost, Host, HostErrorExt, MemoryBucket, Namespace, Oid, RefDeletion,
-    RefName, RefStore, RefUpdate, RemoteConfig, S3Host, SharedBucket,
+    Actor, BlobStore, Expect, FsHost, Host, HostErrorExt, MemoryBucket, Namespace, Oid,
+    RefDeletion, RefName, RefStore, RefUpdate, RemoteConfig, S3Host, SharedBucket,
 };
 
 /// A commit oid to attest to. Any well-formed sha1 will do: the store never parses
@@ -430,12 +430,13 @@ fn the_fs_host_can_actually_forget_a_blob() {
     assert!(host.get_ref(&seat).expect("seat ref reads back").is_some());
 }
 
-/// The single-level spelling of this namespace (`refs/attestations/<oid>`, one ref
-/// per attestation) is what the forge adapter files. It is neither this layout nor an
-/// error: a listing reports it, and a publish that would need that name as a directory
-/// says so instead of overwriting it.
+/// The single-level spelling of this namespace (`refs/attestations/<subject>`, one ref
+/// per attestation) is what older gitiup and the forge adapter used to file. It is not
+/// this layout, but it *is* a proof: a listing reads it and flags it, a publish that
+/// would need that name as a directory says so instead of overwriting it, and
+/// [`attest::migrate`] moves it when asked.
 #[test]
-fn a_single_level_ref_is_reported_not_silently_skipped() {
+fn a_legacy_ref_is_read_flagged_and_movable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let host = FsHost::open_or_create(dir.path().join("store")).expect("open");
     let subject = commit(COMMIT);
@@ -450,19 +451,32 @@ fn a_single_level_ref_is_reported_not_silently_skipped() {
 
     let catalog = attest::list_all(&host).expect("list");
     assert!(
-        catalog.entries.is_empty(),
-        "a ref with no digest component is not this layout: {:?}",
-        catalog.entries
+        catalog.unexpected.is_empty(),
+        "a single-level ref is a shape, not a surprise: {:?}",
+        catalog.unexpected
+    );
+    assert_eq!(catalog.entries.len(), 1, "it is a proof, so it is listed");
+    let entry = &catalog.entries[0];
+    assert_eq!(
+        entry.subject, subject,
+        "the name of a legacy ref is the object it attests"
     );
     assert_eq!(
-        catalog.unexpected,
-        vec![RefName::attestation(&subject).as_str().to_string()],
-        "and it is named rather than dropped: a listing that skips a ref is how          \"there is no proof here\" becomes a lie"
+        entry.digest, digest,
+        "and its value is the attestation itself"
+    );
+    assert!(entry.legacy, "and the listing says which shape it is in");
+    assert_eq!(catalog.legacy().len(), 1);
+    assert_eq!(
+        attest::fetch(&host, &digest).expect("fetch").as_deref(),
+        Some(&bytes[..]),
+        "and the bytes it advertises are readable, verbatim"
     );
 
     // Publishing under that subject would need `refs/attestations/<subject>` to be a
     // directory. Git cannot have both, and neither can a listing that is a prefix
-    // match, so the store names the ref in the way instead of losing either.
+    // match, so the store names the ref in the way instead of losing either — and
+    // names the way out.
     let error = attest::publish(
         &host,
         &subject,
@@ -481,6 +495,55 @@ fn a_single_level_ref_is_reported_not_silently_skipped() {
             .expect("read it back")
             .is_some(),
         "the existing ref survived the refused publish"
+    );
+
+    // A dry run tells the story and changes nothing…
+    let planned = attest::migrate(&host, &attest::MigrationOptions::default()).expect("plan");
+    assert!(planned.dry_run);
+    assert_eq!(planned.moved.len(), 1);
+    assert!(!planned.moved[0].retired);
+    assert!(attest::legacy_proofs(&host).expect("look").len() == 1);
+
+    // …and applying it moves the proof, retires the old ref only once the new one
+    // exists, and leaves the bytes exactly as they were — the whole point, since a
+    // re-encoded document would no longer verify.
+    let applied = attest::migrate(
+        &host,
+        &attest::MigrationOptions {
+            actor: Actor::from("ada"),
+            apply: true,
+            record: true,
+        },
+    )
+    .expect("migrate");
+    assert_eq!(applied.moved.len(), 1);
+    assert!(applied.moved[0].retired);
+    assert!(applied.record.is_some(), "and the move is on the record");
+    assert!(attest::legacy_proofs(&host).expect("look").is_empty());
+    let moved = attest::list_for(&host, &subject).expect("list");
+    assert_eq!(moved.entries.len(), 1);
+    assert!(!moved.entries[0].legacy);
+    assert_eq!(moved.entries[0].digest, digest);
+    assert_eq!(
+        attest::fetch(&host, &digest).expect("fetch").as_deref(),
+        Some(&bytes[..]),
+        "the signed bytes were never touched"
+    );
+
+    // Which is what the shape was in the way of: now a second proof fits.
+    attest::publish(
+        &host,
+        &subject,
+        b"{\"mine\":true}".to_vec().as_slice(),
+        "ada",
+    )
+    .expect("a second proof about one commit");
+    assert_eq!(
+        attest::list_for(&host, &subject)
+            .expect("list")
+            .entries
+            .len(),
+        2
     );
 }
 

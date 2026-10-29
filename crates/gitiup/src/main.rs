@@ -14,7 +14,7 @@
 //! gitiup doctor --sandbox               what this machine can confine, and whether it
 //!                                      may serve a stranger's job at all
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
-//! gitiup attest push|list|show|gc        file signed attestations in a host, read them
+//! gitiup attest push|list|show|gc|migrate  file signed attestations in a host store and reads it
 //!                                      back, and retire the ones a retention policy
 //!                                      says are old
 //! gitiup change new|submit|list|show     propose work to any host: draft a signed
@@ -90,7 +90,7 @@ COMMANDS:
                                    a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
-    attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc
+    attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc, migrate
     change new [OPTIONS]           draft a signed change record from local commits
     change submit [OPTIONS]        publish one attempt of it to the store you name, and
                                    open the quorum rounds its published policy demands

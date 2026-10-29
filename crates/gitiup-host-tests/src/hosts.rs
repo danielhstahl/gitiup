@@ -338,6 +338,21 @@ fn always() -> bool {
     true
 }
 
+/// The host pairs the cross-host body runs, as `(publisher, merger)`.
+///
+/// Ordered the way the workflow actually happens: the contributor publishes to the host
+/// they have credentials for — a bucket, because that is the cheapest forge-shaped store
+/// there is — and the owner merges on the host where their branch lives, which is a plain
+/// git repository. The hermetic pair runs everywhere; the live one is the same body over
+/// a real MinIO and a real `git-http-backend`, which is the shape CI demands.
+pub fn cross_pairs() -> Vec<(&'static str, &'static Registration, &'static Registration)> {
+    #[allow(unused_mut)]
+    let mut pairs = vec![("s3-memory->git-file", &S3_MEMORY, &GIT_FILE)];
+    #[cfg(feature = "s3")]
+    pairs.push(("s3-minio->git-http", &S3_MINIO, &GIT_HTTP));
+    pairs
+}
+
 /// Every registration the suite covers, in the order CI should report them.
 ///
 /// `tests/coverage.rs` walks this and refuses a body that nobody runs, a host kind

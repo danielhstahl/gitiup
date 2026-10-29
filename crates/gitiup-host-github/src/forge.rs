@@ -10,8 +10,7 @@
 //! |-------------|--------------|-----------------------------|
 //! | pull request | [`ChangeRecord`] | the forge's merge machinery is the one thing a bucket cannot offer, so on GitHub the adapter *uses* it ([`GitHubHost::open_change`]) instead of emulating a merge — the merge is atomic and reviewed, which is better than what a bucket can do |
 //! | pull-request head ref `refs/pull/<n>/head` | read-only, shown as the change's head | GitHub publishes it and will not let anyone write it, so it is read, never leased |
-//! | check run | [`AttestationRecord`] | the check run is an **advertisement** ("CI thought this about this commit, look here"); the bytes of record stay in the record store, where a signature can be checked against them verbatim |
-//! | labels, reviews, `+1` | not translated | server-side policy the host trait has no word for; it stays owner-side, exactly as on the other hosts |
+//! | check run | [`AttestationRecord`] | the check run is an **advertisement** ("CI thought this about this commit, look here"); the bytes of record stay in the record store, where a signature can be checked against them verbatim |//! | labels, reviews, `+1` | not translated | server-side policy the host trait has no word for; it stays owner-side, exactly as on the other hosts |
 //! | webhooks, and `github.event.*` | [`ChangeFeed`] polling | a gitiup change *is* a ref, so "did anything happen" is one conditional listing — no public URL, no shared secret, no retries on someone else's schedule |
 //!
 //! # Why a check run is not the attestation
@@ -20,19 +19,21 @@
 //! check run's `output` fields are truncated by the forge (65 535 characters), may
 //! be re-encoded on the way through a UI, and are editable by whoever can push the
 //! commit. So the canonical bytes go to the record store and to
-//! `refs/attestations/<digest>` like on every other host, and the check run carries
-//! a copy *when it fits* plus the digest that identifies the real thing. An
-//! attestation whose copy did not fit reports
+//! `refs/attestations/<subject>/<digest>` — through [`gitiup_host::attest::publish`],
+//! the same code the bucket and git hosts run, not a github-shaped copy of it — and
+//! the check run carries a copy *when it fits* plus the digest that identifies the
+//! real thing. An attestation whose copy did not fit reports
 //! [`AttestationSource::Store`] with the digest and no bytes: a gate that needs the
 //! bytes fetches them, and nothing pretends a fragment is a document.
 
-use gitiup_host::{BlobStore, HostResult, Namespace, Oid, RefName, RefStore, Timestamp};
+use gitiup_host::{
+    Actor, BlobStore, HostError, HostResult, Oid, RefName, RefStore, Timestamp, attest,
+};
 
 use crate::api::MAX_CHECK_RUN_OUTPUT_CHARS;
 use crate::api::{self, CheckRunOutput, PullRequest};
 use crate::codec;
 use crate::host::GitHubHost;
-use crate::store::RefTarget;
 
 /// The change (PR substitute) this adapter publishes attestations under.
 pub const ATTESTATION_CHECK_NAME: &str = "gitiup/attest";
@@ -334,7 +335,7 @@ impl GitHubHost {
     pub fn merge_change(&self, number: u64, sha: &Oid, method: &str) -> HostResult<ForgeMerge> {
         let answer = api::merge_pull(self.client(), number, &sha.hex(), method)?;
         let pull = api::get_pull(self.client(), number)?.ok_or_else(|| {
-            gitiup_host::HostError::not_found("pull request", number.to_string()).with_hint(
+            HostError::not_found("pull request", number.to_string()).with_hint(
                 "the forge merged and then would not show the change; check the repository \
                  the remote points at",
             )
@@ -405,25 +406,19 @@ impl GitHubHost {
     /// Returns the record as it now exists, with the bytes it could be read back
     /// as — because a publish that cannot be read back verbatim has not published
     /// anything worth checking.
+    ///
+    /// The store and ref writes are [`attest::publish`], the same call the bucket and
+    /// git hosts make, so a proof filed here is listed by `gitiup attest list
+    /// --commit` and fetched by `git fetch 'refs/attestations/<subject>/*'` exactly
+    /// as one filed anywhere else. The check run is only ever added on top.
     pub fn publish_attestation(
         &self,
         subject: &Oid,
         bytes: &[u8],
         details_url: Option<&str>,
     ) -> HostResult<AttestationRecord> {
-        let digest = self.put_cas(&Namespace::ATTESTATION, bytes)?;
-        if digest != Oid::hash_bytes(bytes) {
-            return Err(gitiup_host::HostError::invalid(
-                "attestation store",
-                "the store returned a digest that is not the digest of the bytes",
-            ));
-        }
-        // The ref is the host-neutral path: a plain `git fetch` of it carries the
-        // attestation, and it is how the same attestation is found on a bucket.
-        let reference = RefName::attestation(&digest);
-        let head = self.get_ref(&reference)?;
-        let expected = head.as_ref().map(|found| found.oid);
-        self.cas_ref(&reference, expected, digest)?;
+        let published = attest::publish(self, subject, bytes, Actor::from("gitiup"))?;
+        let digest = published.digest;
         // The check run is the advertisement, and it is only for a commit the forge
         // has. A subject that is not a git commit (a record digest) gets the ref and
         // the store entry, which is everything a gate needs.
@@ -473,23 +468,23 @@ impl GitHubHost {
     /// earns its keep.
     pub fn attestations_for(&self, subject: &Oid) -> HostResult<Vec<AttestationRecord>> {
         let mut out: Vec<AttestationRecord> = Vec::new();
-        // 1. The host-neutral path: refs this store wrote.
-        let attestation_ref = RefName::attestation(subject);
-        if let Some(target) = self.store().resolve(attestation_ref.as_str())?
-            && let RefTarget::Record { document, .. } = &target
-            && let Ok(digest) = document.target_oid()
-            && let Some(bytes) = self.get(&digest)?
-        {
+        // 1. The host-neutral path: every ref this store wrote for this subject,
+        // in either shape, read by the same code that lists any other host's.
+        let catalog = attest::list_for(self, subject)?;
+        for entry in catalog.entries {
+            let Some(bytes) = self.get(&entry.digest)? else {
+                continue;
+            };
             out.push(AttestationRecord {
                 name: ATTESTATION_CHECK_NAME.to_string(),
-                subject: *subject,
-                digest,
+                subject: entry.subject,
+                digest: entry.digest,
                 bytes: Some(bytes),
                 source: AttestationSource::Store,
                 copy_truncated: false,
                 conclusion: None,
                 details_url: None,
-                published_at: Some(document.at),
+                published_at: entry.updated_at.map(|at| at.as_unix()),
             });
         }
         // 2. The forge's own bookkeeping.
@@ -503,7 +498,25 @@ impl GitHubHost {
             let Ok(digest) = Oid::from_hex(external) else {
                 continue;
             };
-            if out.iter().any(|found| found.digest == digest) {
+            let already = out.iter().position(|found| found.digest == digest);
+            if let Some(index) = already {
+                // The store already gave us this proof, so the check run adds only
+                // what a store cannot know: the forge's conclusion and where the
+                // publisher pointed a human. Saying `Both` is the point — the proof
+                // was seen by both paths, and the bytes of record are the store's.
+                let found = &mut out[index];
+                if found.bytes.is_some() {
+                    found.source = AttestationSource::Both;
+                }
+                if found.conclusion.is_none() {
+                    found.conclusion = run.conclusion.clone();
+                }
+                if found.details_url.is_none() {
+                    found.details_url = run.details_url.clone();
+                }
+                if found.published_at.is_none() {
+                    found.published_at = stamp(&run.created_at);
+                }
                 continue;
             }
             let stored = self.get(&digest)?;

@@ -387,9 +387,7 @@ fn publish_refuses_a_lost_update_and_a_signer_nobody_trusts() {
     assert_eq!(error.token(), token::CHAIN_BROKEN);
     assert_eq!(error.exit_code(), 6);
     assert!(
-        error
-            .to_string()
-            .contains("but the policy in force is"),
+        error.to_string().contains("but the policy in force is"),
         "{error}"
     );
     // The explicit guard, spelled: a caller that names what it believed says so, and is

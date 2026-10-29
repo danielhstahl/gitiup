@@ -24,15 +24,25 @@ $ ./ci/host-conformance.sh                               # the whole matrix, Min
 The full suite lives in CI (`.github/workflows/host-conformance.yml`), which
 starts a MinIO and a `git-http-backend` service, demands both
 (`GITIUP_CONFORMANCE_REQUIRE_HOSTS` — a service that failed to start fails the
-job instead of skipping quietly), raises the sizes past a bucket's own 1 000-key
-page and 8 MiB part boundary, and finishes with a step whose credentials are
-revoked and which therefore has to be refused.
+job instead of skipping quietly), runs the change workflow as its own step, runs
+the cross-host change across both live transports, raises the sizes past a
+bucket's own 1 000-key page and 8 MiB part boundary, and finishes with a step
+whose credentials are revoked and which therefore has to be refused.
 
-`ci/host-conformance.sh` is the same sequence locally: hermetic hosts by default,
-`--minio` to start a bucket in a container, `MINIO=<url>` to point at one you
-started, `--strict` to demand what CI demands. The refused-credential steps run
-when the endpoint can answer them (`--denied`; implied by `--minio`) — a fake that
-accepts any credentials without checking them makes that body *fail*, on purpose.
+`ci/host-conformance.sh` is the same sequence locally:
+
+| invocation | what it demands |
+|------------|-----------------|
+| (nothing) | the hermetic hosts; the live ones are skipped, out loud |
+| `--minio` | a live bucket: starts one in a container, or use `MINIO=<url>`; no docker and no `MINIO` is a failure, not a skip |
+| `--git-http` | a real `git-http-backend`: started here on an ephemeral port behind the CGI fixture, or use `GIT_HTTP=<url> GIT_HTTP_ROOT=<dir>`; no backend is a failure |
+| `--live` (or `--ci`) | both of the above, and `--strict`: what the CI job does |
+| `--strict` | every skip becomes a failure *and* both services must exist — a run that would have reported green over a missing MinIO stops instead |
+| `--quick` | the size-shaped bodies at laptop sizes |
+
+The refused-credential steps run when the endpoint can answer them (`--denied`;
+implied by `--minio` and `--live`) — a fake that accepts any credentials without
+checking them makes that body *fail*, on purpose.
 
 ## The bodies
 
@@ -47,11 +57,51 @@ accepts any credentials without checking them makes that body *fail*, on purpose
 | `cas = false` degradation | `a_host_without_cas_refuses_cas_writes` |
 | unsupported operations | `unsupported_operations_are_refused_by_name` |
 | forgetting one object (retention) | `one_object_is_forgotten_or_the_refusal_says_why` |
+| two proofs about one commit | `attestations_about_one_subject_are_found_by_subject` |
+| the change workflow, end to end | `a_change_goes_from_proposal_to_merge_and_merges_once` |
+| a stale base must not merge | `a_stale_base_merge_is_refused_the_same_way_everywhere` |
 | multi-ref atomicity | `multi_ref_writes_are_all_or_nothing` |
 | capability honesty | `describe_and_capabilities` |
 
 Every body runs against a **fresh** store, and each is a `#[test]` of its own, so
 a diverging host shows up by name and is rerunnable with `--exact`.
+
+### The change workflow
+
+The two change bodies are the reason `giti-b2z.6` exists, and they are written
+once, in `src/changes.rs`, against `&dyn Host`:
+
+* **propose → re-attempt → list → show → merge → merge-again-is-refused**: the
+  whole of `docs/changes.md` through one store. Attempt refs never move, `head`
+  moves and nothing else does, a re-publish of identical bytes is a retry, a
+  *different* attempt 1 is a conflict naming both sides, the merge is a
+  compare-and-swap of the branch plus a create-only record ref, and the second
+  merge is a conflict rather than a surprise. A closed change also takes no new
+  attempt.
+* **a stale base is refused the same way everywhere**: `HostErrorKind::Invalid`,
+  exit 6, both oids named, nothing written — asserted on the fs host, the plain-git
+  host over `file://` and over `git-http-backend`, the bucket host, the live
+  bucket and the forge adapter, which is the only way "the same kind on all four"
+  is a fact rather than a hope.
+
+One host-specific decision is made, once: the oids a change names have to be
+*nameable* by the store, so a git host gets five real commits packed and ingested
+the way a submit ingests them, and every other host gets digests of records it
+actually holds. Everything else is the same assertions everywhere.
+
+### Across two hosts
+
+A change published on one host and merged through another is measured by
+`tests/change_across_hosts.rs`, over the pairs in `hosts::cross_pairs()`:
+
+| pair | what it proves |
+|------|----------------|
+| `s3-memory → git-file` | the claim itself, hermetically: the same record bytes, the same `kv/change/<hex>` digest, the same `change_digest`, the same `change list`, and a merge on the far host that the publishing host agrees with |
+| `s3-minio → git-http` | the same body over a live MinIO and a real `git-http-backend` — the transports an owner and a contributor actually use, and the pair CI demands |
+
+Objects cross first and refs second, because a store advertising a record it
+cannot return is the failure this is measuring, and the merge record is carried
+back so both stores agree the change is merged.
 
 ## The hosts measured here
 

@@ -1,13 +1,14 @@
 //! `gitiup attest …` — publish a proof, find it again, and keep the store honest
 //! about how long it keeps one (giti-1rs.5).
 //!
-//! Four commands, and the whole of gitiup's attestation *storage* surface:
+//! Five commands, and the whole of gitiup's attestation *storage* surface:
 //!
 //! ```text
 //! gitiup attest push       file a signed attestation: kv/attestation/<digest> + refs/attestations/…
 //! gitiup attest list       what a commit (or the whole store) has, read back from the store
 //! gitiup attest show       one attestation, parsed, checked, and printable as JSON
 //! gitiup attest gc         retire the ones a retention policy says are old, keep what's referenced
+//! gitiup attest migrate    move an old store's single-level refs to <subject>/<digest>
 //! ```
 //!
 //! The bytes are never invented here. An attestation is a signed document and a
@@ -58,6 +59,17 @@
 //! gitiup attest gc --store ./store --max-age 90d --max-per-commit 5 --apply  # the change
 //! ```
 //!
+//! # Moving an old store up to date
+//!
+//! `gc` answers "how long do I keep this"; `migrate` answers "this store predates the
+//! `<subject>/<digest>` layout". A single-level `refs/attestations/<subject>` ref is
+//! still read and still listed (flagged `legacy`), but it can hold exactly one proof,
+//! so a second signer or a second tier has nowhere to go. `migrate` re-files each one
+//! under the current layout and retires the old ref only once the new one exists — same
+//! digest, same bytes, signature untouched — and, like `gc`, prints its report and
+//! changes nothing without `--apply`. A run interrupted between the two ref writes is
+//! repaired by the next one, because the intent was written down first.
+//!
 //! # Exit codes
 //!
 //! The same table as the rest of `gitiup` (ADR-0001 D7): 0 ok · 2 usage · 3 I/O or
@@ -85,6 +97,7 @@ USAGE:
     gitiup attest list [OPTIONS]
     gitiup attest show [DIGEST|ARGS] [OPTIONS]
     gitiup attest gc [OPTIONS]
+    gitiup attest migrate [OPTIONS]
 
 An attestation is signed bytes, and a signature is only ever over the exact canonical
 form (ADR-0001). `push` stores those bytes verbatim at kv/attestation/<digest> and
@@ -134,6 +147,16 @@ gc — retention:
                              store and a versioned bucket refuse and say why)
     --apply                  do it. Without this flag nothing changes: the plan is printed
                              and you can read it first
+
+migrate — move a store's old single-level attestation refs to <subject>/<digest>:
+    Old gitiup filed one proof per commit at refs/attestations/<commit>, a shape that
+    cannot hold a second signer, run or tier. `migrate` re-files each one under the
+    current layout — the same digest, the same bytes, a ref that leaves room for more —
+    and retires the old ref only once the new one exists. A proof whose bytes the store
+    cannot return is reported and left exactly where it is. Like `gc`, it changes
+    nothing without --apply, and a move interrupted between the two ref writes is
+    repaired by the next run.
+    --apply                  do it
 
 All: -j, --json on anything a script reads. Passphrases follow `gitiup key`:
 --passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a script cannot
@@ -186,9 +209,10 @@ pub fn attest(args: &[String]) -> Result<(), CliError> {
         "list" | "ls" => list(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "show" => show(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "gc" => gc(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "migrate" => migrate(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         other => Err(CliError::usage(format!(
             "unknown `gitiup attest` command '{other}'; `gitiup attest help` lists push, list, \
-             show and gc"
+             show, gc and migrate"
         ))),
     }
 }
@@ -533,6 +557,13 @@ fn list(args: &Args) -> Result<(), CliError> {
     for name in &odd {
         eprintln!("note: {name} is in the attestation namespace but not this layout");
     }
+    let legacy = rows.iter().filter(|row| row.entry.legacy).count();
+    if legacy > 0 {
+        eprintln!(
+            "note: {legacy} of them are filed in the old single-level shape; `gitiup attest \
+             migrate` re-files them where a second proof can sit beside them"
+        );
+    }
     Ok(())
 }
 
@@ -542,6 +573,7 @@ fn row_json(row: &Row) -> Value {
         "digest": entry.digest.hex(),
         "subject": entry.subject.hex(),
         "reference": entry.reference.as_str(),
+        "shape": if entry.legacy { "legacy" } else { "current" },
         "published_at": entry.updated_at.map(|at| rfc3339(at.as_unix() as i64 * 1_000_000)),
         "published_by": entry.updated_by.as_ref().map(|actor| actor.as_str().to_string()),
     });
@@ -550,6 +582,7 @@ fn row_json(row: &Row) -> Value {
             "digest": base["digest"],
             "subject": base["subject"],
             "reference": base["reference"],
+            "shape": base["shape"],
             "published_at": base["published_at"],
             "published_by": base["published_by"],
             "run_digest": parsed.run_digest,
@@ -567,6 +600,7 @@ fn row_json(row: &Row) -> Value {
             "digest": base["digest"],
             "subject": base["subject"],
             "reference": base["reference"],
+            "shape": base["shape"],
             "error": error.message,
         }),
     }
@@ -877,6 +911,72 @@ fn gc(args: &Args) -> Result<(), CliError> {
         eprintln!("dry run: nothing changed. Add --apply to retire these.");
     } else if let Some(record) = report.record {
         println!("record   kv/gc/{record}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// migrate
+// ---------------------------------------------------------------------------
+
+/// Move the store's legacy single-level attestation refs to `<subject>/<digest>`.
+///
+/// Same shape as `gc`: the run is a report first and a change only under `--apply`,
+/// because what it moves is signed evidence and the operator should be able to read
+/// the list before anything is rewritten.
+fn migrate(args: &Args) -> Result<(), CliError> {
+    if let Some(()) = args.help(ATTEST_HELP) {
+        return Ok(());
+    }
+    let store = participant::need_store(args)?;
+    let apply = args.on("--apply");
+    let report = attest::migrate(
+        &*store.host,
+        &attest::MigrationOptions {
+            actor: gitiup_host::Actor::from_env(),
+            apply,
+            record: apply,
+        },
+    )
+    .map_err(|e| CliError::io(format!("migrate: {e}")))?;
+
+    if args.json() {
+        let value =
+            serde_json::to_value(&report).map_err(|e| CliError::io(format!("report: {e}")))?;
+        print_json(json!({
+            "store": store.what,
+            "report": value,
+            "note": if apply { "applied" } else { "dry run: nothing changed; add --apply" },
+        }));
+        return Ok(());
+    }
+    println!("store  {}", store.what);
+    println!("{}", report.summary_line());
+    for moved in &report.moved {
+        println!(
+            "  {}  {} -> {}",
+            moved.digest.short_default(),
+            moved.from,
+            moved.to
+        );
+    }
+    for repaired in &report.repaired {
+        println!(
+            "  {}  re-filed after an interrupted move: {}",
+            repaired.digest.short_default(),
+            repaired.to
+        );
+    }
+    for blocked in &report.blocked {
+        println!("  {}  left alone: {}", blocked.reference, blocked.why);
+    }
+    if report.moved.is_empty() && report.repaired.is_empty() && report.blocked.is_empty() {
+        println!("  nothing in the old single-level shape: this store is already current");
+    }
+    if !apply && !report.moved.is_empty() {
+        eprintln!("dry run: nothing changed. Add --apply to move these.");
+    } else if let Some(record) = report.record {
+        println!("record kv/migrate/{record}");
     }
     Ok(())
 }

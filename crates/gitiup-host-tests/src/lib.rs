@@ -36,9 +36,15 @@
 //! | ref deletion | `ref_deletion_is_conditional` |
 //! | pack round-trip | `pack_round_trip_between_two_hosts`, `a_huge_pack_round_trips_intact` |
 //! | blob listing, pagination | `listings_are_complete_across_pages` |
+//! | the change workflow, propose → merge | `a_change_goes_from_proposal_to_merge_and_merges_once` |
+//! | a stale base must not merge | `a_stale_base_merge_is_refused_the_same_way_everywhere` |
 //! | expired / refused credentials | `refused_credentials_are_denied_not_dropped` |
 //! | `cas = false` degradation | `a_host_without_cas_refuses_cas_writes` |
 //! | unsupported operations | `unsupported_operations_are_refused_by_name` |
+//!
+//! Changes are also the one thing measured *between* hosts: [`changes::across_hosts`]
+//! publishes on a bucket and merges through a plain-git host, and insists both stores
+//! answer with the same digests. See `tests/change_across_hosts.rs`.
 //!
 //! # Running it
 //!
@@ -64,6 +70,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod bodies;
+pub mod changes;
 pub mod fixtures;
 pub mod hosts;
 mod macro_support;

@@ -25,7 +25,7 @@
 //! |-----------------|--------------------|--------------------|
 //! | refs, branches, the object store | [`store`] — the git data API, with pointer commits so a ref can point at a record | [`RefStore`], unchanged |
 //! | the pull request database | `GitHubHost::changes`, `GitHubHost::open_change` | a [`ChangeRecord`], same as a bucket's `refs/changes/**` |
-//! | check runs and CI status | `GitHubHost::publish_attestation`, `GitHubHost::attestations_for` | an [`AttestationRecord`], same as `refs/attestations/<oid>` on any host |
+//! | check runs and CI status | `GitHubHost::publish_attestation`, `GitHubHost::attestations_for` | an [`AttestationRecord`], same as `refs/attestations/<subject>/<digest>` on any host |
 //! | webhooks, and `github.event.*` | [`ChangeFeedCursor`] polling | "what is new since I looked", one conditional listing |
 //! | token auth, pagination, rate limits | [`client`], [`auth`] | nothing: they are the adapter's job, and a caller above should not be able to get them wrong |
 //!

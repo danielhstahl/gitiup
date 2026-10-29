@@ -16,11 +16,11 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
-| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc` files a signed attestation in a host store and reads it back, `gitiup change new/submit/list/show` drafts and publishes a signed change record to any store — `submit` also opens the quorum rounds the store's published policy asks for, one per job per matrix arm — and `change merge` merges one under compare-and-swap, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change, `gitiup quorum verdict` tallies every round a store holds for a change — verified / failed / insufficient, exit 0/6/7/8, `--publish` files the signed verdict — `gitiup work` is the volunteer's loop (poll for rounds addressed to this key, check the invitation, lease a seat, run the job in a sandbox, sign it, publish it), `gitiup policy publish/show` signs the policy a merge gate applies into the store and says which one is in force — the only crate that reads files, so the format crate can stay I/O-free |
+| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc/migrate` files a signed attestation in a host store and reads it back, `gitiup change new/submit/list/show` drafts and publishes a signed change record to any store — `submit` also opens the quorum rounds the store's published policy asks for, one per job per matrix arm — and `change merge` merges one under compare-and-swap, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change, `gitiup quorum verdict` tallies every round a store holds for a change — verified / failed / insufficient, exit 0/6/7/8, `--publish` files the signed verdict — `gitiup work` is the volunteer's loop (poll for rounds addressed to this key, check the invitation, lease a seat, run the job in a sandbox, sign it, publish it), `gitiup policy publish/show` signs the policy a merge gate applies into the store and says which one is in force — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), `gitiup.toml` remote config, and where attestations live — `kv/attestation/<digest>` advertised by `refs/attestations/<subject>/<digest>`, with the retention policy (`max age`, `max per commit`) and the rule above it: an object another live ref still points at is never pruned |
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
-| `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, forgetting one object, `cas = false`), run against the `fs`, plain-git, bucket and forge hosts — in CI, against real backends |
+| `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, forgetting one object, `cas = false`, the change workflow from proposal to merge, and a stale base refused with the same kind everywhere), run against the `fs`, plain-git, bucket and forge hosts — plus a change published on the bucket and merged through the plain-git host, with identical digests from both — in CI, against real backends |
 | `gitiup-attest` | the attestation format: canonical manifests, digests, Ed25519 signatures, freshness policy and the verification verdict (ladder, reasons, exit codes) — the bytes ADR-0001 decides, and nothing else |
 | `gitiup-keys` | signing keys and identities: an age-encrypted keystore, ssh-agent and gpg-agent backends, and the signed identity claim that says "this key is mine" — every one of them a `gitiup_attest::Signer`, so a key's origin never changes the signature it produces |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
@@ -80,6 +80,9 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   so its products are the same bytes twice (pin by SHA, images by digest, sorted
   manifests, `SOURCE_DATE_EPOCH`), what the runner rewrites instead (the twelve
   rules), and how a divergence is reported.
+* [Provable CI output](docs/provable-output.md) — the whole giti-1rs path in one place: run
+  → digest → signature → store → `git fetch` → verdict; who does each part, the rules that make
+  it hold, where every claim is executed as a test, and what it honestly does not promise.
 * [Host abstraction design notes](docs/host-abstraction.md) — the contracts every
   host owes, including the ref namespaces, store layout, pack format and error
   taxonomy.
@@ -145,12 +148,15 @@ The hosts all get run against one contract instead:
 
 ```sh
 cargo test -p gitiup-host-tests --features s3,github   # every hermetic host
-./ci/host-conformance.sh --minio                       # plus a live MinIO bucket
+./ci/host-conformance.sh --live                        # what CI runs: a live MinIO and a
+                                                       # real git-http-backend, demanded
 ```
 
 That is what `.github/workflows/host-conformance.yml` does, with a MinIO service
 and a `git-http-backend` service, and it fails rather than skips when a service
-is missing. See [`gitiup-host-tests`](crates/gitiup-host-tests/README.md).
+is missing — as does `--live`/`--strict` locally, which will not quietly narrow the
+matrix because docker is not installed. See
+[`gitiup-host-tests`](crates/gitiup-host-tests/README.md).
 
 `gitiup run` plans a job by default — no process, no network, no secrets, and an
 attestation that says `tier: simulated` — and only runs the steps when given

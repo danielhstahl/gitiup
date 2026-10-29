@@ -549,10 +549,29 @@ carry (a signature, a microsecond timestamp, a 256-bit digest) is listed in
 that a pull request is an advertisement of a record, and `origin: {kind:"pull"}` says so
 inside the record rather than leaving it to be inferred from where you read it.
 
+## Where this is measured
+
+The verbs are tested as a CLI in
+[`crates/gitiup/tests/change_cli.rs`](../crates/gitiup/tests/change_cli.rs), but the
+promise that decides whether any of it is safe — *every host means the same thing by
+this* — is measured in the host conformance suite, against every host and against real
+backends ([`gitiup-host-tests`](../crates/gitiup-host-tests)):
+
+| body | what every host must do |
+|------|-------------------------|
+| `a_change_goes_from_proposal_to_merge_and_merges_once` | propose, re-attempt, list, show, merge — and refuse the second merge with a conflict naming the change |
+| `a_stale_base_merge_is_refused_the_same_way_everywhere` | refuse a merge whose base moved with `invalid`/exit 6, both oids named, nothing written — one kind on the fs host, the plain-git host over `file://` and over `git-http-backend`, the bucket host, a live bucket and the forge adapter |
+| `tests/change_across_hosts.rs` | publish on the bucket, read and merge through the plain-git host, and get the same `kv/change/<hex>` digest, the same `change_digest` and the same `change list` from both — hermetically, and again across a live MinIO and a real `git-http-backend` |
+
+The CI job that runs them (`.github/workflows/host-conformance.yml`, or
+`./ci/host-conformance.sh --live` on your own machine) demands both services: a bucket
+or a served repository that failed to start fails the job instead of quietly narrowing
+what was measured.
+
 ## Not this ticket
 
-Checking a change out (`giti-b2z.5`) is written up above. The
-change-workflow conformance suite run against MinIO and `git-http-backend` (`giti-b2z.6`),
+Checking a change out (`giti-b2z.5`) is written up above, and the
+change-workflow conformance suite is written up just here (`giti-b2z.6`). Remaining:
 GitHub adapter parity for these verbs (`giti-b2z.7`). Opening quorum rounds on submit is
 `giti-zp1.2` and now happens (step 5 above). `gitiup verify change` (`giti-91m.4`) now gates a
 merge on all of it — the record's bytes, the refs, the attempt and the proof digests are

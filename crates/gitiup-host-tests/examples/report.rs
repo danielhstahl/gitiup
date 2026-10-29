@@ -9,7 +9,7 @@
 //! cargo run -p gitiup-host-tests --example report --features s3,github
 //! ```
 
-use gitiup_host_tests::{hosts, report, summary};
+use gitiup_host_tests::{hosts, report, runner, summary};
 
 fn main() {
     let mut failing = 0usize;
@@ -32,6 +32,27 @@ fn main() {
             println!("    FAIL {line}");
         }
     }
+
+    // The claim that is not about one host: a change published on a bucket, read and
+    // merged through a plain-git host, with the same digests from both. It is not a body
+    // — a body is one host measured once — so it gets its own lines here, its own test
+    // file, and its own named step in CI.
+    println!("\ncross-host (publish on the bucket, merge through the git host)");
+    for (name, publisher, merger) in hosts::cross_pairs() {
+        match runner::cross_report(name, publisher, merger) {
+            None => {
+                println!("    {name}: passed");
+                ran_anything = true;
+            }
+            Some(line) if line.contains(": SKIP (") => println!("    {line}"),
+            Some(line) => {
+                failing += 1;
+                ran_anything = true;
+                println!("    FAIL {line}");
+            }
+        }
+    }
+
     if !ran_anything {
         println!("nothing ran: every host was unavailable");
     }

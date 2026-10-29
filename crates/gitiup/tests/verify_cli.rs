@@ -361,6 +361,72 @@ fn a_document_can_be_piped_in() {
 }
 
 #[test]
+fn a_document_named_on_the_command_line_is_the_document_verified() {
+    // The merge-gate case, and the one a default remote could spoil: a working copy
+    // has a `gitiup.toml`, so *some* store is always reachable, and the gate still
+    // has to verify the file it was handed rather than whatever the remote happens
+    // to hold. Getting this backwards verifies one commit and merges another.
+    let harness = Harness::new();
+    let pushed = harness.push("test-failure", "ada");
+    std::fs::write(
+        harness.path().join("gitiup.toml"),
+        format!(
+            "schema-version = 1\ndefault-remote = \"origin\"\n\n[[remote]]\nname = \"origin\"\
+             \nurl = \"file://{}\"\n",
+            harness.store()
+        ),
+    )
+    .expect("write gitiup.toml");
+
+    let output = harness.verify("test-failure", &pinned(&["--json"]));
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(value["verdict"], "pass");
+    assert!(
+        value["source"].as_str().unwrap_or("").starts_with("file "),
+        "the verdict names the document it judged, not a store it could have reached: \
+         {}",
+        value["source"]
+    );
+    assert_eq!(
+        value["stored"],
+        Value::Null,
+        "nothing was fetched from a remote"
+    );
+    assert_eq!(
+        value["attestation"]["run_digest"], pushed["run_digest"],
+        "and it is the same proof either way, which is why the mistake is invisible"
+    );
+
+    // A store named out loud still wins, because the caller said where: the same
+    // commit read out of the remote rather than off disk.
+    let from_store = harness.run(
+        &[
+            "verify",
+            "attestation",
+            "--store",
+            &harness.store(),
+            "--commit",
+            pushed["subject"].as_str().unwrap(),
+            "--trust",
+            "ada",
+            "--now",
+            NOW,
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code(&from_store), 0, "{}", stderr(&from_store));
+    let value: Value = serde_json::from_str(&stdout(&from_store)).expect("json");
+    assert_eq!(value["verdict"], "pass");
+    assert!(
+        value["source"].as_str().unwrap_or("").contains("fs store"),
+        "{}",
+        value["source"]
+    );
+}
+
+#[test]
 fn the_table_reports_the_verdict_on_stdout_and_nothing_on_stderr() {
     // A verdict is a result, not a fault. A CI job that pipes both streams into one
     // log must still be able to read the report, and one that reads stderr must not

@@ -10,7 +10,7 @@
 //! this process has them, the record bytes as `record`. Reading the ref resolves
 //! the pointer back to the promised digest, so nothing above this module knows any
 //! of it happened. The plain-git host does the same thing, which is what makes
-//! *`git fetch` carries proof* true here too: fetching `refs/attestations/<oid>`
+//! *`git fetch` carries proof* true here too: fetching `refs/attestations/<subject>/<digest>`
 //! brings the attestation in the same packfile, and
 //! `git log refs/changes/c1/head` is the history of that change.
 //!

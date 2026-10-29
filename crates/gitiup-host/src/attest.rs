@@ -38,6 +38,18 @@
 //! which is the same refusal the rest of the crate makes when a host cannot promise
 //! something.
 //!
+//! # The two shapes, and how one becomes the other
+//!
+//! Older gitiup filed one proof per subject at `refs/attestations/<subject>` — legal,
+//! readable, and unable to hold a second signer, a second run or a second tier. That
+//! shape is [`legacy_ref_name`], it is still *read* (a listing flags it `legacy`), and
+//! nothing in this build writes it. [`migrate`] moves the ones a store already has:
+//! it re-publishes each under `<subject>/<digest>` and only then retires the old ref,
+//! so a proof is never advertised by less than it was before, and it reports what it
+//! refused to move instead of quietly leaving it behind. `publish` will not silently
+//! take over a subject whose legacy ref is in the way — a ref cannot be both a leaf
+//! and a directory — it says so and names `migrate`.
+//!
 //! # The rule that is not a policy knob
 //!
 //! **An object a live ref still points at is never pruned.** [`referenced`] collects
@@ -105,13 +117,14 @@ pub fn prefix(subject: &Oid) -> String {
 }
 
 /// The `(subject, digest)` a `refs/attestations/**` ref names, when it is shaped
-/// like one.
+/// like this layout.
 ///
-/// Returns `None` for anything else, including the single-level spelling
-/// (`refs/attestations/<oid>`) a forge adapter may still hold: that form can only
-/// carry one attestation per subject, so it is not this store's, and a caller that
-/// is listing attestations has to be able to tell the two apart rather than
-/// mis-read one as the other.
+/// Returns `None` for anything else — a deeper name, garbage, or the single-level
+/// spelling [`legacy_ref_name`] still finds in older stores. Those are *not* a
+/// mystery and are not skipped either: [`parse_legacy_ref`] reads them, and a
+/// listing reports what it cannot read at all. A caller that is listing
+/// attestations has to be able to tell the two shapes apart rather than mis-read
+/// one as the other.
 pub fn parse_ref(name: &RefName) -> Option<(Oid, Oid)> {
     let rest = name.attestation_target()?;
     let (subject, digest) = rest.split_once('/')?;
@@ -119,6 +132,33 @@ pub fn parse_ref(name: &RefName) -> Option<(Oid, Oid)> {
         return None;
     }
     Some((Oid::from_hex(subject).ok()?, Oid::from_hex(digest).ok()?))
+}
+
+/// `refs/attestations/<subject>` — the *legacy* single-level spelling of this
+/// namespace, which is what gitiup filed before a subject needed more than one
+/// proof.
+///
+/// It is legal git and it is still *read*: it advertises exactly one attestation
+/// per subject, which is the whole reason it was replaced (a second signer, a
+/// second run or a second tier would have to overwrite the first). It is never
+/// written by anything in this build, and [`migrate`] moves ones that exist.
+pub fn legacy_ref_name(subject: &Oid) -> RefName {
+    RefName::attestation(subject)
+}
+
+/// The subject a legacy single-level ref advertises a proof about, when the name
+/// is one (`refs/attestations/<hex-of-the-commit>`, nothing deeper).
+///
+/// The *name* is the subject and the ref's *value* is the attestation digest — the
+/// opposite way round from a listing caller's intuition, and worth stating: this
+/// shape can only say "about this commit", so the digest has nowhere to live but
+/// in the value.
+pub fn parse_legacy_ref(name: &RefName) -> Option<Oid> {
+    let rest = name.attestation_target()?;
+    if rest.contains('/') {
+        return None;
+    }
+    Oid::from_hex(rest).ok()
 }
 
 /// Parse a duration for a retention limit: `45d`, `2w`, `36h`, `90m`, `30s`, or a
@@ -191,14 +231,11 @@ pub fn publish(
     bytes: &[u8],
     actor: impl Into<Actor>,
 ) -> HostResult<Published> {
-    let actor = actor.into();
-    let digest = Oid::hash_bytes(bytes);
-    let reference = ref_name(subject, &digest);
-
     // A ref cannot be both a leaf and a directory. The single-level spelling of this
-    // namespace is legal git and a forge adapter may have written it; say so rather
-    // than let the store answer with a transport-level name-conflict error.
-    let leaf = RefName::attestation(subject);
+    // namespace is legal git and an older gitiup wrote it; say so rather than let the
+    // store answer with a transport-level name-conflict error. `migrate` is the way
+    // out, and it is the one caller allowed past this guard.
+    let leaf = legacy_ref_name(subject);
     if let Some(existing) = host.get_ref(&leaf)? {
         return Err(HostError::invalid(
             "attestation ref",
@@ -210,9 +247,27 @@ pub fn publish(
         )
         .with_hint(
             "this store holds one attestation ref for this subject in the old single-ref shape; \
-             move it to refs/attestations/<subject>/<digest> (see gitiup_host::attest::ref_name)",
+             move it with `gitiup attest migrate` (or gitiup_host::attest::migrate), which \
+             reads the proof, files it under <subject>/<digest> and only then retires the old ref",
         ));
     }
+    publish_new(host, subject, bytes, actor)
+}
+
+/// The two writes of a publish, without the legacy-leaf guard.
+///
+/// This is what [`migrate`] files the moved proof with: the ref standing in the way
+/// is the one the migration is about to retire, and the new advertisement still goes
+/// down before that one is removed.
+pub(crate) fn publish_new(
+    host: &dyn Host,
+    subject: &Oid,
+    bytes: &[u8],
+    actor: impl Into<Actor>,
+) -> HostResult<Published> {
+    let actor = actor.into();
+    let digest = Oid::hash_bytes(bytes);
+    let reference = ref_name(subject, &digest);
 
     let stored = host.put_cas(&Namespace::ATTESTATION, bytes)?;
     if stored != digest {
@@ -282,16 +337,25 @@ pub struct Entry {
     /// Size in bytes, when the store would say so without a fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Whether this proof is filed in the legacy single-level shape (`legacy: true`,
+    /// omitted otherwise, so the JSON a script reads is unchanged for current
+    /// layouts). The proof is just as valid; what it lacks is room for a second one
+    /// about the same subject, and [`migrate`] moves it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy: bool,
 }
 
 /// What a listing found, plus what it refused to guess about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     /// The attestations this module's layout describes, sorted by `(subject, digest)`.
+    /// Legacy single-level proofs are here too, flagged `legacy`.
     pub entries: Vec<Entry>,
-    /// `refs/attestations/**` names that are not this layout (a legacy single-level
-    /// ref, say). Reported rather than skipped: a listing that silently drops a ref
-    /// is how "there is no proof" becomes a lie.
+    /// `refs/attestations/**` names that are neither layout — a directory someone
+    /// invented, or a single-level ref whose hex is its own value (a digest
+    /// advertised by digest, which names no subject at all). Reported rather than
+    /// skipped: a listing that silently drops a ref is how "there is no proof"
+    /// becomes a lie.
     pub unexpected: Vec<String>,
 }
 
@@ -299,6 +363,12 @@ impl Catalog {
     /// Nothing found.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.unexpected.is_empty()
+    }
+
+    /// The proofs filed in the legacy single-level shape, in the same order as
+    /// [`Catalog::entries`] — the ones `gitiup attest migrate` would move.
+    pub fn legacy(&self) -> Vec<&Entry> {
+        self.entries.iter().filter(|entry| entry.legacy).collect()
     }
 }
 
@@ -328,8 +398,25 @@ fn scan(host: &dyn Host, subject: Option<&Oid>) -> HostResult<Catalog> {
                 updated_by: reference.updated_by,
                 updated_at: reference.updated_at,
                 size: None,
+                legacy: false,
             }),
-            None => catalog.unexpected.push(reference.name.as_str().to_string()),
+            None => match parse_legacy_ref(&reference.name) {
+                Some(subject) if reference.oid.hex() != subject.hex() => {
+                    catalog.entries.push(Entry {
+                        subject,
+                        digest: reference.oid,
+                        reference: reference.name,
+                        updated_by: reference.updated_by,
+                        updated_at: reference.updated_at,
+                        size: None,
+                        legacy: true,
+                    })
+                }
+                // Either not a hex name at all, or a ref named by the digest it
+                // points at: it advertises a proof without naming what the proof
+                // is about, so no reading of it is honest. Say so; do not guess.
+                _ => catalog.unexpected.push(reference.name.as_str().to_string()),
+            },
         }
     }
     catalog.entries.sort_by(|a, b| {
@@ -391,6 +478,330 @@ pub fn referenced(host: &dyn Host) -> HostResult<BTreeMap<Oid, String>> {
 /// turned off.
 pub fn pin(pins: &mut BTreeMap<Oid, String>, digest: Oid, why: impl Into<String>) {
     pins.entry(digest).or_insert_with(|| why.into());
+}
+
+// --------------------------------------------------------------------------
+// reconciling the two shapes
+// --------------------------------------------------------------------------
+
+/// Namespace of the records [`migrate`] leaves behind.
+pub const MIGRATE_NAMESPACE: Namespace = Namespace::const_new("migrate");
+
+/// One legacy single-level ref, and the proof it advertises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyProof {
+    /// The object the legacy ref names — the subject.
+    pub subject: Oid,
+    /// The digest the legacy ref points at: the attestation itself.
+    pub digest: Oid,
+    /// The legacy ref's own name.
+    pub reference: String,
+}
+
+/// Every legacy single-level attestation ref in the store.
+///
+/// These are read like any other proof and are never silently rewritten: [`migrate`]
+/// moves one only when it is asked to, and refuses when it cannot first put a better
+/// advertisement in place.
+pub fn legacy_proofs(host: &dyn Host) -> HostResult<Vec<LegacyProof>> {
+    Ok(list_all(host)?
+        .legacy()
+        .into_iter()
+        .map(|entry| LegacyProof {
+            subject: entry.subject,
+            digest: entry.digest,
+            reference: entry.reference.as_str().to_string(),
+        })
+        .collect())
+}
+
+/// What [`migrate`] should do, beyond finding the refs.
+#[derive(Debug, Clone)]
+pub struct MigrationOptions {
+    /// Who is running this, recorded in the new ref and the deleted one.
+    pub actor: Actor,
+    /// Decide and report, change nothing. The default, because the thing being moved
+    /// is a signed proof and the operator should read the list first.
+    pub apply: bool,
+    /// Write the `kv/migrate/…` record of this run (only when it applied and moved
+    /// something).
+    pub record: bool,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> MigrationOptions {
+        MigrationOptions {
+            actor: Actor::from_env(),
+            apply: false,
+            record: true,
+        }
+    }
+}
+
+/// One proof that moved (or would move).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovedProof {
+    /// What it attests to.
+    pub subject: Oid,
+    /// The attestation's digest, unchanged: moving a ref never re-writes bytes.
+    pub digest: Oid,
+    /// The single-level ref it was filed under.
+    pub from: String,
+    /// The `<subject>/<digest>` ref it is filed under (or would be).
+    pub to: String,
+    /// Whether the old ref is gone. `false` in a dry run, always.
+    pub retired: bool,
+}
+
+/// One proof that could not be moved, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedProof {
+    /// The legacy ref.
+    pub reference: String,
+    /// The digest it advertises, when the name said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Oid>,
+    /// Why it stays where it is, in the caller's own words.
+    pub why: String,
+}
+
+/// A migration run did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationReport {
+    /// Schema of this record.
+    pub schema_version: u32,
+    /// The clock it ran against (microseconds since the epoch).
+    pub now_us: i64,
+    /// Who ran it.
+    pub actor: String,
+    /// Whether anything was changed.
+    pub dry_run: bool,
+    /// Every proof that moved, or would have.
+    pub moved: Vec<MovedProof>,
+    /// Every proof that stayed, and the reason.
+    pub blocked: Vec<BlockedProof>,
+    /// Proofs a *previous* run left with no advertisement — a crash between retiring
+    /// the old ref and filing the new one — that this run re-filed. Repair is part of
+    /// every applying run, so a half-finished move heals on the next invocation
+    /// instead of waiting for someone to notice bytes with no ref.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repaired: Vec<MovedProof>,
+    /// How many single-level refs are left after this run (in a dry run, how many
+    /// would be: the blocked ones, since every movable ref moves).
+    pub remaining: usize,
+    /// The `kv/migrate/…` record of this run, when one was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<Oid>,
+}
+
+impl MigrationReport {
+    /// One line for a human.
+    pub fn summary_line(&self) -> String {
+        let verb = if self.dry_run { "would move" } else { "moved" };
+        if self.moved.is_empty() && self.blocked.is_empty() {
+            return "no legacy attestation refs".to_string();
+        }
+        let mut line = format!("{verb} {} legacy attestation ref(s)", self.moved.len());
+        if !self.blocked.is_empty() {
+            line.push_str(&format!("; {} blocked", self.blocked.len()));
+        }
+        if self.remaining > 0 {
+            line.push_str(&format!("; {} left single-level", self.remaining));
+        }
+        line
+    }
+}
+
+/// Move every legacy single-level attestation ref to `<subject>/<digest>`.
+///
+/// The order per proof is: note the intent, retire the old advertisement, file the
+/// new one, and put it back if filing it failed. That is the reverse of [`publish`]'s
+/// bytes-then-ref order, and it has to be: a ref cannot be a leaf and a directory at
+/// once, so on a git-backed store the old name has to go before the new one can
+/// exist. The intent record written first is what makes that window recoverable —
+/// every applying run starts by re-filing the proofs a previous run's records say it
+/// was mid-way through, so a crash between the two ref writes is repaired by the next
+/// `migrate` rather than discovered by an audit.
+///
+/// A proof whose bytes the store cannot return is `blocked`, not deleted: the legacy
+/// ref may be the only thing that proves those bytes were ever published, and
+/// retiring the advertisement of a document that cannot be read is a second,
+/// unrelated act that retention (`gc`) gets to decide.
+pub fn migrate(host: &dyn Host, options: &MigrationOptions) -> HostResult<MigrationReport> {
+    let now_us = Timestamp::now().as_unix() as i64 * MICROS;
+    let repaired = if options.apply {
+        repair(host, &options.actor)?
+    } else {
+        Vec::new()
+    };
+    let mut moved = Vec::new();
+    let mut blocked = Vec::new();
+    for proof in legacy_proofs(host)? {
+        let target = ref_name(&proof.subject, &proof.digest);
+        let bytes = match fetch(host, &proof.digest) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                blocked.push(BlockedProof {
+                    reference: proof.reference,
+                    digest: Some(proof.digest),
+                    why: format!(
+                        "the store cannot return the bytes {} advertises, so there is nothing \
+                         to advertise under {target}",
+                        proof.digest.short_default()
+                    ),
+                });
+                continue;
+            }
+            Err(error) => {
+                blocked.push(BlockedProof {
+                    reference: proof.reference,
+                    digest: Some(proof.digest),
+                    why: error.message(),
+                });
+                continue;
+            }
+        };
+        let old_ref = RefName::new(&proof.reference)?;
+        if options.apply {
+            // 1. Say what is about to happen, in the store, before it happens.
+            let intent = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "now_us": now_us,
+                "actor": options.actor.as_str(),
+                "in_flight": [{
+                    "subject": proof.subject.hex(),
+                    "digest": proof.digest.hex(),
+                    "from": proof.reference,
+                    "to": target.as_str(),
+                }],
+            });
+            host.put_json(&MIGRATE_NAMESPACE, &intent)?;
+            // 2. Retire the old advertisement (the name has to be free before the
+            //    directory form can exist).
+            let deletion = RefDeletion::new(old_ref.clone(), Expect::Is(proof.digest))
+                .with_actor(options.actor.clone());
+            match host.delete_ref_cas(&deletion) {
+                Ok(()) => {}
+                Err(error) => {
+                    let gone = ref_gone(host, &old_ref)?;
+                    if !gone {
+                        blocked.push(BlockedProof {
+                            reference: proof.reference.clone(),
+                            digest: Some(proof.digest),
+                            why: format!("{} could not be retired: {error}", proof.reference),
+                        });
+                        continue;
+                    }
+                }
+            }
+            // 3. File the new one; put the old one back if that fails.
+            if let Err(error) = publish_new(host, &proof.subject, &bytes, options.actor.clone()) {
+                let restore = RefUpdate::create(old_ref, proof.digest)
+                    .with_actor(options.actor.clone())
+                    .with_message("migrate rolled back".to_string());
+                let restored = host.update_ref_cas(&restore).is_ok();
+                blocked.push(BlockedProof {
+                    reference: proof.reference,
+                    digest: Some(proof.digest),
+                    why: format!(
+                        "could not be filed under {target}: {error}{}",
+                        if restored {
+                            "; the old ref was put back"
+                        } else {
+                            ", and the old ref could not be put back either — the bytes are \
+                             still in the store and a later migrate can re-file them"
+                        }
+                    ),
+                });
+                continue;
+            }
+        }
+        moved.push(MovedProof {
+            subject: proof.subject,
+            digest: proof.digest,
+            from: proof.reference,
+            to: target.as_str().to_string(),
+            retired: options.apply,
+        });
+    }
+    let mut report = MigrationReport {
+        schema_version: SCHEMA_VERSION,
+        now_us,
+        actor: options.actor.as_str().to_string(),
+        dry_run: !options.apply,
+        remaining: blocked.len(),
+        repaired,
+        moved,
+        blocked,
+        record: None,
+    };
+    if options.record && options.apply && (!report.moved.is_empty() || !report.repaired.is_empty())
+    {
+        let value = serde_json::to_value(&report)
+            .map_err(|e| HostError::invalid("migrate record", format!("cannot encode: {e}")))?;
+        let oid = host.put_json(&MIGRATE_NAMESPACE, &value)?;
+        report.record = Some(oid);
+    }
+    Ok(report)
+}
+
+/// Re-file the proofs previous migration records say were moved but that no ref now
+/// advertises.
+///
+/// This is the repair half of the crash window: the old ref was retired, the new one
+/// was never written (or was deleted since), and the bytes are sitting in the store
+/// with nothing pointing at them. Nothing but the record knows they were meant to be
+/// findable, which is why the record is written before the swap rather than after.
+fn repair(host: &dyn Host, actor: &Actor) -> HostResult<Vec<MovedProof>> {
+    let mut repaired = Vec::new();
+    for entry in host.list(&MIGRATE_NAMESPACE)? {
+        let Some(bytes) = host.get(&entry.oid)? else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(items) = record.get("in_flight").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            let (Some(subject), Some(digest), Some(to)) = (
+                item.get("subject").and_then(|v| v.as_str()),
+                item.get("digest").and_then(|v| v.as_str()),
+                item.get("to").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let (Ok(subject), Ok(digest)) = (Oid::from_hex(subject), Oid::from_hex(digest)) else {
+                continue;
+            };
+            let Ok(reference) = RefName::new(to) else {
+                continue;
+            };
+            if host.get_ref(&reference)?.is_some() {
+                continue; // it was filed after all: nothing to repair
+            }
+            if let Some(bytes) = fetch(host, &digest)? {
+                // Whether this ref is the legacy one or the target, the point is that
+                // the proof is advertised again under the shape that holds many.
+                let _ = publish_new(host, &subject, &bytes, actor.clone());
+                if host.get_ref(&reference)?.is_some() {
+                    repaired.push(MovedProof {
+                        subject,
+                        digest,
+                        from: item
+                            .get("from")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        to: reference.as_str().to_string(),
+                        retired: true,
+                    });
+                }
+            }
+        }
+    }
+    Ok(repaired)
 }
 
 // --------------------------------------------------------------------------
@@ -1442,5 +1853,229 @@ mod tests {
         assert!(policy.describe().contains("30d"));
         assert!(policy.describe().contains("keep 5"));
         assert!(Retention::new(Some("never"), None).unwrap().is_unbounded());
+    }
+
+    // -- the two shapes ----------------------------------------------------
+
+    #[test]
+    fn a_legacy_ref_names_its_subject_and_nothing_else() {
+        let subject = digest_of("a commit");
+        let legacy = legacy_ref_name(&subject);
+        assert_eq!(legacy.as_str(), format!("refs/attestations/{subject}"));
+        assert_eq!(parse_legacy_ref(&legacy), Some(subject));
+        // A two-level ref is not legacy, and neither is a name that is not hex.
+        assert_eq!(
+            parse_legacy_ref(&ref_name(&subject, &digest_of("proof"))),
+            None
+        );
+        assert_eq!(
+            parse_legacy_ref(&RefName::new("refs/attestations/not-hex").unwrap()),
+            None
+        );
+        assert_eq!(
+            parse_ref(&legacy),
+            None,
+            "and the two readings do not overlap"
+        );
+    }
+
+    /// File one proof the old way: `refs/attestations/<subject>` -> digest.
+    fn file_legacy(host: &dyn Host, subject: &Oid, bytes: &[u8]) -> Oid {
+        let digest = host
+            .put_cas(&Namespace::ATTESTATION, bytes)
+            .expect("store the bytes");
+        host.update_ref_cas(&RefUpdate::create(legacy_ref_name(subject), digest))
+            .expect("the legacy ref");
+        digest
+    }
+
+    #[test]
+    fn a_legacy_proof_is_listed_as_a_proof_and_flagged_as_legacy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let subject = digest_of("a commit");
+        let digest = file_legacy(&host, &subject, b"an old attestation");
+
+        let catalog = list_for(&host, &subject).expect("list");
+        assert!(catalog.unexpected.is_empty(), "{:?}", catalog.unexpected);
+        assert_eq!(catalog.entries.len(), 1);
+        let entry = &catalog.entries[0];
+        assert_eq!(entry.subject, subject);
+        assert_eq!(entry.digest, digest, "the ref's value is the attestation");
+        assert!(entry.legacy);
+        assert_eq!(catalog.legacy().len(), 1);
+        // It is findable by the same question a modern proof is found by.
+        assert_eq!(
+            fetch(&host, &digest).unwrap().unwrap(),
+            b"an old attestation"
+        );
+        assert!(list_all(&host).expect("list all").legacy().len() == 1);
+    }
+
+    #[test]
+    fn a_ref_that_names_its_own_digest_advertises_no_subject() {
+        // A digest filed under its own hex proves nothing about a commit, so no
+        // reading of it is honest; it is reported, never guessed at.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let digest = digest_of("a proof");
+        host.put_cas(&Namespace::ATTESTATION, b"a proof").unwrap();
+        host.update_ref_cas(&RefUpdate::create(RefName::attestation(&digest), digest))
+            .unwrap();
+        let catalog = list_all(&host).expect("list");
+        assert!(catalog.entries.is_empty());
+        assert_eq!(catalog.unexpected.len(), 1);
+    }
+
+    #[test]
+    fn publishing_beside_a_legacy_ref_says_so_and_names_the_way_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let subject = digest_of("a commit");
+        file_legacy(&host, &subject, b"an old attestation");
+        let error = publish(&host, &subject, b"a new attestation", "ada").unwrap_err();
+        assert_eq!(error.kind(), crate::HostErrorKind::Invalid);
+        assert!(error.to_string().contains("single ref"), "{error}");
+        assert!(
+            error.hint().unwrap_or_default().contains("attest migrate"),
+            "the refusal has to say what to do: {}",
+            error.hint().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn migrate_moves_a_legacy_proof_and_then_the_subject_holds_many() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let subject = digest_of("a commit");
+        let old = file_legacy(&host, &subject, b"an old attestation");
+
+        // A dry run reads and reports, and changes nothing a later command could
+        // mistake for progress.
+        let planned = migrate(&host, &MigrationOptions::default()).expect("plan");
+        assert!(planned.dry_run);
+        assert_eq!(planned.moved.len(), 1);
+        assert!(!planned.moved[0].retired);
+        assert_eq!(planned.remaining, 0);
+        assert!(planned.record.is_none());
+        assert!(
+            legacy_proofs(&host).unwrap().len() == 1,
+            "nothing moved yet"
+        );
+        assert!(!planned.summary_line().contains("would move 0"));
+
+        let options = MigrationOptions {
+            actor: Actor::from("ada"),
+            apply: true,
+            record: true,
+        };
+        let report = migrate(&host, &options).expect("migrate");
+        assert!(!report.dry_run);
+        assert_eq!(report.moved.len(), 1);
+        assert!(report.moved[0].retired);
+        assert_eq!(report.moved[0].digest, old);
+        assert!(report.record.is_some(), "and the move is recorded");
+        assert!(legacy_proofs(&host).unwrap().is_empty());
+        assert!(
+            host.get_ref(&legacy_ref_name(&subject)).unwrap().is_none(),
+            "the old ref is gone"
+        );
+
+        let catalog = list_for(&host, &subject).expect("list");
+        assert_eq!(catalog.entries.len(), 1);
+        assert!(!catalog.entries[0].legacy);
+        assert_eq!(
+            catalog.entries[0].digest, old,
+            "the same digest, not a re-write"
+        );
+        assert_eq!(
+            fetch(&host, &old).unwrap().unwrap(),
+            b"an old attestation",
+            "the signed bytes were never touched"
+        );
+
+        // The point of the move: a second proof can now be filed beside the first.
+        publish(&host, &subject, b"a second signer", "bob").expect("publish");
+        assert_eq!(list_for(&host, &subject).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_move_interrupted_between_the_two_ref_writes_heals_on_the_next_run() {
+        // The one window this design cannot close: the old ref is retired, the new
+        // one was never written, and the process died in between. The intent record
+        // is what makes that state findable, and `migrate` looks for it before it
+        // looks for anything else.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let subject = digest_of("a commit");
+        let bytes = b"an old attestation";
+        let digest = Oid::hash_bytes(bytes);
+        host.put_cas(&Namespace::ATTESTATION, bytes).unwrap();
+        let target = ref_name(&subject, &digest);
+        host.put_json(
+            &MIGRATE_NAMESPACE,
+            &serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "in_flight": [{
+                    "subject": subject.hex(),
+                    "digest": digest.hex(),
+                    "from": legacy_ref_name(&subject).as_str(),
+                    "to": target.as_str(),
+                }],
+            }),
+        )
+        .unwrap();
+        assert!(
+            host.get_ref(&target).unwrap().is_none(),
+            "the crash left nothing advertising these bytes"
+        );
+        assert!(
+            list_all(&host).unwrap().is_empty(),
+            "and no listing can see them"
+        );
+
+        let report = migrate(
+            &host,
+            &MigrationOptions {
+                actor: Actor::from("ada"),
+                apply: true,
+                record: false,
+            },
+        )
+        .expect("migrate");
+        assert_eq!(report.repaired.len(), 1, "{}", report.summary_line());
+        assert_eq!(report.repaired[0].digest, digest);
+        assert!(host.get_ref(&target).unwrap().is_some(), "re-advertised");
+        assert_eq!(list_all(&host).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn migrate_refuses_to_retire_the_advertisement_of_bytes_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let host = FsHost::create(dir.path().join("store")).expect("fs host");
+        let subject = digest_of("a commit");
+        let bytes = b"bytes that will not be here";
+        let digest = Oid::hash_bytes(bytes);
+        // The ref exists; the object it names does not. That is a broken store, and
+        // the migration's job is not to make it more broken by forgetting the ref.
+        host.update_ref_cas(&RefUpdate::create(legacy_ref_name(&subject), digest))
+            .unwrap();
+        let report = migrate(
+            &host,
+            &MigrationOptions {
+                actor: Actor::from("ada"),
+                apply: true,
+                record: false,
+            },
+        )
+        .expect("migrate");
+        assert!(report.moved.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+        assert!(report.blocked[0].why.contains("cannot return"));
+        assert_eq!(report.remaining, 1);
+        assert!(
+            host.get_ref(&legacy_ref_name(&subject)).unwrap().is_some(),
+            "the only advertisement of those bytes survives"
+        );
     }
 }
