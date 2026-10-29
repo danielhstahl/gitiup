@@ -455,7 +455,14 @@ pub struct PolicyFile {
 
 impl PolicyFile {
     /// The keys a policy file may contain, for the error that lists them.
-    const KEYS: &'static [&'static str] = &[
+    ///
+    /// Public because this is a *schema*, not a detail of this parser: a published
+    /// policy embeds `PolicyFile` verbatim
+    /// ([ADR-0004 D2](../../../docs/adr/0004-published-policy-format-signing-and-resolution.md)),
+    /// so `gitiup-quorum` refuses a rule body by the same key list this parser does.
+    /// Two lists would be two vocabularies for "what a proof must satisfy", which is
+    /// the failure D2 exists to prevent.
+    pub const KEYS: &'static [&'static str] = &[
         "schema_version",
         "allow_simulated",
         "allowed_tiers",

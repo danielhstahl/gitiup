@@ -96,6 +96,7 @@ pub mod error;
 pub mod gate;
 pub mod ledger;
 pub mod participate;
+pub mod policy;
 pub mod record;
 pub mod roster;
 pub mod round;
@@ -112,6 +113,10 @@ pub use gate::{admit, approval};
 pub use gitiup_attest::{Digest, GitOid};
 pub use ledger::RosterLedger;
 pub use participate::{Invitation, JobBrief, ServeOutcome, Served, check_invitation};
+pub use policy::{
+    PolicyDocument, PolicyError, PolicyProvenance, ResolvedPolicy, Source as PolicySource,
+    resolve as resolve_policy,
+};
 pub use roster::{
     EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
 };

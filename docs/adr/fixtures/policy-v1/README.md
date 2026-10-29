@@ -78,24 +78,37 @@ $ python3 generate.py --verify   # re-derive every committed record from its own
 
 ## Reproduced in Rust
 
-`giti-91m.2` owns the test that must exist: build the same three fixture identities
-(`keys` in `cases.json`, derived from
-`gitiup ADR-0003 change-v1 fixture key: ` + a label, exactly as
-[`change-v1/generate.py`](../change-v1/generate.py) derives them), and prove from
-`policies/*.json` alone that
+Yes — `crates/gitiup-quorum/tests/policy_vectors.rs` reads `policies/*.json` and
+`cases.json` and proves from **those bytes alone** (never from a Rust constant) that:
 
-* `gitiup_attest::canon` re-encodes the bytes to themselves and
-  `SignatureEntry::verify` accepts the signature over the PAE bytes for
-  `application/vnd.gitiup.policy+json` — and rejects the same signature over the
-  payload type of any other record type;
+* the three fixture identities in `cases.json:keys` derive the key ids the vectors
+  name, from `gitiup ADR-0003 change-v1 fixture key: ` + a label exactly as
+  [`change-v1/generate.py`](../change-v1/generate.py) derives them;
+* `gitiup_attest::canon` re-encodes every committed vector to itself, so the file and
+  its digest are one fact and not two that have to be kept in step;
+* a signature verifies over the PAE bytes for `application/vnd.gitiup.policy+json` —
+  and the same signature is rejected over the payload type of any other record type;
 * `body_digest` is the digest of the document with `signatures` removed (so it is
-  computable before anyone signs, which is what a `policy publish --dry-run` prints)
-  and `record_digest` is the digest of the stored bytes, which is the `kv/policy/` key;
-* the validator reaches the same token and exit code for all 32 refusals — the point
-  of the table is that `.2`, `.3`, `.4` and `.5` refuse the same documents for the
-  same reason rather than each in its own idiom;
+  computable before anyone signs, which is what `gitiup policy publish --dry-run`
+  prints) and `record_digest` is the digest of the stored bytes, which is the
+  `kv/policy/` key — both re-derived here and compared with `cases.json`;
+* the validator reaches the same token and exit code for all 32 rows of
+  `cases.json:refusals`, which is the point of the table: `.2`, `.3`, `.4` and `.5`
+  refuse the same documents for the same reason instead of each in its own idiom;
 * the history walk picks revision 1, then revision 2, then refuses, at the three
-  timestamps in `history`.
+  timestamps in `cases.json:history`;
+* every row of `cases.json:normalisations` is what publish produces — which is why two
+  authors who wrote the same rules in a different order publish byte-identical bytes,
+  and why a re-publish that changed nothing cannot move a digest a verdict cited.
 
-Until that test exists these vectors are a strong suggestion with real signatures,
-which is better than prose and less than the rule.
+Two files live beside it, because a vector cannot exercise a store or a command line.
+`crates/gitiup-quorum/tests/policy_store.rs` takes the same format into a real store:
+publish it, read it back, resolve it with provenance, and refuse every store-shaped
+failure (unsigned, not canonical, a blob the store cannot return, a signer the reader
+does not trust, a lost update, a chain that runs backwards).
+`crates/gitiup/tests/policy_cli.rs` runs `gitiup policy publish` and `gitiup policy
+show` as command lines, because ADR-0004's `--dry-run`, exit-code and
+provenance-printing clauses are only true of a binary.
+
+If a vector and the Rust ever disagree, the vector is the rule: fix the Rust, and do not
+edit `policies/*.json`, `cases.json` or `generate.py` to match a build.

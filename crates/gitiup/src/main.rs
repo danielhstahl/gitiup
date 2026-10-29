@@ -27,6 +27,8 @@
 //! gitiup identity …                     who this machine signs as: publish, use, whoami
 //! gitiup participant …                  volunteering to verify: register, withdraw, list
 //! gitiup select …                       who verifies one change, and why: derive or audit
+//! gitiup policy publish|show            the policy a merge gate applies: publish it to
+//!                                      the store signed, and ask which one is in force
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -56,6 +58,7 @@ mod env;
 mod keys;
 mod normalise;
 mod participant;
+mod policy;
 mod remotes;
 mod run;
 mod select;
@@ -95,6 +98,11 @@ COMMANDS:
                                    verify-roster, approve, revoke
     select [OPTIONS]               who verifies one change: re-derive a published
                                    selection, or open a new round and exclude the author
+    policy publish [POLICY]        the rule a merge gate applies, in the store and signed:
+                                   publish checks it before it writes, and refuses what it
+                                   cannot stand behind (ADR-0004)
+    policy show [OPTIONS]          which policy is in force, from where, and whether a
+                                   merge may rest on it (`--gate`)
     help                        print this text
     version                     print the version of this build
 
@@ -186,6 +194,9 @@ Try:
     gitiup select --change chg-1 --store ./store --explain
     gitiup select --change chg-1 --job build/matrix/linux-x86_64 --head sha1:… \
         --proposer ada --require-arch x86_64 --store ./store --publish
+    gitiup policy publish --store ./store --allow-tier local --trust ada --json
+    gitiup policy publish policy.json --store ./store --dry-run
+    gitiup policy show --store ./store --gate
     gitiup key gen --comment ada@laptop         # a new key, in the age-encrypted keystore
     gitiup identity publish ada --email ada@example.com
     gitiup identity whoami --check              # proves this machine can still sign
@@ -347,6 +358,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "identity" => keys::identity(&args[1..]),
         "participant" => participant::participant(&args[1..]),
         "select" => select::select(&args[1..]),
+        "policy" => policy::policy(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }
