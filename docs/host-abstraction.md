@@ -74,10 +74,17 @@ wherever the repo lives:
 
 ```text
 refs/heads/**                        real branches (owner writes)
-refs/changes/<id>/head               proposed change head
+refs/changes/<id>/head               proposed change head (the current attempt)
+refs/changes/<id>/attempt/<n>        attempt n, immutable, create-only
+refs/changes/<id>/{merged,abandoned} the record that moved the change out of `open`
 refs/attestations/<subject>/<digest>  attestations for a commit, so `git fetch` carries proof
 refs/gitiup/**                       roster, job/lease records, quorum state
 ```
+
+The change refs, their record format and what a merge is are decided in
+[ADR-0003](adr/0003-change-record-format-and-merge-semantics.md); the shape above is
+repeated here because every host has to honour it, and because `<id>` is a
+content-derived `chg-…` name rather than a number a server handed out (D3 there).
 
 `RefName` validates names git-style (no `..`, no `~^:?*[\\`, no `.lock` suffix,
 no empty components) so a bad name fails at parse time rather than as a weird
@@ -90,6 +97,7 @@ in its own idiom:
 |-----------|---------------|---------------|------------------------------|
 | `refs/heads/**` | the owner, with plain `git push` | a branch, left exactly as git made it | one ref object, `refs/heads/main` |
 | `refs/changes/<id>/head` | gitiup, for a contributor | a ref pointing at the change record (via a pointer commit, so the bytes travel with it) | a ref object plus `kv/change/<hash>` |
+| `refs/changes/<id>/attempt/<n>` | gitiup, once per attempt, never again | the same, and the pointer commit's parents make `git log` the attempt history | a ref object plus the same `kv/change/<hash>` |
 | `refs/attestations/<subject>/<digest>` | gitiup, after a run verifies (or `gitiup attest push`) | a ref pointing at the attestation (via a pointer commit, so the bytes travel with it) | a ref object plus `kv/attestation/<hash>` |
 | `refs/gitiup/**` | gitiup only | the store manifest and the record chains; never listed | `host.json` and `kv/**` |
 

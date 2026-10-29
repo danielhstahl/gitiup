@@ -1,0 +1,149 @@
+{
+  "cases": {
+    "abandoned": {
+      "author": "SHA256:5eBCbqGIQZ4NnR2b5MhqZZrjMYqP049z+pTQqQeqFds",
+      "body_digest": "sha256:556482ab8b80ad1868e2075064015f2744c83eda230277acc2d1ea7930596038",
+      "change_id": "chg-28b29e411598b74f",
+      "file": "records/abandoned.json",
+      "kind": "abandon",
+      "note": "closing a change is a signed record, not a deleted ref",
+      "record_digest": "sha256:8ba46deee78340512d4d0c958de8d72fe8d90fd4b096332319394412614537ea",
+      "refs": {
+        "kv": "kv/abandon/8ba46deee78340512d4d0c958de8d72fe8d90fd4b096332319394412614537ea",
+        "refs": [
+          "refs/changes/chg-28b29e411598b74f/abandoned"
+        ]
+      },
+      "signature": "Z430fN3Q6CwBfWpZUVwCg9bb9uPENT4vcRVgdItyYUuV9F57v/9B3PJe6GyFNM0KDqeOO2c/IzAEtqxJMsdRDg=="
+    },
+    "merged": {
+      "author": "SHA256:coTD9fRSu4C4X7vRiDxKqAnf22IhRtHvjLYiVWdDGR0",
+      "body_digest": "sha256:66f42a17fdb4024728e696a5601324a3e7331c0467745565d1c0a1391106ee99",
+      "change_id": "chg-6a6a8eab778ba4d0",
+      "file": "records/merged.json",
+      "kind": "merge",
+      "note": "what a merge is: base.from -> base.to, the attempt merged, the proofs believed",
+      "record_digest": "sha256:0f1657b56afa54f83b2b11a300f9ae5246a24d762e79e2987e39366038dccce9",
+      "refs": {
+        "kv": "kv/merge/0f1657b56afa54f83b2b11a300f9ae5246a24d762e79e2987e39366038dccce9",
+        "refs": [
+          "refs/changes/chg-6a6a8eab778ba4d0/merged"
+        ]
+      },
+      "signature": "wcy8lGqe8cKzA3KaEHxk7lJVwdUbngBpqYtnLL6hdbhCC8TNlqxDmJliH2ws7EF8w7q69I2AVsViqJ767L1XCw=="
+    },
+    "open-first": {
+      "author": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "body_digest": "sha256:2ff898d046cd43247ebff30a616063e4e5abedd30ee96d9feae867b1ef998766",
+      "change_id": "chg-6a6a8eab778ba4d0",
+      "file": "records/open-first.json",
+      "kind": "change",
+      "note": "the smallest honest change: attempt 0, store origin, two jobs",
+      "record_digest": "sha256:f922006730c28f0d1c28ff1b46f05a4dc915f7048d428863b39b36440297fb7f",
+      "refs": {
+        "kv": "kv/change/f922006730c28f0d1c28ff1b46f05a4dc915f7048d428863b39b36440297fb7f",
+        "refs": [
+          "refs/changes/chg-6a6a8eab778ba4d0/attempt/0",
+          "refs/changes/chg-6a6a8eab778ba4d0/head"
+        ]
+      },
+      "signature": "8uKMyE82f0p6FoPe44c7NX7vSJcVq7QsP0cRkWh/iHv/e6DTAczHcAEp+hmsl5hJoqs0r7qi6SHHKeBSn277Cg=="
+    },
+    "open-second": {
+      "author": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "body_digest": "sha256:eee197bfd84b0e17b9e17f6b9cad74a9e952e5a2d8a5bad1b8d7bc22565a5799",
+      "change_id": "chg-6a6a8eab778ba4d0",
+      "file": "records/open-second.json",
+      "kind": "change",
+      "note": "a force-push: new head, same change_id, previous names open-first's change_digest",
+      "record_digest": "sha256:ec90da2cb569a4c5feca9f90016fc46711e70d4da547341603e67aa290dbf7cf",
+      "refs": {
+        "kv": "kv/change/ec90da2cb569a4c5feca9f90016fc46711e70d4da547341603e67aa290dbf7cf",
+        "refs": [
+          "refs/changes/chg-6a6a8eab778ba4d0/attempt/1",
+          "refs/changes/chg-6a6a8eab778ba4d0/head"
+        ]
+      },
+      "signature": "j6+MfC4OVctHsvLkwFQxfwCA7ESDOUUs2cf0qohxVA3lMnbRuzyeN+WCfxEjojvKYnNx5e2OY5Wjow3PgSowDw=="
+    },
+    "pull-backed": {
+      "author": "SHA256:5eBCbqGIQZ4NnR2b5MhqZZrjMYqP049z+pTQqQeqFds",
+      "body_digest": "sha256:fc7f8e2ce788a35951203f1ab2e9e0d0ed81e034edeb027c18d62f4827936691",
+      "change_id": "chg-28b29e411598b74f",
+      "file": "records/pull-backed.json",
+      "kind": "change",
+      "note": "origin.pull, a non-ASCII title, and the annotation escape hatch",
+      "record_digest": "sha256:5894d7021bd9080cb07fb1b2435d779baf26966463c865ab1a6846ad0a984896",
+      "refs": {
+        "kv": "kv/change/5894d7021bd9080cb07fb1b2435d779baf26966463c865ab1a6846ad0a984896",
+        "refs": [
+          "refs/changes/chg-28b29e411598b74f/attempt/0",
+          "refs/changes/chg-28b29e411598b74f/head"
+        ]
+      },
+      "signature": "wH5WSLHbJCT5GoXbRT+uIH05SqLxKwUvRL1LaH46j3nrdj3DJprn0ctfif07R6bX2R0QJ4Lw6WnA4Pn/k42TBA=="
+    },
+    "wide": {
+      "author": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "body_digest": "sha256:802b0d9aaa5f7a320ab09dc24124405141c324ab2b5d6b54776de9f29f581f18",
+      "change_id": "chg-2946aea92e12c8d7",
+      "file": "records/wide.json",
+      "kind": "change",
+      "note": "escapes, UTF-8, eight jobs: the reader's limits in one record",
+      "record_digest": "sha256:1da106129c9b15cdc835f7910498f2da87384a38c50a4c5d4a2ee2e1def71e42",
+      "refs": {
+        "kv": "kv/change/1da106129c9b15cdc835f7910498f2da87384a38c50a4c5d4a2ee2e1def71e42",
+        "refs": [
+          "refs/changes/chg-2946aea92e12c8d7/attempt/0",
+          "refs/changes/chg-2946aea92e12c8d7/head"
+        ]
+      },
+      "signature": "J30AgLPh7eRSrSpeRtttPMxd6ei9L9Vl7cgred1frSAVXkLWrywNr+zkaFfi6/mx9JfDEbqLv41v7X0XfB3kDg=="
+    }
+  },
+  "id": {
+    "domain": "gitiup-change-1",
+    "formula": "chg- || hex(SHA256(domain || 0x00 || key_id || 0x00 || base.ref || 0x00 || attempts.anchor))[0..16]",
+    "hex_chars": 16
+  },
+  "keys": {
+    "ada": {
+      "key_id": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "principal": "ada@example.org",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINWSHdSm0qDnW+STt0pN+OGdOlFCAy6smIeTWp+lPQLJ",
+      "seed": "SHA256(\"gitiup ADR-0003 change-v1 fixture key: \" || utf8(label))"
+    },
+    "lin": {
+      "key_id": "SHA256:5eBCbqGIQZ4NnR2b5MhqZZrjMYqP049z+pTQqQeqFds",
+      "principal": "lin@nosofter.dev",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH9e6L8YECmCJ9OiitjiLMTmjKwKAk1EfcSu1USeQllr",
+      "seed": "SHA256(\"gitiup ADR-0003 change-v1 fixture key: \" || utf8(label))"
+    },
+    "owner": {
+      "key_id": "SHA256:coTD9fRSu4C4X7vRiDxKqAnf22IhRtHvjLYiVWdDGR0",
+      "principal": "owner@example.org",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFpPhlfiRqqGwTNjxFRL8cnhMKuSbQCNXyexX34SfwNN",
+      "seed": "SHA256(\"gitiup ADR-0003 change-v1 fixture key: \" || utf8(label))"
+    }
+  },
+  "limits": {
+    "annotations": 16,
+    "chain": 64,
+    "job_bytes": 128,
+    "jobs": 64,
+    "principal_bytes": 128,
+    "proofs": 64,
+    "record_bytes": 32768,
+    "title_bytes": 512
+  },
+  "payload_types": {
+    "abandon": "application/vnd.gitiup.abandon+json",
+    "change": "application/vnd.gitiup.change+json",
+    "merge": "application/vnd.gitiup.merge+json"
+  },
+  "record_types": {
+    "abandon": "gitiup-abandon-1",
+    "change": "gitiup-change-1",
+    "merge": "gitiup-merge-1"
+  }
+}

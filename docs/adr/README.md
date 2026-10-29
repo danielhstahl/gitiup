@@ -14,6 +14,7 @@ wire formats, ref namespaces, error taxonomies, trust models, dependency policy.
 |----|-------|--------|------------|
 | [0001](0001-attestation-encoding-hash-and-signature.md) | Attestation encoding, hash and signature format | accepted | `giti-1rs.1` |
 | [0002](0002-roster-verifier-selection-and-sybil-resistance.md) | Roster, verifiable selection and sybil resistance | accepted | `giti-msi.1` |
+| [0003](0003-change-record-format-and-merge-semantics.md) | The change record: bytes, identity, states and what a merge is | accepted | `giti-b2z.1` |
 | — | Host abstraction: CAS ref updates, `kv/` namespaces, store layout | *written up as [design notes](../host-abstraction.md), predates this directory* | `giti-xdw.1/.2` |
 
 When you write one of the placeholders above, add a row here in the same commit.
