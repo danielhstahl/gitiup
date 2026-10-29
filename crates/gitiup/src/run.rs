@@ -692,12 +692,19 @@ fn resolve_commit(explicit: Option<&str>) -> Result<GitOid, CliError> {
 /// loose ref, then `packed-refs`. Read-only, which is the point — the default path
 /// stays read-only.
 fn repository_head() -> Option<GitOid> {
-    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+    repository_head_in(Path::new("."))
+}
+
+/// The same, for a directory that is not the current one — `gitiup work` has to know
+/// which commit a checkout it was not asked to create is on.
+pub(crate) fn repository_head_in(dir: &Path) -> Option<GitOid> {
+    let git = dir.join(".git");
+    let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
     let head = head.trim();
     let candidate = if let Some(reference) = head.strip_prefix("ref: ") {
-        let loose = Path::new(".git").join(reference);
+        let loose = git.join(reference);
         std::fs::read_to_string(&loose).ok().or_else(|| {
-            let packed = std::fs::read_to_string(".git/packed-refs").ok()?;
+            let packed = std::fs::read_to_string(git.join("packed-refs")).ok()?;
             packed.lines().find_map(|line| {
                 let (oid, name) = line.split_once(' ')?;
                 (name.trim() == reference).then(|| oid.to_string())

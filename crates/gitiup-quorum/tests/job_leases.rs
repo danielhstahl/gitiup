@@ -35,6 +35,7 @@ use gitiup_quorum::job::{
     MAX_LEASE_TTL_US,
 };
 use gitiup_quorum::prelude::*;
+use gitiup_quorum::round::REVEAL_MODE_SEALED;
 use gitiup_quorum::{sample, store};
 
 const CHANGE: &str = "chg-000000000000f00d";
@@ -201,6 +202,53 @@ fn an_advertisement_is_signed_by_a_selector_of_its_round_or_it_is_noise() {
             .is_err(),
         "a volunteer that only checked the signature would still have to trust this key: \
          {oid}"
+    );
+}
+
+#[test]
+fn a_sealed_round_is_never_advertised_and_never_answered_as_if_it_were_open() {
+    let scene = Scene::new();
+    let round = scene.open_round(CHANGE, JOB, 0);
+    let mut sealed = Advertisement::new(
+        &round,
+        scene.now(),
+        DEFAULT_LEASE_TTL_US,
+        DEFAULT_JOB_TTL_US,
+    )
+    .unwrap();
+    sealed.reveal_mode = REVEAL_MODE_SEALED.to_string();
+    sealed.signatures.clear();
+    sealed.sign(&scene.owner).expect("a selector signs it");
+
+    // The writer refuses, because an advertisement *lists the seats* and a sealed round
+    // exists to keep them unlistable (giti-zp1.6). Publishing one would tell every
+    // volunteer to go and reveal results that were meant to stay hidden until the
+    // threshold was met.
+    let err = store::advertise(&scene.host, &sealed).unwrap_err();
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(err.message().contains("reveal mode"), "{err}");
+
+    // A volunteer meets one anyway — a mirror that replicated the bytes, a store running
+    // an older writer — and the poll names it instead of handing the volunteer a round to
+    // serve. `gitiup work` turns exactly this error into exit 6 and publishes nothing.
+    let name = store::job_ref(CHANGE, JOB).expect("a ref name");
+    let oid = scene
+        .host
+        .put_cas(
+            &Namespace::JOB,
+            &sealed.canonical_bytes().expect("canonical"),
+        )
+        .expect("put the bytes");
+    scene
+        .host
+        .update_ref_cas(&RefUpdate::create(name, oid))
+        .expect("a store may hold what its writer would not write");
+    let err = store::open_rounds(&scene.host, scene.now(), store::Cursor::START, 10).unwrap_err();
+    assert!(err.message().contains("reveal mode"), "{err}");
+    assert!(
+        err.message().contains("sealed"),
+        "the sentence has to say which mode it refused, for a volunteer reading it back \
+         out of a log: {err}"
     );
 }
 

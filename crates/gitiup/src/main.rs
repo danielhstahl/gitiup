@@ -33,6 +33,8 @@
 //! gitiup select …                       who verifies one change, and why: derive or audit
 //! gitiup policy publish|show            the policy a merge gate applies: publish it to
 //!                                      the store signed, and ask which one is in force
+//! gitiup work [--once|--watch 30s]      the volunteer's loop: invitation check, lease,
+//!                                      sandboxed run, digest, signature, publish
 //! gitiup help                           this text
 //! gitiup version                        version this build reports
 //! ```
@@ -69,6 +71,7 @@ mod run;
 mod select;
 mod verify;
 mod verify_change;
+mod work;
 
 /// The top-level usage text, also printed on `gitiup help`.
 pub const USAGE: &str = "\
@@ -115,6 +118,11 @@ COMMANDS:
                                    cannot stand behind (ADR-0004)
     policy show [OPTIONS]          which policy is in force, from where, and whether a
                                    merge may rest on it (`--gate`)
+    work [OPTIONS]                 the volunteer's loop: find the rounds this store has
+                                   addressed to this key, check the invitation, take a
+                                   lease, run the job in a sandbox that may serve a
+                                   stranger, digest, sign and publish (--once or --watch;
+                                   --dry-run publishes nothing)
     help                        print this text
     version                     print the version of this build
 
@@ -210,6 +218,9 @@ Try:
     gitiup policy publish --store ./store --allow-tier local --trust ada --json
     gitiup policy publish policy.json --store ./store --dry-run
     gitiup policy show --store ./store --gate
+    gitiup work --store ./store --dry-run --json          # what I would run, publishing nothing
+    gitiup work --store ./store --once                    # one pass, then exit
+    gitiup work --store ./store --watch 30s --max-jobs 1  # the volunteer's daemon
     gitiup key gen --comment ada@laptop         # a new key, in the age-encrypted keystore
     gitiup identity publish ada --email ada@example.com
     gitiup identity whoami --check              # proves this machine can still sign
@@ -372,6 +383,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "participant" => participant::participant(&args[1..]),
         "select" => select::select(&args[1..]),
         "policy" => policy::policy(&args[1..]),
+        "work" => work::work(&args[1..]),
         other => Err(CliError::usage(format!("unknown command '{other}'"))),
     }
 }

@@ -242,6 +242,79 @@ Three things it is not:
 A lease is per **attempt**: escalating to `attempt + 1` ends the leases the dead attempt
 handed out, and taking over such a seat is recorded the same way a timeout is.
 
+## Serving it: `gitiup work`
+
+Everything above is a volunteer's *input*. [`gitiup work`](../crates/gitiup/src/work.rs)
+is the loop that turns an input into a signed attestation in a seat, so that volunteering
+means running one command on a box and leaving it running:
+
+```sh
+# one pass over the queue, then exit — a cron entry, or a Tuesday afternoon
+gitiup work --store ./store --key volunteer --once
+
+# what this key is being asked for, with nothing executed, nothing leased, nothing written
+gitiup work --store ./store --key volunteer --dry-run --json
+
+# a service: keep polling, and do not take on more than one job per pass
+gitiup work --store ./store --key volunteer --watch 30s --max-jobs 1
+```
+
+For each advertisement addressed to this key (`store::open_rounds_for`), one pass:
+
+1. **believe the invitation.** Fetch the round behind the advertisement, verify it, and
+   check [`Advertisement::matches`](../crates/gitiup-quorum/src/job.rs) still holds. An
+   index that has fallen behind its round is a refusal with that round named, never a
+   hint; a store that cannot be read at all stops the pass rather than being stepped over
+   as an empty evening.
+2. **run [`participate::check_invitation`](../crates/gitiup-quorum/src/participate.rs)
+   end to end** against the roster epoch the *round* pinned: the key is on the roster and
+   is not revoked, the epoch is at least this store's highest-seen one, the machine still
+   meets the round's `requirements`, and the slot is this key's. The capability half is
+   **measured here and now** (`gitiup env`), not repeated from what the roster remembers
+   this box used to be: a volunteer that has since had its RAM halved is refused by the
+   round's own numbers, and the measurement is printed either way. The epoch it just
+   believed goes into the anti-rollback ledger (`--ledger`, one file per store, and
+   `--no-ledger` skips it and says so in the output).
+3. **lease the seat** (`store::claim_lease`), so a second volunteer on a second machine
+   sees the seat is taken. A live lease held by somebody else is a refusal naming the
+   holder and the TTL left — and `--dry-run` reports it too, without taking one.
+4. **plan the job** with [`gitiup-run`](../crates/gitiup-run/src/lib.rs)'s own planner,
+   from the workflow in the checkout, matching the round's `job_id` (matrix arms included)
+   in a checkout whose `HEAD` *is* the round's head OID. A checkout on another commit is
+   refused outright: an attestation of a run of a commit is not evidence about a commit.
+5. **execute it inside a sandbox** that [`admit`](../crates/gitiup-sandbox/src/lib.rs)
+   will accept for `Purpose::Quorum` — the ladder (`docker`, `podman`, `bwrap`, `landlock`,
+   then refusal), never `plain` or an opt-in-only backend for a stranger's code, and the
+   refusal names the ladder it tried. `SOURCE_DATE_EPOCH` is pinned before the first step
+   (default `0`, because an unpinned local clock is not reproducible across volunteers;
+   `--source-date-epoch` overrides, and the pin is recorded in the manifest's annotations).
+6. **digest** with `gitiup_run::manifest_for`, the same call `gitiup run --attest` makes,
+   and bind the round's challenge into `verifier_challenge` so the attestation is about
+   *this* round and cannot be carried to another.
+7. **sign and publish** through `store::publish_attestation` into the seat the
+   advertisement named — the slot is chosen by the round, not by the volunteer — and
+   release the lease.
+
+Two refusals are worth naming because they are the ones a volunteer expects to argue with.
+A **build that fails is served, not skipped**: exit 3 is signed and published like any
+other result, because a quorum agrees on *what happened* and a green tick is not the
+product. And **`--dry-run` is not a lie**: it simulates the steps
+(`gitiup_run::simulate_report`), digests and signs the result, and publishes nothing and
+leases nothing — the tier of what it prints is `simulated`, so nobody mistakes the
+rehearsal for a vote.
+
+The pass reports every round it looked at, with the state it reached (`refused`,
+`simulated`, `published`) and its own exit code, and exits with the worst of them: 0
+served or nothing to do, 6 refused, 7 a signature that does not verify, 8 bytes that are
+not their canonical form. `--json` prints one line for a supervisor; the text report
+leads with the store, the key, what makes it trusted, the sandbox line, the ledger state,
+and what this box measured — because the first question after a refusal is always "on
+which machine, doing what".
+
+What `work` has no flag for is deliberate: the quorum size, the architecture, the tier it
+votes at. Those belong to the round and to the owner's policy; a volunteer that could
+restate them would be voting on its own terms.
+
 ## Choosing the five
 
 `seed = HMAC-SHA256(secret, round_kind ‖ roster_epoch ‖ roster_digest_body ‖ change_id ‖

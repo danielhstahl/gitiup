@@ -309,9 +309,10 @@ impl Advertisement {
             return Err(Error::unsupported(
                 "advertisement",
                 format!(
-                    "an advertisement lists the seats, which a round in '{}' mode exists to \
-                     keep unlistable; advertising a sealed round needs a sealed advertisement \
-                     (giti-zp1.6), not this one with the field rewritten",
+                    "reveal mode '{}' is not enforced by this build, and an advertisement \
+                     lists the seats — which a round in that mode exists to keep \
+                     unlistable. Advertising a sealed round needs a sealed advertisement \
+                     (giti-zp1.6), not this one with the field rewritten.",
                     self.reveal_mode
                 ),
             ));
