@@ -1,0 +1,400 @@
+{
+  "clock_us": 1793092800000000,
+  "genesis_previous": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "history": [
+    {
+      "at_us": 1790828799999999,
+      "chain": [
+        "project",
+        "project-tightened"
+      ],
+      "refusal": "policy_history_missing"
+    },
+    {
+      "at_us": 1791350400000000,
+      "chain": [
+        "project",
+        "project-tightened"
+      ],
+      "in_force": "project",
+      "revision": 1
+    },
+    {
+      "at_us": 1792985000000000,
+      "chain": [
+        "project",
+        "project-tightened"
+      ],
+      "in_force": "project-tightened",
+      "revision": 2
+    }
+  ],
+  "keys": {
+    "ada": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+    "ci-runner": "SHA256:kHe5CTrcfnmORAqMoE3KPhY+IjO+b4k1l7fkv3mQ+aQ",
+    "sofia": "SHA256:3cEfXue74sCZzae0WYt9ziDP/bUhY9HYPh2UiUyulOU"
+  },
+  "normalisations": [
+    {
+      "from": {
+        "allow_simulated": true
+      },
+      "note": "the shorthand a human writes, as the signed document spells it",
+      "to": {
+        "allowed_tiers": [
+          "local",
+          "simulated"
+        ]
+      }
+    },
+    {
+      "from": {
+        "allow_simulated": false
+      },
+      "note": "`false` is the default, so the signed tier list says `local` and nothing else",
+      "to": {
+        "allowed_tiers": [
+          "local"
+        ]
+      }
+    },
+    {
+      "from": {
+        "allowed_sandboxes": [
+          "podman",
+          "docker"
+        ],
+        "allowed_tiers": [
+          "quorum",
+          "local"
+        ]
+      },
+      "note": "order is normalised away, so equivalent rules are one byte string (D2)",
+      "to": {
+        "allowed_sandboxes": [
+          "docker",
+          "podman"
+        ],
+        "allowed_tiers": [
+          "local",
+          "quorum"
+        ]
+      }
+    }
+  ],
+  "payload_type": "application/vnd.gitiup.policy+json",
+  "policies": {
+    "fork-inherited": {
+      "body_digest": "sha256:c1406ed5671f7ee38585a257bec0989c4f061f9a43d3073f795d7f749be78ecb",
+      "effective_from_us": 1790828800000000,
+      "file": "policies/fork-inherited.json",
+      "kv": "kv/policy/f80a3d214cb43e1050e3900bf5397db715608ebcfe4ad4ae50a0fc560fea8e19",
+      "note": "a fork that changes nothing: byte-identical, same digest",
+      "previous_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "protects": [
+        "refs/heads/**",
+        "refs/heads/stable/**"
+      ],
+      "record_digest": "sha256:f80a3d214cb43e1050e3900bf5397db715608ebcfe4ad4ae50a0fc560fea8e19",
+      "ref": "refs/gitiup/policy/current",
+      "required_tiers": [
+        "quorum"
+      ],
+      "revision": 1,
+      "signed_by": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "size_bytes": 1638,
+      "warnings": [
+        "quorum.by_job[arm-*] demands unanimity: one verifier that is offline is no verdict, and the escalation round asks for more"
+      ]
+    },
+    "fork-weakened": {
+      "body_digest": "sha256:97edf3584fe02f712d637133670209a6ee49f993d2be9446f3179ffffa9816b5",
+      "effective_from_us": 1790828800000000,
+      "file": "policies/fork-weakened.json",
+      "kv": "kv/policy/2e3cbcaa4af8a441d162ba90c5200e3a9942028e132703ca97789c77b8f01775",
+      "note": "a fork that re-signs a weaker policy: refused, not distrusted",
+      "previous_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "protects": [
+        "refs/heads/**",
+        "refs/heads/stable/**"
+      ],
+      "record_digest": "sha256:2e3cbcaa4af8a441d162ba90c5200e3a9942028e132703ca97789c77b8f01775",
+      "ref": "refs/gitiup/policy/current",
+      "required_tiers": [
+        "local",
+        "quorum"
+      ],
+      "revision": 1,
+      "signed_by": "SHA256:3cEfXue74sCZzae0WYt9ziDP/bUhY9HYPh2UiUyulOU",
+      "size_bytes": 1030,
+      "warnings": [
+        "none of the trust anchors is a key this machine holds: correct when a CI runner signs and the owner publishes, a mistake if you meant to sign yourself",
+        "quorum.default demands unanimity: one verifier that is offline is no verdict, and the escalation round asks for more"
+      ]
+    },
+    "personal": {
+      "body_digest": "sha256:8f2a80159b86b4d84c76d7be10d8660d538b2c155f286067846980f775c39ce3",
+      "effective_from_us": 1790828800000000,
+      "file": "policies/personal.json",
+      "kv": "kv/policy/9596987498bdb9779c771ce0b6193efc57a61aca296520bc2235bec52a75c7fe",
+      "note": "one owner, one runner: `local` from a named key, amd64, 24 h",
+      "previous_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "protects": [
+        "refs/heads/**"
+      ],
+      "record_digest": "sha256:9596987498bdb9779c771ce0b6193efc57a61aca296520bc2235bec52a75c7fe",
+      "ref": "refs/gitiup/policy/current",
+      "required_tiers": [
+        "local"
+      ],
+      "revision": 1,
+      "signed_by": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "size_bytes": 924,
+      "warnings": [
+        "none of the trust anchors is a key this machine holds: correct when a CI runner signs and the owner publishes, a mistake if you meant to sign yourself"
+      ]
+    },
+    "project": {
+      "body_digest": "sha256:c1406ed5671f7ee38585a257bec0989c4f061f9a43d3073f795d7f749be78ecb",
+      "effective_from_us": 1790828800000000,
+      "file": "policies/project.json",
+      "kv": "kv/policy/f80a3d214cb43e1050e3900bf5397db715608ebcfe4ad4ae50a0fc560fea8e19",
+      "note": "nothing counts without a quorum: tier `quorum`, 5 seats 4 agree",
+      "previous_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "protects": [
+        "refs/heads/**",
+        "refs/heads/stable/**"
+      ],
+      "record_digest": "sha256:f80a3d214cb43e1050e3900bf5397db715608ebcfe4ad4ae50a0fc560fea8e19",
+      "ref": "refs/gitiup/policy/current",
+      "required_tiers": [
+        "quorum"
+      ],
+      "revision": 1,
+      "signed_by": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "size_bytes": 1638,
+      "warnings": [
+        "quorum.by_job[arm-*] demands unanimity: one verifier that is offline is no verdict, and the escalation round asks for more"
+      ]
+    },
+    "project-tightened": {
+      "body_digest": "sha256:33b304ccf382a9fbdaed40f132c6b595a77104eebb7032c4c4c936e72b887b80",
+      "effective_from_us": 1792467200000000,
+      "file": "policies/project-tightened.json",
+      "kv": "kv/policy/911a34a38a7880a5a6fa9918504cac062c43c5435a883275ac4d5b8605e552a0",
+      "note": "revision 2, `previous_digest` names revision 1: the bar moved",
+      "previous_digest": "sha256:c1406ed5671f7ee38585a257bec0989c4f061f9a43d3073f795d7f749be78ecb",
+      "protects": [
+        "refs/heads/**"
+      ],
+      "record_digest": "sha256:911a34a38a7880a5a6fa9918504cac062c43c5435a883275ac4d5b8605e552a0",
+      "ref": "refs/gitiup/policy/current",
+      "required_tiers": [
+        "quorum"
+      ],
+      "revision": 2,
+      "signed_by": "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0",
+      "size_bytes": 1606,
+      "warnings": [
+        "quorum.by_job[arm-*] demands unanimity: one verifier that is offline is no verdict, and the escalation round asks for more"
+      ]
+    }
+  },
+  "refusals": [
+    {
+      "case": "arch spelled two ways",
+      "exit": 6,
+      "mutation": "set quorum.requirements.arch = \"aarch64\"",
+      "token": "arch_conflict"
+    },
+    {
+      "case": "previous_digest names nothing",
+      "exit": 6,
+      "mutation": "set previous_digest = \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"",
+      "token": "chain_broken"
+    },
+    {
+      "case": "accepts no tier",
+      "exit": 6,
+      "mutation": "set rules.allowed_tiers = []",
+      "token": "empty_tiers"
+    },
+    {
+      "case": "env match off with a requirement",
+      "exit": 6,
+      "mutation": "set rules.require_env_match = \"off\"",
+      "token": "env_match_off"
+    },
+    {
+      "case": "expired",
+      "exit": 6,
+      "mutation": "set expires_at_us = 1793092799999999",
+      "token": "expired"
+    },
+    {
+      "case": "expiry before effect",
+      "exit": 6,
+      "mutation": "set expires_at_us",
+      "token": "expires_before_effective"
+    },
+    {
+      "case": "unknown field",
+      "exit": 6,
+      "mutation": "set rules.require_archh = \"x86_64\"",
+      "token": "field_unknown"
+    },
+    {
+      "case": "future-dated",
+      "exit": 6,
+      "mutation": "set effective_from_us = 1793093800000000",
+      "token": "future_dated"
+    },
+    {
+      "case": "zero signatures required",
+      "exit": 6,
+      "mutation": "set rules.min_signatures = 0",
+      "token": "min_signatures_zero"
+    },
+    {
+      "case": "no anchors at all",
+      "exit": 6,
+      "mutation": "set rules.trust_key_ids = []",
+      "token": "no_trust_anchors"
+    },
+    {
+      "case": "rules not in canonical order",
+      "exit": 6,
+      "mutation": "set rules.allowed_tiers = [\"quorum\", \"local\"]",
+      "token": "not_normalised"
+    },
+    {
+      "case": "signer is not the owner",
+      "exit": 6,
+      "mutation": "owner key",
+      "token": "owner_mismatch"
+    },
+    {
+      "case": "gates a contributor ref",
+      "exit": 6,
+      "mutation": "set protects = [\"refs/changes/**\"]",
+      "token": "protects_out_of_scope"
+    },
+    {
+      "case": "threshold above seats",
+      "exit": 6,
+      "mutation": "set quorum.default.required_agree = 9",
+      "token": "required_agree_unreachable"
+    },
+    {
+      "case": "threshold of zero",
+      "exit": 6,
+      "mutation": "set quorum.default.required_agree = 0",
+      "token": "required_agree_zero"
+    },
+    {
+      "case": "no sandbox can satisfy it",
+      "exit": 6,
+      "mutation": "set quorum.requirements.sandboxes = []",
+      "token": "requirements_unsatisfiable"
+    },
+    {
+      "case": "zero resource floor",
+      "exit": 6,
+      "mutation": "set quorum.requirements.ram_mb = 0",
+      "token": "requirements_unsatisfiable"
+    },
+    {
+      "case": "revision skips",
+      "exit": 6,
+      "mutation": "set revision = 9",
+      "token": "revision_gap"
+    },
+    {
+      "case": "sandbox sets disjoint",
+      "exit": 6,
+      "mutation": "set quorum.requirements.sandboxes = [\"landlock\"]",
+      "token": "sandbox_disjoint"
+    },
+    {
+      "case": "policy demands no confinement",
+      "exit": 6,
+      "mutation": "set quorum.requirements.min_sandbox_level = 0",
+      "token": "sandbox_floor"
+    },
+    {
+      "case": "unconfined sandbox demanded",
+      "exit": 6,
+      "mutation": "add rules.allowed_sandboxes = \"none\"",
+      "token": "sandbox_forbidden"
+    },
+    {
+      "case": "two signatures",
+      "exit": 6,
+      "mutation": "dup signature",
+      "token": "signature_count"
+    },
+    {
+      "case": "signed by a stranger",
+      "exit": 6,
+      "mutation": "foreign signer",
+      "token": "signer_untrusted"
+    },
+    {
+      "case": "over the size limit",
+      "exit": 6,
+      "mutation": "add 64 annotations of 512 bytes, over the 32 KiB record limit",
+      "token": "size_exceeded"
+    },
+    {
+      "case": "unknown roster tier",
+      "exit": 6,
+      "mutation": "set quorum.default.tier_floor = \"famous\"",
+      "token": "tier_floor_unknown"
+    },
+    {
+      "case": "quorum rules, quorum refused",
+      "exit": 6,
+      "mutation": "set rules.allowed_tiers = [\"local\"]",
+      "token": "tier_not_allowed"
+    },
+    {
+      "case": "unknown tier",
+      "exit": 6,
+      "mutation": "set rules.allowed_tiers = [\"cloud\"]",
+      "token": "tier_unknown"
+    },
+    {
+      "case": "unknown schema",
+      "exit": 6,
+      "mutation": "set schema_version = 2",
+      "token": "unknown_schema"
+    },
+    {
+      "case": "unsigned policy",
+      "exit": 6,
+      "mutation": "remove signatures",
+      "token": "unsigned"
+    },
+    {
+      "case": "body edited after signing",
+      "exit": 7,
+      "mutation": "tamper",
+      "token": "bad_signature"
+    },
+    {
+      "case": "typed key id",
+      "exit": 7,
+      "mutation": "signer key id",
+      "token": "key_id_derivation"
+    },
+    {
+      "case": "not its own bytes",
+      "exit": 8,
+      "mutation": "re-encode with whitespace",
+      "token": "not_canonical"
+    }
+  ],
+  "trust_roots": [
+    "SHA256:kxdEn5B5O97An8LO4jzpCD5gVIqAyJxWVyqY7ILLiB0"
+  ]
+}

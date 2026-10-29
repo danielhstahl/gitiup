@@ -2,3 +2,5 @@ prompt.txt
 .transcripts/
 /target
 .fathom/
+__pycache__/
+*.pyc
