@@ -39,6 +39,13 @@ pub const WITHDRAWAL_PAYLOAD_TYPE: &str = "application/vnd.gitiup.withdrawal+jso
 pub const ROUND_PAYLOAD_TYPE: &str = "application/vnd.gitiup.round+json";
 /// A verdict record (giti-msi.7).
 pub const VERDICT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.verdict+json";
+/// A job advertisement (giti-zp1.1): the round's invitation, published where a
+/// volunteer looking for work can find it.
+pub const ADVERTISEMENT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.job-advertisement+json";
+/// A TTL lease on one seat of one job (giti-zp1.1). Signed by the holder alone:
+/// nothing about a lease is authorised by the owner, so nothing about it needs their
+/// signature.
+pub const LEASE_PAYLOAD_TYPE: &str = "application/vnd.gitiup.lease+json";
 
 /// The canonical bytes of `value`, with `signatures` and `self_signature` removed.
 ///
@@ -266,6 +273,22 @@ impl Record for crate::verdict::VerdictRecord {
         record.validate()?;
         require_same_bytes(&record, bytes)?;
         Ok(record)
+    }
+}
+
+impl Record for crate::job::Advertisement {
+    fn load(bytes: &[u8]) -> crate::error::Result<Self> {
+        crate::job::Advertisement::from_canonical_bytes(bytes)
+    }
+}
+
+impl Record for crate::job::Lease {
+    /// Loads and structurally validates. The signature is checked by
+    /// [`Lease::verify`](crate::job::Lease::verify), which needs no trust list because a
+    /// lease is a key's claim about itself — but every reader in `store` owes that call,
+    /// or the store could invent a holder.
+    fn load(bytes: &[u8]) -> crate::error::Result<Self> {
+        crate::job::Lease::from_canonical_bytes(bytes)
     }
 }
 

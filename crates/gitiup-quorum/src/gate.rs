@@ -189,6 +189,12 @@ pub fn approval<'a>(
 /// submission reaches here the roster has been fixed as the one the round pinned. It
 /// also does not re-run the attestation's whole policy (tier, age, sandbox): the verdict
 /// does that, and must, because those facts can change between a submission and a merge.
+///
+/// And it has never heard of a [`Lease`](crate::job::Lease) (giti-zp1.1): a lease is
+/// advice about who is *working* a seat, and this function decides whether a key's answer
+/// counts. If admission consulted leases, a slow holder whose lease had been stolen would
+/// be refused its own vote — a lock nobody can release, and the one thing the lease must
+/// never become.
 pub fn admit(
     roster: &Roster,
     round: &Round,

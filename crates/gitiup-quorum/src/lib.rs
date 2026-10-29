@@ -94,6 +94,7 @@ pub mod capability;
 pub mod derive;
 pub mod error;
 pub mod gate;
+pub mod job;
 pub mod ledger;
 pub mod participate;
 pub mod policy;
@@ -111,6 +112,7 @@ pub use derive::{ROUND_KIND, SelectionSecret};
 pub use error::{Error, Result};
 pub use gate::{admit, approval};
 pub use gitiup_attest::{Digest, GitOid};
+pub use job::{Advertisement, Lease, LeaseRequest, Taken, ttl_text};
 pub use ledger::RosterLedger;
 pub use participate::{Invitation, JobBrief, ServeOutcome, Served, check_invitation};
 pub use policy::{

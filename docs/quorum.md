@@ -2,8 +2,11 @@
 
 Status: **the mechanism exists, and so do the roster and selection commands** —
 `gitiup participant register|withdraw|list|verify-roster` (plus the owner's `approve` and
-`revoke`) and `gitiup select`, which opens a round or re-derives a published one. The job,
-lease and verdict CLIs are open tickets.
+`revoke`) and `gitiup select`, which opens a round or re-derives a published one. The
+store side of jobs and leases exists too — an advertised round, a paged listing of open
+rounds, and TTL leases on seats ([`store`](../crates/gitiup-quorum/src/store.rs),
+[`job`](../crates/gitiup-quorum/src/job.rs)). The volunteer and verdict **CLIs** are open
+tickets.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -37,6 +40,7 @@ decision, and neither changes what a plain local run produces.
 | [`capability`](../crates/gitiup-quorum/src/capability.rs) | the eligibility filters and their order — the order is a published decision, because it decides which reason a refusal names. |
 | [`select`](../crates/gitiup-quorum/src/select.rs) | the selection proper: score ordering, the greedy pass over tier and identity caps, reserves, promotion, the proposer-family rule (`proposer_family`, `RoundInputs::excluding`, `ProposerExclusion`), and `explain()`, the audit trail. |
 | [`round`](../crates/gitiup-quorum/src/round.rs) | the signed record that pins a round to a roster epoch and digest and publishes the seats and the seed. |
+| [`job`](../crates/gitiup-quorum/src/job.rs) | what an advertisement and a lease *are*: the seat list copied out of a round, a TTL that dies, a steal that is recorded. |
 | [`store`](../crates/gitiup-quorum/src/store.rs) | the ref names and CAS writes. The store is the broker: compare-and-swap does the locking, so there is no coordinator to bribe. |
 | [`gate`](../crates/gitiup-quorum/src/gate.rs) | admission at submission time: is *this key* approved, for *this epoch*, in *this round*, and is *this document* its own? Every refusal has its own code. |
 | [`participate`](../crates/gitiup-quorum/src/participate.rs) | the volunteer's fail-closed checklist (ADR-0002 D11). |
@@ -52,7 +56,7 @@ decision, and neither changes what a plain local run produces.
 | sybils and ballot stuffing | membership costs an owner signature and a key-ownership proof, one *identity* casts one vote whatever it controls, the proposer's family is excluded, and the caps limit each tier. The cost model is in ADR-0002 D4–D7; `max_per_identity` is enforced in the tally as well as in selection, so a roster cannot smuggle two boxes into two votes. |
 | stale or replayed attestations | the round pins the head oid, the attestation binds the round's challenge, freshness is evaluated at verdict time, and revocation is evaluated there too — a `compromised` key voids what it signed *earlier*, which is the only useful reading of a stolen key. |
 
-Two more, because a mechanism that can be silently rolled back is a mechanism that can be
+Three more, because a mechanism that can be silently rolled back is a mechanism that can be
 switched off:
 
 * **roster rollback** — epochs are dense and time-derived, every round pins epoch *and*
@@ -61,6 +65,11 @@ switched off:
 * **an offer that cannot be met** — a volunteer checks the whole invitation before it
   runs anything ([`check_invitation`](../crates/gitiup-quorum/src/participate.rs)), and
   step 5 is "my slot is still free", enforced by a CAS write rather than by asking.
+* **a seat blacked out by a volunteer that died** — the lease on a seat carries a TTL, so
+  the volunteer that was rebooted mid-job costs the round a renewal window and not an hour
+  ([`job`](../crates/gitiup-quorum/src/job.rs)); the lease is stealable when it dies and
+  the steal is recorded, and it never gates admission, so the *slow* holder that finishes
+  first still counts. A lease is coordination; the seat is the authority.
 
 ## Verdict semantics
 
@@ -150,6 +159,8 @@ refs/gitiup/signup/<slot>               a volunteer's application, signed by its
 refs/gitiup/withdrawal/<slot>           a volunteer leaving, signed by its key
 refs/gitiup/revocation/<slot>           the owner's revocation (or the key's own)
 refs/gitiup/round/<change>/<job>/<attempt>  the round record
+refs/gitiup/job/<change>/<job>          the advertisement: this job is still open
+refs/gitiup/lease/<change>/<job>/<slot> one volunteer's TTL claim on one seat
 refs/gitiup/reveal/<change>/<job>/<slot>    one attestation per seat, claimed CAS
 refs/gitiup/verdict/<change>/<job>      the owner's verdict
 ```
@@ -165,6 +176,62 @@ host: one namespace per record class, one layout per host, see
 Every one of those is a CAS write, so a double submission is *refused* rather than
 counted twice, and a roster rewrite produces a different digest rather than a quiet
 edit. See [host abstraction](host-abstraction.md) for the store contracts this relies on.
+
+One divergence from [ADR-0002 D10](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
+which sketches `refs/gitiup/job/<change>/<job>` as one "job/lease record": the lease got
+its own ref, one per **seat**, because a lease that is worth having is one two volunteers
+can race for without touching each other, and a single ref per job would make every
+heartbeat on every seat contend for one CAS. The advertisement keeps the ADR's path.
+
+## Finding work: the advertisement and the lease on a seat
+
+A round record answers "who was picked for this job". A volunteer has the inverse
+question — "what wants doing" — and there is no coordinator to ask, so the store carries
+the inverse index as a ref: `store::advertise_round` publishes an
+[`Advertisement`](../crates/gitiup-quorum/src/job.rs) at `refs/gitiup/job/<change>/<job>`,
+naming the round, its attempt, and the seats it still wants. Listing that one prefix,
+paged from `store::Cursor::START`, **is** "rounds that still need filling"
+([`store::open_rounds`](../crates/gitiup-quorum/src/store.rs)); the cost is one bounded
+ref query plus one blob per row returned, which is what a poll that runs every minute
+from a few hundred machines needs. Listing `refs/gitiup/**` is not the way: it would show
+a stranger every roster epoch, revocation and submission slot as if they were branches,
+and get slower as the store fills.
+
+An advertisement is an **index, not an authority**. It is copied from a round and it is
+believed through it: fetch the round, [`Round::verify`](../crates/gitiup-quorum/src/round.rs),
+[`Advertisement::matches`](../crates/gitiup-quorum/src/job.rs), and only then run anything.
+It is signed anyway (by a key that signed the round — `store::advertise_round` enforces
+that, so the noticeboard cannot carry someone else's invitation) because the cheap check
+should be possible even when the expensive one is still to come. It carries the seats,
+which is what makes `store::open_rounds_for(key)` free, and that is only honest while
+`reveal_mode` is `open`: **advertising a sealed round is refused**, because for a sealed
+round the seats are the secret (giti-zp1.6 will need a sealed advertisement of its own).
+A round that could not fill its seats is not advertised either — a quorum that cannot
+happen is `insufficient`, and recruiting volunteers for it is a worse answer than
+escalating.
+
+A **lease** is the second half: `store::claim_lease` puts `{holder, acquired_at, ttl,
+attempt}` at `refs/gitiup/lease/<change>/<job>/<slot>` so two volunteers do not burn two
+machines on one seat. It is claimed by CAS, refused while alive with the holder's name
+and the TTL left, **stealable once expired, and the steal is recorded** in the new lease's
+`taken` trail; renewal and release are CAS too, and only the holder may do either.
+Three things it is not:
+
+* **not a lock**, because it expires: a volunteer that was rebooted mid-job costs the seat
+  a TTL (15 minutes by default, one hour maximum), not an hour of nobody daring;
+* **not permission**, because [`gate::admit`](../crates/gitiup-quorum/src/gate.rs) has
+  never heard of leases: the **seat** is the authority, so the slow original holder that
+  finishes first still gets its attestation admitted and counted — that is the difference
+  between advice and a lock nobody can release, and
+  [`tests/job_leases.rs`](../crates/gitiup-quorum/tests/job_leases.rs) enforces it in both
+  directions (a stolen lease does not displace the holder's work; holding a lease grants
+  a key with no seat exactly nothing);
+* **not owner-approved**, because a lease is a key's claim about itself: it is signed by
+  its holder alone, and `Lease::verify` checks that signature against the holder field and
+  asks nobody else.
+
+A lease is per **attempt**: escalating to `attempt + 1` ends the leases the dead attempt
+handed out, and taking over such a seat is recorded the same way a timeout is.
 
 ## Choosing the five
 
@@ -243,10 +310,11 @@ that already exists:
 
 * **commit-reveal submission** ([giti-msi.6](../README.md)) — the slot is already
   per-seat and unguessable; `reveal_mode` is a published field and an unimplemented mode
-  is *refused*, never silently downgraded to "open".
-* **job advertisement and lease** ([giti-msi.4](../README.md)) — a volunteer reads its
-  invitation from the round record; a TTL lease is an additional ref, not a change to the
-  selection.
+  is *refused*, never silently downgraded to "open". One consequence for that ticket: a
+  sealed round cannot be advertised today, because the advertisement copies the seat list
+  ([`Advertisement::new`](../crates/gitiup-quorum/src/job.rs) refuses one). Sealed needs a
+  sealed advertisement — the job and the deadline, not the seats — and the lease refs do
+  not care either way, since a lease names a slot and grants nothing.
 * **policy engine and status reporting** ([giti-msi.7](../README.md)) — `VerdictRecord`
   is the input; `SelectionPolicy` is the knob.
 * **disagreement handling** ([giti-msi.8](../README.md)) — `divergent`, `rejected` and
@@ -263,9 +331,14 @@ that already exists:
 ```sh
 cargo test -p gitiup-quorum            # vectors, properties, store, end-to-end
 cargo test -p gitiup-quorum --test quorum_end_to_end -- --nocapture
+cargo test -p gitiup-quorum --test job_leases -- --nocapture
 ```
 
 The end-to-end test is the acceptance criterion as code: seven volunteers in the roster,
 five seats filled, each publishing into its own slot, and the verdict coming out
 `verified` — and then `failed` when the split cannot reach the threshold, and
 `insufficient` when too few turn up.
+
+`job_leases` is the same discipline for finding work and leaning on it: an advertisement
+that pages, a lease that two volunteers race for and only one wins, a steal that leaves a
+trail, and the rule that a lease never displaces an attestation.

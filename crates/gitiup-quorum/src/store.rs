@@ -15,22 +15,54 @@
 //! refs/gitiup/withdrawal/<slot>                  a signed withdrawal
 //! refs/gitiup/revocation/<slot>                  a revocation record
 //! refs/gitiup/round/<change>/<job>/<attempt>     the round record (inputs, seed, seats)
+//! refs/gitiup/job/<change>/<job>                 the job advertisement: this round is open
+//! refs/gitiup/lease/<change>/<job>/<slot>        one volunteer's TTL claim on one seat
 //! refs/gitiup/reveal/<change>/<job>/<slot>       one verifier's submission
 //! refs/gitiup/verdict/<change>/<job>             the signed verdict
 //! ```
 //!
 //! Every write here is a CAS write, and every read re-checks canonical bytes and
 //! signatures: a store that lies about bytes is caught at the digest, not assumed away.
+//! A record filed under the wrong ref is caught too (`same_ref`), because "the store
+//! said so" is not an argument this crate is allowed to make.
+//!
+//! # Finding work: [`open_rounds`] and nothing else
+//!
+//! A volunteer polls. It does not know the changes this store holds, so it needs the
+//! inverse of the round record — "what wants doing" rather than "who was picked for
+//! this" — and the cheap answer is one prefix: `refs/gitiup/job`. Listing
+//! `refs/gitiup/**` at a stranger would show it every roster epoch, every revocation and
+//! every submission slot as if they were branches to browse, which is both a privacy
+//! leak (those refs name keys) and a poll that gets slower as the store fills. So the
+//! advertisement ref is the only thing a poll lists, paged from [`Cursor::START`], and
+//! the listing costs one ref query plus one blob per row it actually returned.
+//!
+//! # A lease is advice, not a lock
+//!
+//! [`claim_lease`] puts `{holder, acquired_at, ttl, attempt}` at
+//! `refs/gitiup/lease/<change>/<job>/<slot>` so two volunteers do not burn two machines
+//! on one seat. It is *advisory*, and the difference between advice and a lock is one
+//! rule: **admission never consults a lease.** [`crate::gate::admit`] asks whether the signing
+//! key holds a seat in a round it is really answering for, and has no idea and no
+//! interest in who leased what. So the volunteer whose lease expired, or was stolen by
+//! somebody impatient, still has its vote: a slow holder that finishes first still
+//! counts, and a holder that died mid-job costs the round a TTL of latency instead of an
+//! hour of a blacked-out seat. Turning a lease into permission would put the store in the
+//! path of every submission and buy nothing that the seat does not already do.
 
-use gitiup_attest::AttestationDoc;
+use gitiup_attest::{AttestationDoc, Signer, TimeUs};
 use gitiup_host::{
-    Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefName, RefQuery, RefUpdate,
+    Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefDeletion, RefName, RefQuery, RefUpdate,
 };
 
 use crate::error::{Error, Result};
+use crate::job::{
+    Advertisement, JobAddress, Lease, LeaseRequest, Taken, record_steal, short_slot, ttl_text,
+};
 use crate::record::{Record, short_key};
 use crate::roster::{Revocation, Roster, SignUp, Withdrawal};
 use crate::round::Round;
+use crate::select::Seat;
 use crate::verdict::VerdictRecord;
 
 /// Blob namespaces used by the quorum. `roster`, `job`, `policy` and `attestation`
@@ -53,6 +85,9 @@ pub mod ns {
     pub const ENDORSEMENT: Namespace = Namespace::const_new("endorsement");
     /// Per-key submission slots (commit-reveal in giti-msi.6 splits this in two).
     pub const REVEAL: Namespace = Namespace::const_new("reveal");
+    /// Job advertisements and lease records (giti-zp1.1); ADR-0002 D10 calls the
+    /// namespace `job`, singular, and both record kinds travel under it.
+    pub const JOB: Namespace = Namespace::JOB;
     /// Run attestations, signed by the verifier.
     pub const ATTESTATION: Namespace = Namespace::ATTESTATION;
     /// Verdicts and policy documents (the host documents this namespace that way).
@@ -130,6 +165,48 @@ pub fn verdict_ref(change: &str, job: &str) -> Result<RefName> {
     )
 }
 
+/// `refs/gitiup/job/<change>/<job>` — one job's advertisement.
+///
+/// One ref per `(change, job)` and *not* one per attempt, the way `refs/gitiup/roster`
+/// is one ref per roster: an escalation moves it forward with [`Expect::Is`], so the
+/// listing has one row per job somebody could still do rather than one row per round
+/// somebody gave up on.
+pub fn job_ref(change: &str, job: &str) -> Result<RefName> {
+    check_segment(change, "change id")?;
+    check_segment(job, "job id")?;
+    gitiup_ref(
+        &format!("job/{}/{}", escape(change), escape(job)),
+        "job advertisement ref",
+    )
+}
+
+/// `refs/gitiup/lease/<change>/<job>/<slot>` — one seat's lease.
+///
+/// Keyed by the seat's slot, the same name its submission uses, because "who is doing
+/// seat 3" has to be findable by the person about to *not* do seat 3, and the only
+/// stable name for a seat is the slot its round derived.
+pub fn lease_ref(change: &str, job: &str, slot: &str) -> Result<RefName> {
+    check_segment(change, "change id")?;
+    check_segment(job, "job id")?;
+    crate::job::check_slot(slot)?;
+    gitiup_ref(
+        &format!("lease/{}/{}", escape(change), escape(job)),
+        "lease ref",
+    )
+    .and_then(|name| name.join(slot).map_err(host_error))
+}
+
+/// `refs/gitiup/lease/<change>/<job>` — every lease one job has out.
+pub fn lease_prefix(change: &str, job: &str) -> Result<String> {
+    check_segment(change, "change id")?;
+    check_segment(job, "job id")?;
+    Ok(format!(
+        "refs/gitiup/lease/{}/{}",
+        escape(change),
+        escape(job)
+    ))
+}
+
 fn gitiup_ref(rel: &str, what: &'static str) -> Result<RefName> {
     RefName::gitiup(rel).map_err(|e| {
         Error::store(what, &e).with_hint(format!(
@@ -144,7 +221,7 @@ fn host_error(error: gitiup_host::HostError) -> Error {
 }
 
 /// A change or job id must survive the journey into a ref name.
-fn check_segment(value: &str, what: &'static str) -> Result<()> {
+pub(crate) fn check_segment(value: &str, what: &'static str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::invalid(
             "store",
@@ -344,6 +421,9 @@ pub fn list_revocations(
 /// *different* round for the same change/job/attempt is a conflict, because that would
 /// be two different quorums for one change, which is the thing the seed exists to make
 /// impossible.
+///
+/// Publishing is not advertising: a round nobody advertises is invisible to the
+/// volunteers [`advertise_round`] exists for.
 pub fn publish_round(host: &dyn Host, round: &Round) -> Result<Oid> {
     let name = round_ref(
         &round.inputs.change_id,
@@ -613,6 +693,893 @@ fn put_record(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// paging
+// ---------------------------------------------------------------------------
+
+/// `refs/gitiup/job` — the only ref prefix a volunteer polling for work should list.
+///
+/// Everything else under `refs/gitiup/**` is somebody's roster, revocation or submission
+/// slot: not news, and not a stranger's business.
+pub const ADVERTISED_PREFIX: &str = "refs/gitiup/job";
+
+/// The default window of a paged listing.
+pub const DEFAULT_PAGE: usize = 32;
+
+/// The largest window a listing will fill. A poll is meant to be small; a caller that
+/// wants everything pages.
+pub const MAX_PAGE: usize = 256;
+
+/// How many times one CAS write is retried against a contested ref before the store
+/// gives up and says so out loud.
+const MAX_CAS_RETRIES: usize = 4;
+
+/// A position in a paged listing.
+///
+/// The cursor is an offset into the *ref listing*, not into the rows: a page can come
+/// back short (an advertisement that expired is dropped rather than returned dead) and
+/// still say there is more. Keep paging until `next` is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cursor {
+    offset: usize,
+}
+
+impl Cursor {
+    /// The beginning.
+    pub const START: Cursor = Cursor { offset: 0 };
+
+    /// Where this cursor points in the listing (for a progress line).
+    pub fn offset(self) -> usize {
+        self.offset
+    }
+
+    /// Whether this is the start of the listing.
+    pub fn is_start(self) -> bool {
+        self.offset == 0
+    }
+
+    fn after(self, count: usize) -> Cursor {
+        Cursor {
+            offset: self.offset.saturating_add(count),
+        }
+    }
+}
+
+/// One window of a listing, and where the next one starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    /// The rows, in ref-name order.
+    pub items: Vec<T>,
+    /// The next window's position, or `None` when the listing is exhausted.
+    pub next: Option<Cursor>,
+}
+
+impl<T> Page<T> {
+    /// An empty, finished page.
+    pub fn empty() -> Page<T> {
+        Page {
+            items: Vec::new(),
+            next: None,
+        }
+    }
+
+    /// How many rows came back.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether this page carried nothing.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+fn clamp_page(limit: usize) -> usize {
+    limit.clamp(1, MAX_PAGE)
+}
+
+// ---------------------------------------------------------------------------
+// advertisements: the round's inverse index
+// ---------------------------------------------------------------------------
+
+/// Publish an advertisement: the blob first, then the ref that names the job.
+pub fn advertise(host: &dyn Host, advertisement: &Advertisement) -> Result<Oid> {
+    advertisement.validate()?;
+    if advertisement.signatures.is_empty() {
+        return Err(Error::policy(
+            "advertisement",
+            "an unsigned advertisement is an invitation nobody authorised; sign it as a \
+             selector of the round it advertises",
+        ));
+    }
+    let name = job_ref(&advertisement.change_id, &advertisement.job_id)?;
+    let oid = host
+        .put_cas(&ns::JOB, &advertisement.canonical_bytes()?)
+        .map_err(|e| Error::store("put advertisement", &e))?;
+    let current = host
+        .get_ref(&name)
+        .map_err(|e| Error::store("read job ref", &e))?;
+    let update = match current {
+        None => RefUpdate::create(name.clone(), oid),
+        Some(existing) if existing.oid == oid => return Ok(oid),
+        Some(existing) => {
+            let Some((_, held)) = read_record::<Advertisement>(host, &name, "advertisement")?
+            else {
+                return Err(Error::store(
+                    "read advertisement",
+                    &gitiup_host::HostError::not_found("advertisement", existing.oid.hex()),
+                ));
+            };
+            match held.attempt.cmp(&advertisement.attempt) {
+                std::cmp::Ordering::Equal if held.round_digest == advertisement.round_digest => {
+                    // The same round, re-advertised: a selector running its publish step
+                    // again (a fresh TTL, a new clock, a retried command). The job is one
+                    // ref and stays one ref, so this is a refresh and not a conflict.
+                    RefUpdate::new(name.clone(), Expect::Is(existing.oid), oid)
+                        .with_message(format!("attempt {} re-advertised", held.attempt))
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(Error::Store(crate::error::StoreError::conflict(
+                        "advertise job",
+                        format!(
+                            "{name} already advertises this job at attempt {}, pointing at {}; \
+                             this would point at {}",
+                            held.attempt, held.round_digest, advertisement.round_digest
+                        ),
+                    ))
+                    .with_hint(
+                        "one job, one round per attempt: two different rounds for one attempt \
+                         is the thing the seed exists to make impossible",
+                    ));
+                }
+                std::cmp::Ordering::Greater => {
+                    return Err(Error::policy(
+                        "advertisement",
+                        format!(
+                            "{name} is at attempt {} and this would move it back to {}; \
+                             attempts only go forward",
+                            held.attempt, advertisement.attempt
+                        ),
+                    ));
+                }
+                std::cmp::Ordering::Less => {
+                    RefUpdate::new(name.clone(), Expect::Is(existing.oid), oid).with_message(
+                        format!("attempt {} → {}", held.attempt, advertisement.attempt),
+                    )
+                }
+            }
+        }
+    };
+    host.update_ref_cas(&update.with_actor(actor("advertisement")))
+        .map_err(|e| {
+            Error::store("advertise job", &e).with_hint(
+                "the job's advertisement moved under this write: re-read \
+                 refs/gitiup/job/<change>/<job> and advertise from what the store says, \
+                 which is the arbitration and not an obstacle",
+            )
+        })?;
+    Ok(oid)
+}
+
+/// Advertise a published round, signed by one of the round's own selectors.
+///
+/// The signer must be a key that signed the round: an advertisement derives whatever
+/// authority it has from the record it indexes, and letting any key publish one would
+/// make `refs/gitiup/job` a noticeboard for fake invitations. (A volunteer is still
+/// told to check the round itself — [`Advertisement::matches`] — this check is what makes
+/// the cheap one worthwhile.)
+pub fn advertise_round(
+    host: &dyn Host,
+    round: &Round,
+    selector: &dyn Signer,
+    now: TimeUs,
+) -> Result<Oid> {
+    round.validate()?;
+    let key_id = selector.key_id();
+    if !round.signatures.iter().any(|s| s.key_id == key_id) {
+        return Err(Error::signature(
+            "advertisement",
+            format!(
+                "{} did not sign the round it is advertising, so it cannot invite volunteers \
+                 to it",
+                short_key(&key_id)
+            ),
+        ));
+    }
+    let mut advertisement = Advertisement::new(
+        round,
+        now,
+        crate::job::DEFAULT_LEASE_TTL_US,
+        crate::job::DEFAULT_JOB_TTL_US,
+    )?;
+    advertisement.sign(selector)?;
+    advertise(host, &advertisement)
+}
+
+/// The advertisement a job carries, if it has one.
+pub fn advertisement_at(host: &dyn Host, change: &str, job: &str) -> Result<Option<Advertisement>> {
+    let name = job_ref(change, job)?;
+    let Some((_, advertisement)) = read_record::<Advertisement>(host, &name, "advertisement")?
+    else {
+        return Ok(None);
+    };
+    same_ref(
+        &name,
+        &job_ref(&advertisement.change_id, &advertisement.job_id)?,
+        "advertisement",
+    )?;
+    Ok(Some(advertisement))
+}
+
+/// The refs that carry advertisements, paged, without fetching a single blob.
+///
+/// The cheapest possible poll, for a caller that remembers what it saw last time and only
+/// wants to know whether anything moved: one `list_refs` bounded by `limit`, under
+/// `refs/gitiup/job` and nowhere else.
+pub fn advertised_refs(
+    host: &dyn Host,
+    cursor: Cursor,
+    limit: usize,
+) -> Result<Page<(RefName, Oid)>> {
+    let limit = clamp_page(limit);
+    let query = RefQuery::prefix(ADVERTISED_PREFIX)
+        .with_limit(cursor.offset().saturating_add(limit).saturating_add(1));
+    let refs = host
+        .list_refs(&query)
+        .map_err(|e| Error::store("list advertised jobs", &e))?;
+    let items: Vec<(RefName, Oid)> = refs
+        .iter()
+        .skip(cursor.offset())
+        .take(limit)
+        .map(|reference| (reference.name.clone(), reference.oid))
+        .collect();
+    let more = refs.len() > cursor.offset().saturating_add(limit);
+    Ok(Page {
+        next: if more && items.len() == limit {
+            Some(cursor.after(items.len()))
+        } else {
+            None
+        },
+        items,
+    })
+}
+
+/// Rounds that still want filling, paged.
+///
+/// An advertisement is "open" while its ref exists and it has not expired; closing is
+/// [`close_job`], which the publisher of a verdict calls, so the listing does not have to
+/// re-derive "has this been tallied" from verdict refs at poll time. Expired rows are
+/// dropped here rather than returned dead.
+///
+/// Cost, stated because a poll that lies about its cost gets slower and nobody notices:
+/// one bounded ref listing plus one blob fetch per row in the window. What it does *not*
+/// do is work out how full each job is — that is [`job_fill`], and it is asked one job at
+/// a time precisely so a volunteer can ask it only about the job it is about to do.
+///
+/// A row that will not parse is an error and not a skipped row: a poll that quietly
+/// drops a row can drop the one it was looking for. A caller that wants to tolerate a
+/// store full of other people's rubbish is asking the wrong question, but
+/// [`advertised_refs`] is the escape hatch — it diffs refs and parses nothing.
+pub fn open_rounds(
+    host: &dyn Host,
+    now: TimeUs,
+    cursor: Cursor,
+    limit: usize,
+) -> Result<Page<Advertisement>> {
+    let page = advertised_refs(host, cursor, limit)?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for (name, oid) in &page.items {
+        let bytes = host
+            .get(oid)
+            .map_err(|e| Error::store("fetch advertisement", &e))?
+            .ok_or_else(|| {
+                Error::store(
+                    "fetch advertisement",
+                    &gitiup_host::HostError::not_found("advertisement", oid.hex()),
+                )
+            })?;
+        let advertisement = Advertisement::from_canonical_bytes(&bytes)?;
+        same_ref(
+            name,
+            &job_ref(&advertisement.change_id, &advertisement.job_id)?,
+            "advertisement",
+        )?;
+        if advertisement.is_live(now) {
+            items.push(advertisement);
+        }
+    }
+    Ok(Page {
+        items,
+        next: page.next,
+    })
+}
+
+/// Rounds open *and* inviting `key_id` — the volunteer's poll.
+///
+/// The invitation list is copied into the advertisement ([`Advertisement::invites`]), so
+/// this costs exactly what [`open_rounds`] costs: no extra round trips per job. A sealed
+/// round cannot be advertised at all, which is what keeps that copy honest
+/// ([`Advertisement::new`]).
+pub fn open_rounds_for(
+    host: &dyn Host,
+    key_id: &str,
+    now: TimeUs,
+    cursor: Cursor,
+    limit: usize,
+) -> Result<Page<Advertisement>> {
+    let page = open_rounds(host, now, cursor, limit)?;
+    Ok(Page {
+        items: page
+            .items
+            .into_iter()
+            .filter(|advertisement| advertisement.invites(key_id))
+            .collect(),
+        next: page.next,
+    })
+}
+
+/// Take a job out of the listing: it has been tallied, abandoned, or superseded by a
+/// change nobody has advertised yet.
+///
+/// The publisher of a verdict calls this — a tallied job needs no more volunteers — and
+/// so does whoever gives up on a change. It needs no signature because it forges nothing:
+/// a deletion cannot cast a vote, and the worst it does is hide a job that the selector
+/// re-advertises with the next `gitiup select --publish`. The CAS is what matters here:
+/// `expected` is the advertisement the caller read, and a job somebody re-advertised in
+/// the meantime is not this caller's to delete.
+pub fn close_job(host: &dyn Host, change: &str, job: &str, expected: Option<Oid>) -> Result<bool> {
+    let name = job_ref(change, job)?;
+    let current = host
+        .get_ref(&name)
+        .map_err(|e| Error::store("read job ref", &e))?;
+    let Some(existing) = current else {
+        return Ok(false);
+    };
+    if let Some(expected) = &expected
+        && expected != &existing.oid
+    {
+        return Err(Error::policy(
+            "advertisement",
+            format!(
+                "{name} is no longer the advertisement this close was asked for ({} is not \
+                 {}); refusing to delete a job somebody re-advertised",
+                existing.oid.hex(),
+                expected.hex()
+            ),
+        ));
+    }
+    host.delete_ref_cas(
+        &RefDeletion::new(name.clone(), Expect::Is(existing.oid))
+            .with_actor(actor("advertisement")),
+    )
+    .map_err(|e| {
+        Error::store("close job", &e)
+            .with_hint("the job moved under this close; re-read it and decide again")
+    })?;
+    Ok(true)
+}
+
+/// What one seat of an advertised job looks like right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatState {
+    /// The seat, as advertised.
+    pub seat: Seat,
+    /// Its submission ref is written: somebody (this key, or an earlier run of it) has
+    /// already answered for it.
+    pub submitted: bool,
+    /// The lease ref, whatever it holds — an expired lease is reported and the caller
+    /// decides, because "expired" is a fact about the clock and not about the store.
+    pub lease: Option<Lease>,
+}
+
+impl SeatState {
+    /// Whether the lease is alive at `now`.
+    pub fn lease_live(&self, now: TimeUs) -> bool {
+        self.lease.as_ref().is_some_and(|l| l.is_live(now))
+    }
+
+    /// Nobody has answered and nobody is working it.
+    pub fn open(&self, now: TimeUs) -> bool {
+        !self.submitted && !self.lease_live(now)
+    }
+
+    /// Who is working it, if the lease says so and is alive.
+    pub fn holder(&self, now: TimeUs) -> Option<&str> {
+        self.lease
+            .iter()
+            .find(|lease| lease.is_live(now))
+            .map(|lease| lease.holder.as_str())
+    }
+}
+
+/// Per-seat status for one advertised job.
+///
+/// Two point lookups per seat (the submission ref and the lease ref) and nothing else: no
+/// listing, no round fetch. That is the deliberate cost of "how full is this job", and it
+/// is why [`open_rounds`] does not do it for the whole page — a volunteer asks about the
+/// job it is holding, not about every job in the store.
+pub fn job_fill(host: &dyn Host, advertisement: &Advertisement) -> Result<Vec<SeatState>> {
+    let mut out = Vec::with_capacity(advertisement.seats.len());
+    for seat in &advertisement.seats {
+        let slot = reveal_ref(&advertisement.change_id, &advertisement.job_id, &seat.slot)?;
+        let submitted = host
+            .get_ref(&slot)
+            .map_err(|e| Error::store("read submission slot", &e))?
+            .is_some();
+        let lease = lease_at(
+            host,
+            &advertisement.change_id,
+            &advertisement.job_id,
+            &seat.slot,
+        )?;
+        out.push(SeatState {
+            seat: seat.clone(),
+            submitted,
+            lease,
+        });
+    }
+    Ok(out)
+}
+
+/// How many seats an advertised job still needs somebody for.
+pub fn open_seats(host: &dyn Host, advertisement: &Advertisement, now: TimeUs) -> Result<usize> {
+    Ok(job_fill(host, advertisement)?
+        .iter()
+        .filter(|state| state.open(now))
+        .count())
+}
+
+// ---------------------------------------------------------------------------
+// leases: advice with a deadline
+// ---------------------------------------------------------------------------
+
+/// The answer to "may I take this seat?".
+///
+/// "Somebody else is already doing it" is not an error: it is the normal answer to a
+/// poll, and the caller needs the holder and the remaining TTL to print and to schedule
+/// its next look. Errors are reserved for the store failing, and for renewals and
+/// releases that are refused because the caller is not the holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// The lease is the caller's now.
+    Claimed {
+        /// What was written. Boxed because a claim that lost is a handful of words and a
+        /// poll should not pay for a record it will throw away.
+        lease: Box<Lease>,
+        /// The ref's new value.
+        oid: Oid,
+        /// The lease this one took over, if it did.
+        took: Option<Taken>,
+    },
+    /// A live lease is held by somebody else.
+    Held {
+        /// The seat that refused.
+        slot: String,
+        /// Who has it.
+        holder: String,
+        /// When their lease dies, and it is stealable from then on.
+        expires_at_us: i64,
+        /// How long is left, for a volunteer deciding whether to wait.
+        remaining_us: i64,
+    },
+}
+
+impl Claim {
+    /// Whether the caller got the seat.
+    pub fn claimed(&self) -> bool {
+        matches!(self, Claim::Claimed { .. })
+    }
+
+    /// The seat this claim is about.
+    pub fn slot(&self) -> String {
+        match self {
+            Claim::Claimed { lease, .. } => lease.slot.clone(),
+            Claim::Held { slot, .. } => slot.clone(),
+        }
+    }
+
+    /// Who holds the seat now.
+    pub fn holder(&self) -> &str {
+        match self {
+            Claim::Claimed { lease, .. } => &lease.holder,
+            Claim::Held { holder, .. } => holder,
+        }
+    }
+
+    /// How long the current holder has left.
+    pub fn remaining_us(&self) -> i64 {
+        match self {
+            Claim::Claimed { lease, .. } => lease.ttl_us,
+            Claim::Held { remaining_us, .. } => *remaining_us,
+        }
+    }
+
+    /// The steal this claim recorded, if it took over from somebody.
+    pub fn took(&self) -> Option<&Taken> {
+        match self {
+            Claim::Claimed { took, .. } => took.as_ref(),
+            Claim::Held { .. } => None,
+        }
+    }
+
+    /// The line to print: ours, or whose it is and for how long.
+    pub fn text(&self) -> String {
+        match self {
+            Claim::Claimed { lease, took, .. } => match took {
+                Some(taken) => format!(
+                    "{} slot {} is yours for {} (took over a dead lease from {})",
+                    JobAddress {
+                        change_id: &lease.change_id,
+                        job_id: &lease.job_id,
+                    },
+                    short_slot(&lease.slot),
+                    ttl_text(lease.ttl_us),
+                    short_key(&taken.holder)
+                ),
+                None => format!(
+                    "{} slot {} is yours for {}",
+                    JobAddress {
+                        change_id: &lease.change_id,
+                        job_id: &lease.job_id,
+                    },
+                    short_slot(&lease.slot),
+                    ttl_text(lease.ttl_us)
+                ),
+            },
+            Claim::Held {
+                slot,
+                holder,
+                remaining_us,
+                ..
+            } => format!(
+                "{} is held by {} for another {}; not doing it twice",
+                short_slot(slot),
+                short_key(holder),
+                ttl_text(*remaining_us)
+            ),
+        }
+    }
+}
+
+/// Take (or refresh) the lease on one seat.
+///
+/// The CAS is the whole arbitration, and there are four outcomes:
+///
+/// * **free** — claimed with `Expect::Absent`, so two volunteers polling the same free
+///   seat get one winner; the loser re-reads and gets `Held`.
+/// * **already ours, alive** — refreshed, not duplicated: a claim retried after a dropped
+///   connection is not a second seat.
+/// * **alive and somebody else's** — refused by returning [`Claim::Held`] naming the
+///   holder and the remaining TTL.
+/// * **expired, or belonging to an attempt that is over** — takeable, and the take is
+///   recorded in the new lease's `taken` trail. A volunteer that died mid-job must not
+///   black out a seat for a TTL, and an escalation to `attempt + 1` ends the leases the
+///   dead attempt handed out; either way "who had this before me" stays auditable instead
+///   of becoming a mystery.
+///
+/// Nothing here grants anything. See the [module docs](crate::store#a-lease-is-advice-not-a-lock)
+/// and [`crate::gate::admit`], which has never heard of leases.
+pub fn claim_lease(host: &dyn Host, request: &LeaseRequest<'_>) -> Result<Claim> {
+    request.validate()?;
+    let name = lease_ref(request.change_id, request.job_id, request.slot)?;
+    let holder = request.holder_id();
+    for _ in 0..MAX_CAS_RETRIES {
+        let prior = read_lease(host, &name)?;
+        let Some((current_oid, prior)) = prior else {
+            let mut lease = Lease::new(
+                request.job(),
+                request.attempt,
+                request.slot,
+                &holder,
+                request.now,
+                request.ttl_us,
+                Vec::new(),
+            )?;
+            lease.sign(request.holder)?;
+            return match cas_lease(host, &name, &lease, Expect::Absent, "claim")? {
+                Some(oid) => Ok(Claim::Claimed {
+                    lease: Box::new(lease),
+                    oid,
+                    took: None,
+                }),
+                // Somebody wrote the free seat between the read and the write. Nothing
+                // was overwritten; fall round and give the honest answer.
+                None => continue,
+            };
+        };
+        let ours = prior.holder == holder;
+        let same_attempt = prior.attempt == request.attempt;
+        if ours && same_attempt && prior.is_live(request.now) {
+            let mut lease = Lease::new(
+                request.job(),
+                request.attempt,
+                request.slot,
+                &holder,
+                request.now,
+                request.ttl_us,
+                prior.taken.clone(),
+            )?;
+            lease.sign(request.holder)?;
+            if let Some(oid) = cas_lease(host, &name, &lease, Expect::Is(current_oid), "refresh")? {
+                return Ok(Claim::Claimed {
+                    lease: Box::new(lease),
+                    oid,
+                    took: None,
+                });
+            }
+            continue;
+        }
+        if same_attempt && prior.is_live(request.now) {
+            return Ok(Claim::Held {
+                slot: prior.slot.clone(),
+                holder: prior.holder.clone(),
+                expires_at_us: prior.expires_at_us(),
+                remaining_us: prior.remaining_us(request.now),
+            });
+        }
+        let took = Taken::of(&prior, request.now);
+        let mut lease = Lease::new(
+            request.job(),
+            request.attempt,
+            request.slot,
+            &holder,
+            request.now,
+            request.ttl_us,
+            prior.taken.clone(),
+        )?;
+        record_steal(&mut lease, took.clone());
+        lease.sign(request.holder)?;
+        if let Some(oid) = cas_lease(host, &name, &lease, Expect::Is(current_oid), "take")? {
+            return Ok(Claim::Claimed {
+                lease: Box::new(lease),
+                oid,
+                took: Some(took),
+            });
+        }
+    }
+    Err(Error::policy(
+        "lease",
+        format!(
+            "{} slot {} was contested {} times over; nothing was overwritten",
+            JobAddress {
+                change_id: request.change_id,
+                job_id: request.job_id
+            },
+            short_slot(request.slot),
+            MAX_CAS_RETRIES
+        ),
+    )
+    .with_hint(
+        "many volunteers want this seat at once, or the store is replaying reads; poll again",
+    ))
+}
+
+/// Renew a lease: a heartbeat from a volunteer that is still working.
+pub fn renew_lease(host: &dyn Host, request: &LeaseRequest<'_>) -> Result<Lease> {
+    request.validate()?;
+    let name = lease_ref(request.change_id, request.job_id, request.slot)?;
+    let holder = request.holder_id();
+    let Some((current_oid, prior)) = read_lease(host, &name)? else {
+        return Err(Error::policy(
+            "lease",
+            format!(
+                "{} slot {} has no lease to renew: it was released, or was never taken",
+                JobAddress {
+                    change_id: request.change_id,
+                    job_id: request.job_id
+                },
+                short_slot(request.slot)
+            ),
+        ));
+    };
+    if prior.holder != holder {
+        return Err(live_refusal(&prior, request.now));
+    }
+    if prior.attempt != request.attempt {
+        return Err(Error::policy(
+            "lease",
+            format!(
+                "the lease on {} slot {} is for attempt {}, not attempt {}; a renewal does \
+                 not cross attempts, because attempt {}'s round is over",
+                JobAddress {
+                    change_id: request.change_id,
+                    job_id: request.job_id
+                },
+                short_slot(request.slot),
+                prior.attempt,
+                request.attempt,
+                prior.attempt
+            ),
+        ));
+    }
+    if prior.is_expired(request.now) {
+        return Err(Error::policy(
+            "lease",
+            format!(
+                "your lease on {} slot {} died {} ago and is nobody's to renew; claim it \
+                 again if it is still free",
+                JobAddress {
+                    change_id: request.change_id,
+                    job_id: request.job_id
+                },
+                short_slot(request.slot),
+                ttl_text(request.now.as_us().saturating_sub(prior.expires_at_us()))
+            ),
+        ));
+    }
+    let mut lease = Lease::new(
+        request.job(),
+        request.attempt,
+        request.slot,
+        &holder,
+        request.now,
+        request.ttl_us,
+        prior.taken.clone(),
+    )?;
+    lease.sign(request.holder)?;
+    match cas_lease(host, &name, &lease, Expect::Is(current_oid), "renew")? {
+        Some(_) => Ok(lease),
+        None => match read_lease(host, &name)? {
+            Some((_, now_holds)) => Err(live_refusal(&now_holds, request.now)),
+            None => Err(Error::policy(
+                "lease",
+                "the lease was released under this renewal; nothing was written",
+            )),
+        },
+    }
+}
+
+/// Give a lease up: the job is done, or it turned out to be impossible, and the seat
+/// should not sit leased until the TTL expires.
+pub fn release_lease(host: &dyn Host, request: &LeaseRequest<'_>) -> Result<bool> {
+    request.validate()?;
+    let name = lease_ref(request.change_id, request.job_id, request.slot)?;
+    let holder = request.holder_id();
+    let Some((current_oid, prior)) = read_lease(host, &name)? else {
+        return Ok(false);
+    };
+    if prior.holder != holder {
+        return Err(live_refusal(&prior, request.now));
+    }
+    host.delete_ref_cas(
+        &RefDeletion::new(name.clone(), Expect::Is(current_oid)).with_actor(actor("lease")),
+    )
+    .map_err(|e| {
+        Error::store("release lease", &e).with_hint(
+            "the lease moved under this release; whoever holds it now is not you, and \
+                 deleting their claim would be the one thing a lease cannot allow",
+        )
+    })?;
+    Ok(true)
+}
+
+/// The lease on one seat, verified, whether or not it is alive.
+pub fn lease_at(host: &dyn Host, change: &str, job: &str, slot: &str) -> Result<Option<Lease>> {
+    let name = lease_ref(change, job, slot)?;
+    read_lease(host, &name).map(|found| found.map(|(_, lease)| lease))
+}
+
+/// Every lease one job has out, optionally for one attempt only.
+pub fn job_leases(
+    host: &dyn Host,
+    change: &str,
+    job: &str,
+    attempt: Option<u64>,
+) -> Result<Vec<Lease>> {
+    let prefix = lease_prefix(change, job)?;
+    let mut out = Vec::new();
+    for reference in host
+        .list_refs(&RefQuery::prefix(&prefix))
+        .map_err(|e| Error::store("list leases", &e))?
+    {
+        if let Some((_, lease)) = read_lease(host, &reference.name)?
+            && attempt.is_none_or(|want| lease.attempt == want)
+        {
+            out.push(lease);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.slot
+            .cmp(&b.slot)
+            .then(a.acquired_at_us.cmp(&b.acquired_at_us))
+    });
+    Ok(out)
+}
+
+/// The refusal every non-holder gets, naming who does hold the lease and for how long.
+fn live_refusal(lease: &Lease, now: TimeUs) -> Error {
+    let whereabout = JobAddress {
+        change_id: &lease.change_id,
+        job_id: &lease.job_id,
+    };
+    if lease.is_live(now) {
+        return Error::policy(
+            "lease",
+            format!(
+                "{} slot {} is held by {} for another {} (attempt {}); it is not yours to \
+                 renew or release",
+                whereabout,
+                short_slot(&lease.slot),
+                short_key(&lease.holder),
+                ttl_text(lease.remaining_us(now)),
+                lease.attempt
+            ),
+        );
+    }
+    Error::policy(
+        "lease",
+        format!(
+            "{} slot {} carried {}'s lease, which died; it is not yours, and it is now \
+             anybody's to claim",
+            whereabout,
+            short_slot(&lease.slot),
+            short_key(&lease.holder)
+        ),
+    )
+}
+
+/// Read a lease and check it is what it claims: canonical bytes, the holder's own
+/// signature, and a record that speaks about the ref it is filed under.
+fn read_lease(host: &dyn Host, name: &RefName) -> Result<Option<(Oid, Lease)>> {
+    let Some((oid, lease)) = read_record::<Lease>(host, name, "lease")? else {
+        return Ok(None);
+    };
+    lease.verify()?;
+    same_ref(
+        name,
+        &lease_ref(&lease.change_id, &lease.job_id, &lease.slot)?,
+        "lease",
+    )?;
+    Ok(Some((oid, lease)))
+}
+
+/// CAS-write a lease. `Ok(None)` means the expectation failed — the ref moved, and the
+/// caller must re-read and answer honestly rather than force the write.
+fn cas_lease(
+    host: &dyn Host,
+    name: &RefName,
+    lease: &Lease,
+    expect: Expect,
+    why: &'static str,
+) -> Result<Option<Oid>> {
+    let oid = host
+        .put_cas(&ns::JOB, &lease.canonical_bytes()?)
+        .map_err(|e| Error::store(format!("put {why} record"), &e))?;
+    let update = RefUpdate::new(name.clone(), expect, oid)
+        .with_actor(actor("lease"))
+        .with_message(format!(
+            "{why}: {} slot {}",
+            short_key(&lease.holder),
+            short_slot(&lease.slot)
+        ));
+    match host.update_ref_cas(&update) {
+        Ok(reference) => Ok(Some(reference.oid)),
+        Err(error) if error.kind() == HostErrorKind::Conflict => Ok(None),
+        Err(error) => Err(Error::store(format!("{why} lease"), &error)),
+    }
+}
+
+/// Does this ref carry the record it names?
+///
+/// The check behind "a store that lies is caught at the digest". A record filed under the
+/// wrong ref is either a bug or an attack, and in both cases believing it is worse than
+/// stopping.
+fn same_ref(found: &RefName, expected: &RefName, what: &'static str) -> Result<()> {
+    if found == expected {
+        return Ok(());
+    }
+    Err(Error::digest_mismatch(
+        "store",
+        format!(
+            "a {what} filed at {found} speaks about {expected}: the ref and the record \
+             disagree, so neither can be believed",
+        ),
+    )
+    .with_hint(format!(
+        "this is a store bug or a hostile store, not a bad record to retry; report {found}"
+    )))
 }
 
 fn actor(what: &str) -> Actor {
