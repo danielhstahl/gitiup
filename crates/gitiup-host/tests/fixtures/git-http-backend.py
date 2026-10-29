@@ -10,12 +10,20 @@ dependency beyond a git install.
 The port is printed on stdout (pass 0 to get an ephemeral one), which is what the
 Rust tests wait for before talking to it.
 
-Two details that matter, because they are exactly what a hand-rolled harness gets
+Three details that matter, because they are exactly what a hand-rolled harness gets
 wrong:
 
 * git POSTs its request bodies with `Transfer-Encoding: chunked`, so the body has
   to be de-chunked before `git-http-backend` sees it — otherwise `receive-pack`
   never gets the packfile and every push fails with a truncated stream.
+* Once a client has enough refs to send, git gzips its negotiation body and says so
+  with `Content-Encoding: gzip`. The CGI contract is a plain body and a
+  `CONTENT_LENGTH` that matches it, so this bridge inflates the body and rewrites the
+  length. Leave the gzip in and upload-pack reads binary as pkt-lines (`bad line
+  length character`), inflate without fixing the length and the CGI reads a truncated
+  request — either way the client just sees "the remote end hung up unexpectedly".
+  It bites on the *second* fetch into a mirror, the first one with `have` lines, which
+  is how a test passes until the store grows.
 * Python 3.14 has no `cgi` module (and `http.server.CGIHTTPRequestHandler` died
   with it), so the CGI protocol is implemented directly: build the environment,
   feed stdin, split `Status:`/headers from the response body.
@@ -24,6 +32,7 @@ Anonymous pushes additionally need `http.receivepack = true` in the repository's
 own config, exactly as with any other git HTTP server; the caller sets that.
 """
 
+import gzip
 import os
 import subprocess
 import sys
@@ -94,6 +103,18 @@ class CgiHandler(BaseHTTPRequestHandler):
         }
         if self.command not in ("GET", "HEAD"):
             env["CONTENT_TYPE"] = self.headers.get("Content-Type", "")
+            # git gzips its negotiation body once it has enough refs to send (a mirror's
+            # second fetch is the first one with `have` lines, which is how a test passes
+            # until the store grows). The CGI contract is a plain body and a
+            # CONTENT_LENGTH that matches it: leave the gzip in and upload-pack reads
+            # binary as pkt-lines ("bad line length character", and the client sees "the
+            # remote end hung up"), inflate without fixing CONTENT_LENGTH and the CGI
+            # reads a truncated request.
+            if self.headers.get("Content-Encoding", "").strip().lower() in (
+                "gzip",
+                "x-gzip",
+            ):
+                body = gzip.decompress(body)
             env["CONTENT_LENGTH"] = str(len(body))
         try:
             proc = subprocess.run(

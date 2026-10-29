@@ -3,11 +3,23 @@
 //! Four commands, and they are the whole of the contributor's surface:
 //!
 //! ```text
-//! gitiup change new   --base main              draft a record from local commits, write --out
+//! gitiup change new      --base main           draft a record from local commits, write --out
 //! gitiup change submit                         publish head ref + record to the resolved store
-//! gitiup change list  [--state open] [--json]
-//! gitiup change show  <id> [--json]
+//! gitiup change list     [--state open] [--json]
+//! gitiup change show     <id> [--json]
+//! gitiup change checkout <id> [--for <job>]    fetch the change *and its proofs* into a clone
 //! ```
+//!
+//! # `checkout`, which is the reviewer's whole command
+//!
+//! Everything else here is the author's side or the owner's side. `checkout` is the third
+//! reader: someone with a clone of the repository and a change id, who wants the bytes and
+//! the proof in one command and no argument to type twice. It fetches the change's own refs
+//! and `refs/attestations/<head>/*` as *one* pack — the objects the change introduces and
+//! nothing the clone already holds, with the attestations in the same packfile, which is the
+//! property [host abstraction](../../../docs/host-abstraction.md) advertises and this is the
+//! command that checks it held. It writes nothing to the store (a store that will only read
+//! serves it), and it will not touch a dirty worktree: the paths are named and nothing moves.
 //!
 //! # Composition, exactly as `attest push` does it
 //!
@@ -73,20 +85,27 @@
 //!
 //! The same table as the rest of `gitiup` (ADR-0001 D7, ADR-0003 D11): 0 ok · 2 usage ·
 //! 3 I/O or an unreachable store · 6 refused (no store named, unsigned record, stale
-//! base, an attempt that already exists with a different head, a conflict) · 7 a
+//! base, an attempt that already exists with a different head, a conflict; for
+//! `checkout`: a dirty worktree, a bare repository, a store with no git object database,
+//! a local ref that the change cannot fast-forward, no round for `--for`, or a live round
+//! drawn against other bytes) · 7 a
 //! signature that does not verify · 8 bytes that are not their own canonical form or a
-//! digest that does not match.
+//! digest that does not match — including a proof that arrived without its bytes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use gitiup_attest::TimeUs;
+use gitiup_attest::{AttestationDoc, TimeUs};
 use gitiup_host::change::{self, AttemptInfo, ChangeId, ChangeRecord, State, StoredRecord};
 use gitiup_host::{
-    Actor, Config, CredentialProfile, Host, Namespace, Oid, RefName, RefQuery, RemoteConfig,
+    Actor, Config, CredentialProfile, Host, HostKind, Namespace, Oid, PackFormat, PackRequest,
+    RefName, RefQuery, RemoteConfig,
 };
+use gitiup_quorum::round::Round;
+use gitiup_quorum::store as qstore;
+use gitiup_quorum::verdict::VerdictRecord;
 use serde_json::{Map, Value, json};
 
 use crate::CliError;
@@ -103,6 +122,7 @@ USAGE:
     gitiup change submit    [OPTIONS]
     gitiup change list      [OPTIONS]
     gitiup change show      <ID> [OPTIONS]
+    gitiup change checkout  <ID> [--for JOB] [--ref NAME]
     gitiup change merge     <ID> [--expected-oid OID] [--proof DIGEST] [--dry-run]
     gitiup change reconcile <ID> [--via store|forge] [--dry-run]
 
@@ -112,7 +132,7 @@ branch it is proposed against and the oid that branch was at where this work for
 and it is signed by the key that proposed it. `who proposed this` is a signature, so
 a mirror, a bucket and a forge all say the same thing about it.
 
-WHERE IT GOES (submit, list, show):
+WHERE IT GOES (submit, list, show, checkout):
     --store <dir>            a directory as the store (the fs host)
     --remote <name>          a remote from gitiup.toml
                              `list` and `show` may read the configured default remote;
@@ -191,6 +211,32 @@ show — one change, read back through the ref that advertises it:
     --json                   the record, its digests, its signature, the attempt chain,
                              and the merge/abandon record if the change has one
 
+checkout — fetch one change, and its proofs, into a clone:
+    ID                       the change to fetch (id, or 4+ hex of one)
+    --repository, -C         the clone to fetch into (default: this one). It must have a
+                             working tree: a bare repository has nothing to check out
+    --ref <name>             the local branch to leave it on (default: the change id).
+                             A name without refs/ goes under refs/heads/
+    --attempt <n>            fetch attempt n rather than the current one
+    --for <job>              also fetch that job's round, its seat submissions and its
+                             verdict, and print them (build/matrix/linux-x86_64 is a job)
+    --owner <key|id>         whose signature on a verdict counts (repeatable; default:
+                             this machine's own keys, and the output says which)
+    --detach                 look at it without a branch: detach HEAD at the change head
+    --no-checkout            fetch and write the ref, and leave the worktree alone — the
+                             one case a dirty worktree is allowed, because nothing in it
+                             moves. --detach with --ref or with --no-checkout is refused
+                             as usage: they contradict each other
+
+checkout writes to the clone and never to the store: the pack is fetched, the store's refs
+are not moved, and a store configured read-only serves it. It refuses a dirty worktree by
+name (exit 6) rather than folding someone's uncommitted work into a review, and it refuses
+to move a local branch that the change cannot fast-forward. The fetch is one pack carrying
+refs/changes/<id>/* and refs/attestations/<head>/*, so the proof arrives with the bytes;
+what the clone already held is not fetched twice, and the output counts the haves that made
+that true. With --for the verdict is printed, not re-derived: `gitiup quorum verdict` is
+the command whose exit code *is* the verdict.
+
 merge — the owner's side: a compare-and-swap of the branch, then the record of it:
     ID                       the change to merge (id, or 4+ hex of one)
     --expected-oid <oid>     what the branch must hold. Default: the base.oid the author
@@ -244,9 +290,13 @@ Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable, a refusal the store own
 write) · 6 refused (no store, no key, unsigned record, stale base naming both oids,
 attempt conflict, an id you cannot sign for, not a fast-forward, ancestry the tool cannot
 check, --proof-required, a demanded quorum that cannot be opened: no roster, no
-`quorum.requirements`, no derivable selector, no job, a round that seated its author) ·
+`quorum.requirements`, no derivable selector, no job, a round that seated its author; for
+checkout: a dirty worktree — named, not guessed — a bare repository, a store with no git
+object database, commits the store cannot return, a local ref the change would rewind, no
+round for --for, a --for round drawn against other bytes) ·
 7 a signature that does not verify · 8 bytes that are not the
-record's own canonical form, or a digest that does not match its name.
+record's own canonical form, or a digest that does not match its name — including a
+change head or a proof that did not arrive with the pack.
 ";
 
 /// Switches `gitiup change …` accepts.
@@ -259,6 +309,8 @@ const SWITCHES: &[&str] = &[
     "--bytes",
     "--dry-run",
     "--proof-required",
+    "--detach",
+    "--no-checkout",
 ];
 
 /// Valued flags `gitiup change …` accepts.
@@ -289,6 +341,9 @@ const VALUED: &[&str] = &[
     "--selector",
     "--seed-file",
     "--trust",
+    "--ref",
+    "--for",
+    "--owner",
 ];
 
 /// `gitiup change …`
@@ -306,11 +361,12 @@ pub fn change(args: &[String]) -> Result<(), CliError> {
         "submit" => submit(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "list" | "ls" => list(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "show" => show(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "checkout" => checkout(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "merge" => merge(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "reconcile" => reconcile(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         other => Err(CliError::usage(format!(
             "unknown `gitiup change` command '{other}'; `gitiup change help` lists new, \
-             submit, list, show, merge and reconcile"
+             submit, list, show, checkout, merge and reconcile"
         ))),
     }
 }
@@ -662,6 +718,100 @@ impl Repo {
             Some(format!("{list}\n").as_bytes()),
         )?;
         parse_batch(&out)
+    }
+
+    /// Whether this repository has a working tree to check a change out into.
+    ///
+    /// Asked before anything is fetched, because "nothing moved" is the only honest
+    /// answer a bare repository can give to `checkout`.
+    fn bare(&self) -> Result<bool, CliError> {
+        Ok(self.text(&["rev-parse", "--is-bare-repository"])? == "true")
+    }
+
+    /// The paths that differ from `HEAD` — staged, unstaged, added, deleted, conflicted.
+    ///
+    /// Untracked files are not dirt: they belong to whoever left them there, they survive
+    /// a checkout, and git itself refuses a checkout that would overwrite one. Everything
+    /// else is work someone has not committed, which is the thing a review must not
+    /// silently land on top of.
+    fn dirty_paths(&self) -> Result<Vec<String>, CliError> {
+        let out = self.bytes(&["status", "--porcelain", "--untracked-files=no"], None)?;
+        let text = String::from_utf8_lossy(&out);
+        Ok(text
+            .lines()
+            // `XY <path>`: the two status columns and a space are not part of the name,
+            // which is why this cannot go through [`Repo::text`] — the first column is
+            // often a space, and trimming the output would eat it.
+            .filter_map(|line| line.get(3..))
+            .map(|path| {
+                // A rename is `R  old -> new`; the new path is the one that exists.
+                let path = path.rsplit(" -> ").next().unwrap_or(path);
+                path.trim_end().to_string()
+            })
+            .filter(|path| !path.is_empty())
+            .collect())
+    }
+
+    /// Every ref tip this repository holds, as bare hex.
+    ///
+    /// These are the haves a fetch is told about, so a change costs its own commits and
+    /// not the history the clone already shares with the store.
+    fn ref_tips(&self) -> Result<Vec<String>, CliError> {
+        let out = self.text(&["for-each-ref", "--format=%(objectname)"])?;
+        let mut out: Vec<String> = out
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        // A detached HEAD has no ref to be found by, and its commit is a legitimate have.
+        if let Ok(head) = self.text(&["rev-parse", "--verify", "--quiet", "HEAD"])
+            && !head.is_empty()
+            && !out.contains(&head)
+        {
+            out.push(head);
+        }
+        Ok(out)
+    }
+
+    /// The oid a ref name holds here, bare hex, when it holds anything.
+    fn ref_oid(&self, name: &str) -> Result<Option<String>, CliError> {
+        match self.text(&["rev-parse", "--verify", "--quiet", name]) {
+            Ok(hex) if !hex.is_empty() => Ok(Some(hex)),
+            Ok(_) => Ok(None),
+            // `--quiet` means "no such ref" is a non-zero exit and no output, and that
+            // answer is not an error to report.
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The git oid `bytes` would have as a blob — without writing them anywhere.
+    ///
+    /// A git store carries an attestation as the blob of exactly its canonical bytes
+    /// (the pointer commit's `record`), so this is how a checkout proves the proof
+    /// arrived rather than that a ref mentioned it.
+    fn blob_oid(&self, bytes: &[u8]) -> Result<String, CliError> {
+        self.bytes(&["hash-object", "-t", "blob", "--stdin"], Some(bytes))
+            .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// Take a packfile into this repository's object database.
+    fn index_pack(&self, bytes: &[u8]) -> Result<(), CliError> {
+        self.bytes(&["index-pack", "--stdin"], Some(bytes))?;
+        Ok(())
+    }
+
+    /// Whether `from` is an ancestor of `to` (both hex oids this repository holds).
+    fn is_ancestor(&self, from: &str, to: &str) -> bool {
+        self.raw(&["merge-base", "--is-ancestor", from, to], None)
+            .is_ok()
+    }
+
+    /// Run a git command that changes this repository, keeping git's own words on a
+    /// refusal (a branch that is checked out elsewhere, a path in the way).
+    fn change(&self, args: &[&str]) -> Result<(), CliError> {
+        self.raw(args, None)?;
+        Ok(())
     }
 }
 
@@ -2930,6 +3080,1006 @@ fn attempt_json(attempt: &AttemptInfo) -> Value {
         "created_at_us": attempt.created_at_us,
         "size": attempt.size,
     })
+}
+
+// ---------------------------------------------------------------------------
+// checkout — the reviewer's one command (giti-b2z.5)
+// ---------------------------------------------------------------------------
+
+/// One proof the store advertises about the commit being checked out.
+///
+/// The listing is the store's (`refs/attestations/<subject>/`) and the bytes are read back
+/// through it, so what gets printed is the signed document and not a ref's label — the
+/// same rule `gitiup attest list` keeps.
+struct Proof {
+    digest: String,
+    reference: String,
+    tier: String,
+    result: String,
+    signers: Vec<String>,
+    claimed_at_us: i64,
+    size: usize,
+    legacy: bool,
+    /// The git blob these bytes are inside a git store's pointer commit, and whether the
+    /// clone holds it after the fetch. That second half is the ticket's whole promise,
+    /// checked rather than assumed.
+    blob: String,
+    arrived: bool,
+}
+
+/// One seat of a round, and what it handed in.
+struct SeatReport {
+    rank: u32,
+    slot: String,
+    key: String,
+    identity: String,
+    /// `None` is a silent seat, which is a fact about the round and not an error here.
+    submission: Option<Submission>,
+}
+
+/// What a seat submitted, as far as a reader of a checkout needs: which result it signed,
+/// at what tier, and who signed it. Re-verifying a submission is `gitiup quorum verdict`'s
+/// job and it keeps the exit code that comes with the answer.
+struct Submission {
+    result: String,
+    tier: String,
+    signer: String,
+    claimed_at_us: i64,
+}
+
+/// Everything `--for <job>` asks the store for beyond the change and its attestations.
+struct ForJob {
+    job: String,
+    /// The ref the round was read through.
+    reference: String,
+    round: Round,
+    /// Every attempt the store holds for this job, escalation included.
+    attempts: Vec<u64>,
+    seats: Vec<SeatReport>,
+    /// The verdict, when the store files one *and* this machine trusts the key that signed
+    /// it. A verdict is a claim by an owner and believing it is a trust decision.
+    verdict: Option<VerdictRecord>,
+    /// A verdict that is there and is not believed, in the words of the check that refused
+    /// it. Reported, never quietly dropped.
+    distrust: Option<String>,
+    /// Which roots decided that, said out loud as every trust decision is.
+    trusted_by: String,
+    /// The round's head is the change's head, or the evidence is about other bytes.
+    bound_to_head: bool,
+}
+
+/// The directory a ref name lives in, with the trailing separator a prefix match needs.
+fn parent_of(name: &str) -> String {
+    match name.rsplit_once('/') {
+        Some((head, _)) => format!("{head}/"),
+        None => format!("{name}/"),
+    }
+}
+
+impl Proof {
+    /// Every attestation filed under `refs/attestations/<subject>/`, plus the refs in that
+    /// namespace the listing could not read at all.
+    fn for_commit(
+        host: &dyn Host,
+        repo: &Repo,
+        subject: &Oid,
+    ) -> Result<(Vec<Proof>, Vec<String>), CliError> {
+        let catalog = gitiup_host::attest::list_for(host, subject)
+            .map_err(|e| host_error("list the proofs", e))?;
+        let mut out = Vec::with_capacity(catalog.entries.len());
+        for entry in catalog.entries {
+            let bytes = gitiup_host::attest::fetch(host, &entry.digest)
+                .map_err(|e| host_error("read a proof", e))?
+                .ok_or_else(|| {
+                    CliError::new(
+                        gitiup_attest::ErrorKind::DigestMismatch,
+                        format!(
+                            "{} is advertised by {} and the store cannot return its bytes",
+                            entry.digest.short_default(),
+                            entry.reference
+                        ),
+                        Some(
+                            "a ref that names a missing object is a broken store, not a \
+                         missing proof",
+                        ),
+                    )
+                })?;
+            let doc = AttestationDoc::from_canonical_bytes(&bytes)?;
+            out.push(Proof {
+                digest: format!("sha256:{}", entry.digest.hex()),
+                reference: entry.reference.as_str().to_string(),
+                tier: doc.manifest.result.provenance.tier.as_str().to_string(),
+                result: doc.result_digest()?.to_string(),
+                signers: doc
+                    .signatures
+                    .iter()
+                    .map(|entry| entry.key_id.clone())
+                    .collect(),
+                claimed_at_us: doc.manifest.claims.claimed_at_us,
+                size: bytes.len(),
+                legacy: entry.legacy,
+                blob: repo.blob_oid(&bytes)?,
+                arrived: false,
+            });
+        }
+        // Newest claim first: the question a reviewer asks is what the proof about this
+        // commit says *now*, and an older attempt's proof should not read as the answer.
+        out.sort_by(|a, b| {
+            b.claimed_at_us
+                .cmp(&a.claimed_at_us)
+                .then(a.digest.cmp(&b.digest))
+        });
+        Ok((out, catalog.unexpected))
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "digest": self.digest,
+            "reference": self.reference,
+            "shape": if self.legacy { "legacy" } else { "current" },
+            "tier": self.tier,
+            "result": self.result,
+            "signers": self.signers,
+            "claimed_at": rfc3339(self.claimed_at_us),
+            "claimed_at_us": self.claimed_at_us,
+            "size": self.size,
+            "blob": format!("sha1:{}", self.blob),
+            "arrived": self.arrived,
+        })
+    }
+}
+
+impl ForJob {
+    /// Read the round, the seats and the verdict for one job of one change.
+    ///
+    /// Nothing here is derived: the round is the one the selector signed and published, the
+    /// submissions are the ones the seats published, and the verdict is the one an owner
+    /// signed. A checkout that recomputed any of it would disagree with the store for
+    /// reasons nobody could explain.
+    fn read(
+        host: &dyn Host,
+        id: &ChangeId,
+        job: &str,
+        record: &ChangeRecord,
+        args: &Args,
+    ) -> Result<ForJob, CliError> {
+        let change = id.as_str();
+        let rounds = qstore::rounds_for(host, change)?;
+        let mut mine: Vec<&Round> = rounds
+            .iter()
+            .filter(|round| round.inputs.job_id == job)
+            .collect();
+        if mine.is_empty() {
+            let known: Vec<&str> = rounds
+                .iter()
+                .map(|round| round.inputs.job_id.as_str())
+                .collect();
+            return Err(CliError::refused(
+                format!("no round for job '{job}' was opened for {id} in this store"),
+                if known.is_empty() {
+                    format!(
+                        "this change has no rounds at all; `gitiup change show {id} --json` \
+                         prints the jobs its author asked to have re-run, and `gitiup select \
+                         --change {id} --job <job> … --publish` opens one (ADR-0002)"
+                    )
+                } else {
+                    format!(
+                        "the store has rounds for {} of this change; a matrix arm is its own \
+                         job id, spelled build/matrix/linux-x86_64",
+                        known.join(", ")
+                    )
+                },
+            ));
+        }
+        // The highest attempt is the live one: an escalation supersedes, it does not run
+        // beside what it escalated from.
+        mine.sort_by_key(|round| round.inputs.attempt);
+        let attempts: Vec<u64> = mine.iter().map(|round| round.inputs.attempt).collect();
+        let round = mine
+            .last()
+            .copied()
+            .expect("non-empty after the refusal above");
+        let reference = qstore::round_ref(change, job, round.inputs.attempt)?;
+        if oid_hex(&round.inputs.head_oid.to_string()) != oid_hex(&record.head) {
+            return Err(CliError::refused(
+                format!(
+                    "the round for '{job}' was drawn against {}, which is not {id}'s head {} \
+                     in this store",
+                    round.inputs.head_oid, record.head
+                ),
+                "the evidence is about other bytes, so printing it beside these would be \
+                 worse than printing nothing: check the change out without --for, or open a \
+                 round on this attempt (`gitiup select --change <id> --job <job> --head \
+                 <oid> … --publish') (ADR-0002 D7)",
+            ));
+        }
+        let docs = qstore::submissions(host, round)?;
+        let by_key: BTreeMap<String, &AttestationDoc> = docs
+            .iter()
+            .filter_map(|doc| Some((doc.signatures.first()?.key_id.clone(), doc)))
+            .collect();
+        let mut seats = Vec::with_capacity(round.selected.len());
+        for seat in &round.selected {
+            let submission = match by_key.get(&seat.key_id) {
+                Some(doc) => Some(Submission {
+                    result: doc.result_digest()?.to_string(),
+                    tier: doc.manifest.result.provenance.tier.as_str().to_string(),
+                    signer: seat.key_id.clone(),
+                    claimed_at_us: doc.manifest.claims.claimed_at_us,
+                }),
+                None => None,
+            };
+            seats.push(SeatReport {
+                rank: seat.rank,
+                slot: seat.slot.clone(),
+                key: seat.key_id.clone(),
+                identity: seat.identity.clone(),
+                submission,
+            });
+        }
+        // A verdict is read only when the store actually advertises one, so that a change
+        // with no verdict costs this command no keystore and no trust decision.
+        let name = qstore::verdict_ref(change, job)?;
+        let (mut verdict, mut distrust, mut trusted_by) = (None, None, String::new());
+        if host
+            .get_ref(&name)
+            .map_err(|e| host_error("read the verdict ref", e))?
+            .is_some()
+        {
+            let (trust, by) = participant::owner_trust(args, &participant::keystore()?)?;
+            trusted_by = by;
+            match qstore::verdict_at(host, change, job, &trust) {
+                Ok(Some(record)) => verdict = Some(record),
+                Ok(None) => {
+                    distrust = Some(format!("{name} names a record the store cannot return"))
+                }
+                Err(why) => distrust = Some(why.message()),
+            }
+        }
+        Ok(ForJob {
+            job: job.to_string(),
+            reference: reference.as_str().to_string(),
+            round: round.clone(),
+            attempts,
+            seats,
+            verdict,
+            distrust,
+            trusted_by,
+            bound_to_head: true,
+        })
+    }
+
+    /// The refs `--for` adds to the fetch. On a git store these are ordinary refs, so the
+    /// round, every seat's submission and the verdict arrive in the same packfile as the
+    /// change and cost no second protocol.
+    fn ref_prefixes(&self) -> Result<Vec<String>, CliError> {
+        let change = &self.round.inputs.change_id;
+        let job = &self.round.inputs.job_id;
+        let round = qstore::round_ref(change, job, self.round.inputs.attempt)?;
+        let mut out = vec![parent_of(round.as_str())];
+        if let Some(seat) = self.round.selected.first() {
+            let reveal = qstore::reveal_ref(change, job, &seat.slot)?;
+            out.push(parent_of(reveal.as_str()));
+        }
+        out.push(qstore::verdict_ref(change, job)?.as_str().to_string());
+        Ok(out)
+    }
+
+    fn submitted(&self) -> usize {
+        self.seats
+            .iter()
+            .filter(|seat| seat.submission.is_some())
+            .count()
+    }
+
+    fn json(&self) -> Value {
+        let policy = &self.round.inputs.policy;
+        json!({
+            "job": self.job,
+            "reference": self.reference,
+            "attempt": self.round.inputs.attempt,
+            "attempts": self.attempts,
+            "round_digest": self.round.digest().map(|d| d.to_string()).unwrap_or_default(),
+            "seed": self.round.seed.to_string(),
+            "roster_epoch": self.round.inputs.roster_epoch,
+            "roster_digest": self.round.inputs.roster_digest.to_string(),
+            "policy_digest": self.round.policy_digest.to_string(),
+            "seats": self.round.selected.len(),
+            "required_agree": policy.required_agree,
+            "sufficient": self.round.sufficient,
+            "eligible": self.round.eligible,
+            "bound_to_head": self.bound_to_head,
+            "submitted": self.submitted(),
+            "seat_report": self.seats.iter().map(|seat| json!({
+                "rank": seat.rank,
+                "slot": seat.slot,
+                "key": seat.key,
+                "identity": seat.identity,
+                "submitted": seat.submission.as_ref().map(|done| json!({
+                    "result": done.result,
+                    "tier": done.tier,
+                    "signed_by": done.signer,
+                    "claimed_at": rfc3339(done.claimed_at_us),
+                })),
+            })).collect::<Vec<_>>(),
+            "verdict": self.verdict.as_ref().map(|record| json!({
+                "state": record.state.as_str(),
+                "reason": record.reason.as_str(),
+                "detail": record.detail,
+                "attempt": record.attempt,
+                "agreeing": record.agreeing,
+                "required_agree": record.required_agree,
+                "result": record.result_digest.as_ref().map(|d| d.to_string()),
+                "counted": record.counted.iter().map(|v| v.key_id.clone()).collect::<Vec<_>>(),
+                "missing": record.missing,
+                "divergent": record.divergent.len(),
+                "signed_by": record.signatures.iter().map(|s| s.key_id.clone()).collect::<Vec<_>>(),
+                "digest": record.digest().map(|d| d.to_string()).unwrap_or_default(),
+                "issued_at": rfc3339(record.issued_at_us),
+                "trusted_by": self.trusted_by,
+            })),
+            "verdict_refused": self.distrust,
+        })
+    }
+
+    /// The lines a person reads. The verdict is printed and not re-derived: `gitiup quorum
+    /// verdict` is the command whose exit code *is* the answer.
+    fn text(&self) {
+        let policy = &self.round.inputs.policy;
+        println!(
+            "  round    {} attempt {} \u{b7} {} seat{} \u{b7} {} must agree \u{b7} {} eligible",
+            self.job,
+            self.round.inputs.attempt,
+            self.round.selected.len(),
+            if self.round.selected.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            policy.required_agree,
+            self.round.eligible,
+        );
+        if self.attempts.len() > 1 {
+            println!(
+                "           attempts held: {} ({} is the live one)",
+                self.attempts
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.round.inputs.attempt
+            );
+        }
+        if !self.round.sufficient {
+            println!(
+                "           this round did not fill its seats: it can only ever be \
+                 `insufficient' (ADR-0002 D3)"
+            );
+        }
+        println!(
+            "           {} \u{b7} roster epoch {} ({}) \u{b7} seed {}",
+            short_id(
+                self.round
+                    .digest()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default()
+                    .as_str()
+            ),
+            self.round.inputs.roster_epoch,
+            short_id(&self.round.inputs.roster_digest.to_string()),
+            short_id(&self.round.seed.to_string()),
+        );
+        println!(
+            "  seats    {} of {} submitted",
+            self.submitted(),
+            self.round.selected.len()
+        );
+        for seat in &self.seats {
+            match &seat.submission {
+                Some(done) => println!(
+                    "    {:<3} {:<14} {:<9} {} \u{b7} {}",
+                    format!("s{}", seat.rank),
+                    short(&seat.key),
+                    done.tier,
+                    short_id(&done.result),
+                    rfc3339(done.claimed_at_us),
+                ),
+                None => println!(
+                    "    {:<3} {:<14} {:<9} silent",
+                    format!("s{}", seat.rank),
+                    short(&seat.key),
+                    "-",
+                ),
+            }
+        }
+        match (&self.verdict, &self.distrust) {
+            (Some(record), _) => {
+                println!(
+                    "  verdict  {} \u{b7} {} of {} identities agree on {}",
+                    record.state,
+                    record.agreeing,
+                    record.required_agree,
+                    record
+                        .result_digest
+                        .as_ref()
+                        .map(|d| short_id(&d.to_string()))
+                        .unwrap_or_else(|| "nothing".to_string()),
+                );
+                println!("           {}", one_line(&record.detail));
+                println!(
+                    "           signed by {} \u{b7} trusted via {} \u{b7} {}",
+                    record
+                        .signatures
+                        .iter()
+                        .map(|entry| short(&entry.key_id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.trusted_by,
+                    short_id(&record.digest().map(|d| d.to_string()).unwrap_or_default()),
+                );
+                if record.attempt != self.round.inputs.attempt {
+                    println!(
+                        "           note: it speaks about attempt {}, and the live round is \
+                         attempt {}",
+                        record.attempt, self.round.inputs.attempt
+                    );
+                }
+            }
+            (None, Some(why)) => {
+                println!("  verdict  there is one, and this machine will not believe it: {why}")
+            }
+            (None, None) => println!(
+                "  verdict  none filed for {} yet \u{b7} `gitiup quorum verdict <id> --job {} \
+                 --publish' signs one",
+                self.job, self.job
+            ),
+        }
+    }
+}
+
+/// One round trip to the store: every object under `prefixes` that `haves` does not
+/// already reach, in one git packfile.
+struct Transport {
+    /// `git-packfile`, or nothing at all when the clone already had it all.
+    form: &'static str,
+    objects: usize,
+    bytes: usize,
+    /// The packfile itself, for the clone to take into its object database.
+    raw: Vec<u8>,
+    /// How many of the clone's own ref tips the store agreed to treat as already held.
+    haves: usize,
+    /// True when the store could not honour the haves and had to send more, which is a
+    /// fact about the size of the fetch and not a secret to keep.
+    degraded: bool,
+    prefixes: Vec<String>,
+}
+
+/// The haves a store will accept: this clone's ref tips that the store can also name.
+///
+/// One oid the store has never heard of would fail the whole fetch — git's `--not` has no
+/// way to say "ignore that one" — so a local branch with local commits is left out rather
+/// than guessed at, and the pack is a little bigger for it.
+fn usable_haves(repo: &Repo, host: &dyn Host) -> Result<Vec<Oid>, CliError> {
+    let advertised: BTreeSet<String> = host
+        .list_refs(&RefQuery::all())
+        .map_err(|e| host_error("read the store's refs", e))?
+        .iter()
+        .map(|reference| reference.oid.hex().to_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    for hex in repo.ref_tips()? {
+        let hex = hex.to_lowercase();
+        if advertised.contains(&hex)
+            && let Ok(oid) = Oid::from_hex(&hex)
+        {
+            out.push(oid);
+        }
+    }
+    Ok(out)
+}
+
+/// Ask the store for the pack, and say how much of it the clone did not need.
+fn fetch_change(
+    host: &dyn Host,
+    prefixes: &[String],
+    haves: &[Oid],
+) -> Result<Transport, CliError> {
+    let request = PackRequest {
+        wants: Vec::new(),
+        have: haves.to_vec(),
+        ref_prefixes: prefixes.to_vec(),
+        format: PackFormat::GitPackfile,
+        limit_bytes: None,
+    };
+    let (pack, degraded) = match host.fetch_pack(&request) {
+        Ok(pack) => (pack, false),
+        Err(_) if !haves.is_empty() => {
+            // Every have was checked against the store's own refs first, so this is a
+            // surprise rather than a stale branch. Asking for more is the honest retry;
+            // giving up, or retrying with the same request, is not.
+            let wide = PackRequest {
+                wants: Vec::new(),
+                have: Vec::new(),
+                ..request.clone()
+            };
+            (
+                host.fetch_pack(&wide)
+                    .map_err(|e| host_error("fetch the change", e))?,
+                true,
+            )
+        }
+        Err(error) => return Err(host_error("fetch the change", error)),
+    };
+    if pack.format != PackFormat::GitPackfile {
+        return Err(CliError::new(
+            gitiup_attest::ErrorKind::Invalid,
+            format!(
+                "this store answered a git packfile request with a {} pack",
+                pack.format.as_str()
+            ),
+            Some(
+                "a checkout needs git objects; the change's commits are not reachable as such here",
+            ),
+        ));
+    }
+    Ok(Transport {
+        form: if pack.bytes.is_empty() {
+            "nothing-new"
+        } else {
+            "git-packfile"
+        },
+        objects: pack_object_count(&pack.bytes),
+        bytes: pack.len(),
+        raw: pack.bytes,
+        haves: if degraded { 0 } else { haves.len() },
+        degraded,
+        prefixes: prefixes.to_vec(),
+    })
+}
+
+/// How many objects a git packfile carries, from its twelve-byte header.
+fn pack_object_count(bytes: &[u8]) -> usize {
+    if bytes.len() < 12 || &bytes[..4] != b"PACK" {
+        return 0;
+    }
+    u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize
+}
+
+/// Where the change was left in the clone.
+struct Landing {
+    /// The ref written, if any; `--detach` writes none.
+    reference: Option<String>,
+    /// `created` · `fast-forwarded` · `unchanged` · `detached`, plus `written` when the
+    /// worktree was deliberately left alone.
+    action: &'static str,
+    /// Whether the working tree now shows the change.
+    worktree: &'static str,
+}
+
+fn checkout(args: &Args) -> Result<(), CliError> {
+    if let Some(()) = args.help(CHANGE_HELP) {
+        return Ok(());
+    }
+    let handle = positional_handle(args, "checkout")?;
+    if args.on("--detach") && args.get("--ref").is_some() {
+        return Err(CliError::usage(
+            "--detach and --ref contradict each other: detaching leaves no branch to name",
+        ));
+    }
+    if args.on("--detach") && args.on("--no-checkout") {
+        return Err(CliError::usage(
+            "--detach and --no-checkout contradict each other: detaching is a working-tree \
+             move, which is the one thing --no-checkout promises not to make",
+        ));
+    }
+    let repo = Repo::discover(args)?;
+    if repo.bare()? {
+        return Err(CliError::refused(
+            format!(
+                "{} is a bare repository, so there is no working tree to check out into",
+                repo.dir.display()
+            ),
+            "run this in a clone, or say --no-checkout to bring the objects and the ref and \
+             leave the worktree alone",
+        ));
+    }
+    // Before the store is opened, let alone fetched from: a refusal should cost nothing,
+    // and the paths are the whole of what the person needs.
+    let dirty = if args.on("--no-checkout") {
+        Vec::new()
+    } else {
+        repo.dirty_paths()?
+    };
+    if !dirty.is_empty() {
+        return Err(CliError::refused(
+            format!(
+                "{} has uncommitted changes: {}",
+                repo.dir.display(),
+                dirty.join(", ")
+            ),
+            "commit or stash them first: a checkout that folded your work into someone \
+             else's change leaves you unable to tell the two apart, and `git status` is the \
+             only thing that ever said which was which",
+        ));
+    }
+    let store = read_store(args)?;
+    if store.host.kind() != HostKind::Git {
+        return Err(CliError::refused(
+            format!(
+                "{} cannot serve a git packfile — a {} store has no way to hand git \
+                 objects over — so it cannot hand over the commits a checkout is",
+                store.what,
+                store.host.kind()
+            ),
+            "only a plain-git store speaks git objects (ADR-0003 D5): `gitiup change show` \
+             reads the record and prints the refspec, `gitiup verify change` judges the \
+             proofs, and a `git fetch` of the change refs does the rest — or name the \
+             repository's git URL as the remote",
+        ));
+    }
+    let found = resolve_handle(&*store.host, &handle)?;
+    let id = found.change_id.clone();
+    let reference = match args.get("--attempt") {
+        Some(text) => {
+            let index = text
+                .parse::<u32>()
+                .map_err(|_| CliError::usage(format!("--attempt '{text}' is not a number")))?;
+            change::attempt_ref(&id, index)
+        }
+        None => change::change_head_ref(&id),
+    };
+    let fetched = change::change_at(&*store.host, &reference).map_err(store_refusal)?;
+    let StoredRecord::Change(record) = fetched.record.clone() else {
+        return Err(CliError::refused(
+            format!(
+                "{} holds a {} record",
+                fetched.reference,
+                fetched.record.record_type()
+            ),
+            "a change's head and attempts hold gitiup-change-1 records",
+        ));
+    };
+    let head = oid_hex(&record.head).to_string();
+    let subject = Oid::from_hex(&head).map_err(|e| {
+        CliError::refused(
+            format!("{}'s head '{}' is not an object id: {e}", id, record.head),
+            "a change names a git commit, algorithm-tagged, as `git rev-parse` prints one",
+        )
+    })?;
+    // Read everything the store has to say before a byte is written anywhere, so that a
+    // refusal — no round for that job, a proof whose bytes the store cannot return —
+    // leaves the clone exactly as it was.
+    let (mut proofs, odd) = Proof::for_commit(&*store.host, &repo, &subject)?;
+    let for_job = match args.get("--for") {
+        Some(job) => Some(ForJob::read(&*store.host, &id, job, &record, args)?),
+        None => None,
+    };
+    let base_here = repo.holds(oid_hex(&record.base.oid));
+    let mut prefixes = vec![
+        change::change_prefix(&id),
+        gitiup_host::attest::prefix(&subject),
+    ];
+    if proofs.iter().any(|proof| proof.legacy) {
+        prefixes.push(
+            gitiup_host::attest::legacy_ref_name(&subject)
+                .as_str()
+                .to_string(),
+        );
+    }
+    if let Some(job) = &for_job {
+        prefixes.extend(job.ref_prefixes()?);
+    }
+    let haves = usable_haves(&repo, &*store.host)?;
+    let pack = fetch_change(&*store.host, &prefixes, &haves)?;
+    if pack.bytes > 0 {
+        repo.index_pack(&pack.raw)?;
+    }
+    // The promise, checked instead of announced: the ref arrived, so the commit and every
+    // proof filed under it must be in this object database now.
+    if !repo.holds(&head) {
+        return Err(CliError::refused(
+            format!(
+                "the store's refs for {id} do not carry {}, so nothing arrived to check out",
+                record.head
+            ),
+            "the record was published and the commits were not — `submit --no-objects` says \
+             \"the store already holds them\" out loud, and a store that was told that does \
+             not hold them (ADR-0003 D5). Re-submit with the objects, or fetch the commits \
+             from wherever they really are",
+        ));
+    }
+    for proof in &mut proofs {
+        proof.arrived = repo.holds(&proof.blob);
+    }
+    let lost: Vec<&Proof> = proofs.iter().filter(|proof| !proof.arrived).collect();
+    if !lost.is_empty() {
+        return Err(CliError::new(
+            gitiup_attest::ErrorKind::DigestMismatch,
+            format!(
+                "the pack carried the change but not {} of its {} proof(s): {}",
+                lost.len(),
+                proofs.len(),
+                lost.iter()
+                    .map(|proof| short_id(&proof.digest))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(
+                "a ref in refs/attestations/** that arrives without its bytes is a broken \
+                 proof: the store advertised more than it moved",
+            ),
+        ));
+    }
+    let landing = land(args, &repo, &id, &head)?;
+    if args.json() {
+        print_json(json!({
+            "store": store.what,
+            "repository": repo.dir.display().to_string(),
+            "change": id.as_str(),
+            "state": found.state.as_str(),
+            "attempt": record.attempts.index,
+            "reference": fetched.reference.as_str(),
+            "record_digest": tagged(fetched.digest),
+            "change_digest": record.change_digest().unwrap_or_default(),
+            "head": record.head,
+            "title": record.title,
+            "base": {
+                "ref": record.base.branch,
+                "oid": record.base.oid,
+                "held_here": base_here,
+            },
+            "fetch": {
+                "form": pack.form,
+                "objects": pack.objects,
+                "bytes": pack.bytes,
+                "haves": pack.haves,
+                "degraded": pack.degraded,
+                "prefixes": pack.prefixes,
+            },
+            "proofs": proofs.iter().map(Proof::json).collect::<Vec<_>>(),
+            "proof_count": proofs.len(),
+            "unexpected_refs": odd,
+            "quorum": for_job.as_ref().map(ForJob::json),
+            "landed": {
+                "ref": landing.reference,
+                "action": landing.action,
+                "worktree": landing.worktree,
+                "at": record.head,
+            },
+        }));
+        return Ok(());
+    }
+    println!(
+        "checkout {} attempt {} \u{b7} {}",
+        id, record.attempts.index, found.state
+    );
+    println!("  store    {}", store.what);
+    println!(
+        "  ref      {} -> record {}",
+        fetched.reference,
+        short_id(&tagged(fetched.digest))
+    );
+    println!(
+        "  head     {} \u{b7} {}",
+        short_id(&record.head),
+        clip(&record.title, 48)
+    );
+    println!(
+        "  base     {} @ {} [{}]",
+        record.base.branch,
+        short_id(&record.base.oid),
+        if base_here {
+            "held here"
+        } else {
+            "not in this clone: its objects came with the pack"
+        }
+    );
+    println!(
+        "  fetched  {}",
+        if pack.bytes == 0 {
+            "nothing \u{2014} this clone already holds the change and every proof of it".to_string()
+        } else {
+            format!(
+                "{} objects, {} bytes as a git packfile \u{b7} {} of the clone's refs were \
+                 already in the store and were not fetched twice{}",
+                pack.objects,
+                pack.bytes,
+                pack.haves,
+                if pack.degraded {
+                    " (the store could not honour them, so this pack is larger than it was)"
+                } else {
+                    ""
+                }
+            )
+        }
+    );
+    for prefix in &pack.prefixes {
+        // A directory prefix is what the fetch wildcard means. An exact ref — a verdict,
+        // one per change and job — is printed as itself, because `…/linux-x86_64*` would
+        // advertise siblings the layout does not have.
+        if prefix.ends_with('/') {
+            println!("           {prefix}*");
+        } else {
+            println!("           {prefix}");
+        }
+    }
+    if proofs.is_empty() {
+        println!(
+            "  proofs   none yet \u{b7} {} is what a run signs afterwards",
+            gitiup_host::attest::prefix(&subject)
+        );
+    } else {
+        println!(
+            "  proofs   {} arrived with the pack, for {}",
+            proofs.len(),
+            short_id(&record.head)
+        );
+        for proof in &proofs {
+            println!(
+                "           {}  {:<9} {} \u{b7} {}{}",
+                short_id(&proof.digest),
+                proof.tier,
+                proof
+                    .signers
+                    .iter()
+                    .map(String::as_str)
+                    .map(short)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                rfc3339(proof.claimed_at_us),
+                if proof.legacy {
+                    " \u{b7} legacy ref"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    for name in &odd {
+        eprintln!("note: {name} is in the attestation namespace but not this layout");
+    }
+    if let Some(job) = &for_job {
+        job.text();
+    }
+    println!(
+        "  worktree {}",
+        match (landing.reference.as_deref(), landing.action) {
+            (_, "detached") => format!("detached at {}", short_id(&record.head)),
+            (Some(full), "written") => format!(
+                "left alone; {} now names {}",
+                branch_of(full),
+                short_id(&record.head)
+            ),
+            (Some(full), "created") => format!(
+                "checked out on branch {} at {}",
+                branch_of(full),
+                short_id(&record.head)
+            ),
+            (Some(full), "unchanged") => format!(
+                "already on {} at {}",
+                branch_of(full),
+                short_id(&record.head)
+            ),
+            (Some(full), _) => format!(
+                "fast-forwarded {} to {}",
+                branch_of(full),
+                short_id(&record.head)
+            ),
+            (None, _) => "not moved".to_string(),
+        }
+    );
+    let named = match (args.get("--remote"), args.get("--store")) {
+        (Some(name), _) => format!("--remote {name}"),
+        (None, Some(dir)) => format!("--store {dir}"),
+        (None, None) => "--remote <name>".to_string(),
+    };
+    println!("  next     gitiup verify change {id} {named}");
+    println!(
+        "           the tally is `gitiup quorum verdict {id} --job {}`'s exit code, not \
+         this one's",
+        args.get("--for").unwrap_or("<job>")
+    );
+    Ok(())
+}
+
+/// Write the change into the clone: a branch that may move, or a detached HEAD.
+///
+/// The rule on a branch is the rule everywhere else in gitiup: a ref moves forward or it
+/// does not move. `change merge` will not rewind a branch in the store and this will not
+/// quietly rewind one in someone's clone either — the fast-forward test is the same test.
+fn land(args: &Args, repo: &Repo, id: &ChangeId, head: &str) -> Result<Landing, CliError> {
+    if args.on("--detach") {
+        repo.change(&["checkout", "--detach", head])?;
+        return Ok(Landing {
+            reference: None,
+            action: "detached",
+            worktree: "detached",
+        });
+    }
+    let name = match args.get("--ref") {
+        Some(text) if text.starts_with("refs/") => text.to_string(),
+        Some(text) if text.is_empty() || text.starts_with('-') => {
+            return Err(CliError::usage(format!("'{text}' is not a ref name")));
+        }
+        Some(text) => format!("refs/heads/{text}"),
+        // The change id is the default because it is derived, copyable from the store and
+        // cannot collide with a branch the clone already had by accident.
+        None => format!("refs/heads/{}", id.as_str()),
+    };
+    RefName::new(name.clone()).map_err(|e| {
+        CliError::usage(format!(
+            "'{name}' is not a ref this repository will accept: {e}"
+        ))
+    })?;
+    let short = name
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&name)
+        .to_string();
+    let action: &'static str = match repo.ref_oid(&name)? {
+        Some(existing) if oid_hex(&existing) == head => "unchanged",
+        Some(existing) if repo.is_ancestor(oid_hex(&existing), head) => "fast-forwarded",
+        Some(existing) => {
+            // Both oids, spelled the same way: the whole point of the message is the
+            // comparison, and a refusal that says "would drop commits" without naming
+            // which commits is advice nobody can act on.
+            let here = tag_oid(&existing).unwrap_or_else(|| existing.clone());
+            let there = tag_oid(head).unwrap_or_else(|| head.to_string());
+            let free = format!("refs/heads/{}", id.as_str());
+            return Err(CliError::refused(
+                format!(
+                    "{name} is {here} in this clone and {id}'s head is {there}, so moving \
+                     it would drop commits"
+                ),
+                format!(
+                    "a ref moves forward or it does not move: name somewhere else with \
+                     --ref ({free} is free here), delete the branch if it really is spent, \
+                     or look at the change without a branch using --detach"
+                ),
+            ));
+        }
+        None => "created",
+    };
+    if args.on("--no-checkout") {
+        if action != "unchanged" {
+            if action == "created" {
+                repo.change(&["branch", &short, head])?;
+            } else {
+                repo.change(&["branch", "-f", &short, head])?;
+            }
+        }
+        return Ok(Landing {
+            reference: Some(name),
+            action: "written",
+            worktree: "left alone",
+        });
+    }
+    repo.change(&["checkout", "-B", &short, head])?;
+    let now = repo.oid("HEAD", "HEAD")?;
+    if oid_hex(&now) != head {
+        return Err(CliError::io(format!(
+            "HEAD is {now} after a checkout of {head}"
+        )));
+    }
+    Ok(Landing {
+        reference: Some(name),
+        action,
+        worktree: "checked out",
+    })
+}
+
+/// A branch ref the way `git branch` prints it. A ref outside `refs/heads/` keeps its
+/// full name, because it has no short form that means only itself.
+fn branch_of(name: &str) -> &str {
+    name.strip_prefix("refs/heads/").unwrap_or(name)
+}
+
+/// A sentence that stays one line, however the store wrote it.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" \u{2014} ")
 }
 
 // ---------------------------------------------------------------------------

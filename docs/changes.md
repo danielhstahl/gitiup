@@ -1,6 +1,7 @@
 # Contributing without a forge — the change workflow
 
-*Ticket: `giti-b2z.3` (`gitiup change new|submit|list|show`). Format decision:
+*Ticket: `giti-b2z.3` (`gitiup change new|submit|list|show`), with `giti-b2z.5`
+(`gitiup change checkout`). Format decision:
 [ADR-0003](adr/0003-change-record-format-and-merge-semantics.md). Host contract:
 [host abstraction](host-abstraction.md). Proofs about a change:
 [verification](verification.md).*
@@ -16,6 +17,8 @@ gitiup change new    --base main          draft a signed record from local commi
 gitiup change submit --record … --remote …   publish one attempt of it
 gitiup change list   [--state open] [--json]  what a store advertises
 gitiup change show   <id> [--attempt n]    one change, read back through its ref
+gitiup change checkout <id> [--for job]    bring it, and its proofs, into a clone
+                                           — and read that job's quorum while at it
 gitiup change merge     <id> [--expected-oid OID] [--proof DIGEST]   merge it, or --dry-run
 gitiup change reconcile <id>              write the merge record for a move that happened
 ```
@@ -263,6 +266,88 @@ attempt; `--bytes` prints the exact stored bytes.
 | `head_tracks_newest` | whether `head` names the newest attempt, or a half-finished submit left it behind |
 | `fetch` | the refspec a reviewer fetches: one `git fetch` on a git host brings the record and every commit it proposes |
 
+## Checking it out: one fetch, the change and its proofs (`checkout`)
+
+`submit` answers "how does work get in". `checkout` is the same door from the other side,
+and it exists because a reviewer otherwise has to know three things — which ref to fetch,
+which ref the proofs live under, and whether the bytes they name actually came — and get
+all three right in one `git fetch` before `verify` can be run at all.
+
+```console
+$ cd my-repo && gitiup change checkout chg-422b13f7e1972adb --remote origin
+checkout chg-422b13f7e1972adb attempt 0 · open
+  store    remote 'origin'
+  ref      refs/changes/chg-422b13f7e1972adb/head -> record sha256:dfd5393f…0376
+  head     sha1:b23903d9…34ca · propose
+  base     refs/heads/main @ sha1:cd9ee8fe…7c87 [held here]
+  fetched  14 objects, 2823 bytes as a git packfile · 3 of the clone's refs were already
+           in the store and were not fetched twice
+           refs/changes/chg-422b13f7e1972adb/*
+           refs/attestations/b23903d97740c06dd4f934fb111897f020c734ca/*
+  proofs   1 arrived with the pack, for sha1:b23903d9…34ca
+           sha256:7003c357…996d  simulated 1PQUtCVY…ek6Q · 2026-10-27T09:15:02Z
+  worktree checked out on branch chg-422b13f7e1972adb at sha1:b23903d9…34ca
+  next     gitiup verify change chg-422b13f7e1972adb --remote origin
+           the tally is `gitiup quorum verdict … --job <job>`'s exit code, not this one's
+```
+
+**One fetch, two prefixes, one pack.** The wants are `refs/changes/<id>/*` and
+`refs/attestations/<head>/*` in a single request, which is the promise
+[host-abstraction](host-abstraction.md) advertises: on a git host a proof's canonical bytes
+are a blob, its ref is a commit pointing at that blob, and so the ref cannot arrive without
+the bytes. The clone's own ref tips are sent as haves, so what comes back is bounded by what
+the change introduces and not by the repository's history. If a store will not honour the
+haves the fetch is retried without them and says so (`degraded: true`) rather than failing.
+
+**A counted proof is a proof that is here.** Every attestation the store lists for the head
+is checked against the clone afterwards — the blob its ref names, present in this object
+database, at the length the record claimed. A ref that arrived *without* its bytes exits 8;
+printing a proof nobody could produce is worse than printing none. That is why this command
+needs a git-backed store: an fs store or a bucket holds the change's commits as gitiup
+records and has no way to hand over git objects, and it is refused **by name** with the
+verbs that do work against it (`change show`, `verify change`, `git fetch` of the refspec
+`show` prints) rather than half-succeeding.
+
+**Nothing is written to the remote, ever.** Not a ref, not a record, not a pack pushed back
+"to be helpful" — which is what lets a remote configured `read-only = "true"` serve a
+checkout, and what the test suite asserts both ways
+([`tests/change_checkout_cli.rs`](../crates/gitiup/tests/change_checkout_cli.rs)).
+
+What it refuses, and why:
+
+| exit | when |
+|------|------|
+| 6 | a dirty worktree — *named path by path*, because folding your work into a stranger's change makes `git status` useless afterwards (untracked files do not count: `git` itself refuses one it would overwrite) · a bare repository, which has no worktree to move · a store with no git objects, named as such · a local ref the change cannot fast-forward, with **both** oids and where to go instead · `--for <job>` with no round for that job, naming the jobs that have one · `--for <job>` whose live round was drawn against a different head: the evidence is about other bytes |
+| 8 | a proof ref that arrived without the bytes it names |
+| 2 | no id given, a handle shorter than 4 hex, `--detach` with `--ref` or with `--no-checkout` |
+
+The change lands on `refs/heads/<change-id>` unless `--ref <name>` names another branch;
+`--detach` looks at it without making a branch, and `--no-checkout` writes the ref and
+leaves the worktree alone — which is the one case a dirty worktree is allowed, because
+nothing touches it. A ref already at that commit is left alone (`unchanged`), a ref the
+change *can* fast-forward is moved, and this is the same ancestor question `merge` asks
+above: after a checkout, this clone is the local repository that can prove the
+fast-forward.
+
+```
+  round    build/matrix/linux-x86_64 attempt 1 · 5 seats · 4 must agree · 6 eligible
+           attempts held: 0, 1 (1 is the live one)
+           sha256:a67a67cc…3317 · roster epoch 2968 (sha256:083200b7…7adf)
+  seats    0 of 5 submitted
+    s1  vyB4Bkj7…wE9I  -         silent
+    s2  4Kr8N+NB…3M7I  -         silent
+  verdict  none filed for build/matrix/linux-x86_64 yet · `gitiup quorum verdict … --publish' signs one
+```
+
+`--for <job>` adds that arm of the quorum to the same fetch — `refs/gitiup/round/<change>/
+<job>/*`, the seat submissions under `refs/gitiup/reveal/…` and the verdict at
+`refs/gitiup/verdict/<change>/<job>` if one has been signed — and prints it, because a
+reviewer staring at a green change with no idea whether anybody checked it is the failure
+mode worth designing against. A verdict that no key this machine trusts signed is reported
+as refused rather than dropped, and a job with several attempts reads the highest one (the
+live round) and says which attempts the store holds. It is display: the tally's exit code
+belongs to `gitiup quorum verdict`, and the hint says so.
+
 ## Merging: a compare-and-swap, then a signed record of it
 
 `merge` is the owner's command, and it is two writes in a fixed order (ADR-0003 D8). First
@@ -444,9 +529,9 @@ branch on the transport and does not branch on the verb either:
 | 0 | published, listed, shown, merged, reconciled (including the idempotent `already: true`) |
 | 2 | usage: unknown verb or flag, missing `--base`, a handle shorter than 4 hex, a `--proof` or `--expected-oid` that cannot mean anything to the store |
 | 3 | I/O, an unreachable store, git failing — and a refusal the **store** owns, passed through in the store's own taxonomy (a credential that may not write `refs/heads/**` stays `permission denied`, never retold as an I/O error or a generic 6) |
-| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, an ambiguous handle — and for a merge: not a fast-forward, an ancestry the tool cannot check, a branch that has already moved (reconcile instead), a change already merged or abandoned, a proof the store cannot return, `--proof-required` with no policy engine |
+| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, an ambiguous handle — and for a merge: not a fast-forward, an ancestry the tool cannot check, a branch that has already moved (reconcile instead), a change already merged or abandoned, a proof the store cannot return, `--proof-required` with no policy engine — and for a checkout: a dirty worktree (paths named), a bare repository, a store with no git objects, a local ref the change cannot fast-forward, no round for `--for`, a `--for` round drawn against another head |
 | 7 | a signature that does not verify, or a `key_id` that is not the fingerprint of the key offered |
-| 8 | bytes that are not their own canonical form, a record that does not re-hash to the name it is filed under, a `change_id` that does not re-derive |
+| 8 | bytes that are not their own canonical form, a record that does not re-hash to the name it is filed under, a `change_id` that does not re-derive — and for a checkout, a proof ref that arrived without the bytes it names |
 
 ## Composition, and what a forge has to do with it
 
@@ -466,7 +551,7 @@ inside the record rather than leaving it to be inferred from where you read it.
 
 ## Not this ticket
 
-Checking a change out (`giti-b2z.5`), the
+Checking a change out (`giti-b2z.5`) is written up above. The
 change-workflow conformance suite run against MinIO and `git-http-backend` (`giti-b2z.6`),
 GitHub adapter parity for these verbs (`giti-b2z.7`). Opening quorum rounds on submit is
 `giti-zp1.2` and now happens (step 5 above). `gitiup verify change` (`giti-91m.4`) now gates a

@@ -99,6 +99,9 @@ COMMANDS:
     change merge <ID> [OPTIONS]    the owner's merge: compare-and-swap the branch, then
                                    a signed record of it (--dry-run first)
     change reconcile <ID> [OPTS]   write that record for a merge the store already has
+    change checkout <ID> [OPTS]    the reviewer's side: fetch one change's commits and
+                                   every proof filed for them into a clone as one thin
+                                   pack, and say what arrived (the store is never written)
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·
@@ -178,6 +181,16 @@ record at kv/change/<digest> and moves refs/changes/<id>/head under compare-and-
 re-submit is a new *attempt* and never an overwrite, and a base the store no longer has is
 refused with both oids and exit 6. `list` and `show` read it back from an fs directory, a
 bare repository or a bucket with the same three flags: `--store`, `--remote`, `--json`.
+
+`checkout` is the same door from the reviewer's side. One fetch of `refs/changes/<id>/*`
+and `refs/attestations/<head>/*` brings the change's commits *and* every proof filed for
+them across as a single thin pack — the proof arrives with the bytes it is about, and is
+checked to be really in the clone before it is counted — then the change lands on a local
+branch and the worktree is checked out, unless `--no-checkout` or `--detach` says
+otherwise. A dirty worktree is refused by name (6), a branch the change cannot
+fast-forward is refused with both ends (6), and nothing is ever written to the store, which
+is what lets a read-only remote serve it. `--for <job>` adds that job's round, its seat
+submissions and its verdict if one has been signed.
 
 `verify attestation` is the question the whole format exists to answer: may this proof be
 acted on? It checks the canonical bytes re-hash to the digest they claim, that every
