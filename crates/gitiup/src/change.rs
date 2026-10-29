@@ -84,7 +84,9 @@ use std::process::Command;
 
 use gitiup_attest::TimeUs;
 use gitiup_host::change::{self, AttemptInfo, ChangeId, ChangeRecord, State, StoredRecord};
-use gitiup_host::{Actor, Host, Namespace, Oid, RefName, RefQuery};
+use gitiup_host::{
+    Actor, Config, CredentialProfile, Host, Namespace, Oid, RefName, RefQuery, RemoteConfig,
+};
 use serde_json::{Map, Value, json};
 
 use crate::CliError;
@@ -97,10 +99,12 @@ pub const CHANGE_HELP: &str = "\
 gitiup change — propose work to a store, with no forge
 
 USAGE:
-    gitiup change new    [OPTIONS]
-    gitiup change submit [OPTIONS]
-    gitiup change list   [OPTIONS]
-    gitiup change show   <ID> [OPTIONS]
+    gitiup change new       [OPTIONS]
+    gitiup change submit    [OPTIONS]
+    gitiup change list      [OPTIONS]
+    gitiup change show      <ID> [OPTIONS]
+    gitiup change merge     <ID> [--expected-oid OID] [--proof DIGEST] [--dry-run]
+    gitiup change reconcile <ID> [--via store|forge] [--dry-run]
 
 A change is one signed record in a content-addressed store, advertised by a ref
 (ADR-0003). It is not a pull request: the record names the commit it proposes, the
@@ -161,6 +165,39 @@ show — one change, read back through the ref that advertises it:
     --json                   the record, its digests, its signature, the attempt chain,
                              and the merge/abandon record if the change has one
 
+merge — the owner's side: a compare-and-swap of the branch, then the record of it:
+    ID                       the change to merge (id, or 4+ hex of one)
+    --expected-oid <oid>     what the branch must hold. Default: the base.oid the author
+                             signed, which is the honest default: it merges the attempt
+                             the author could actually have merged. Naming another oid is
+                             a decision of the owner's and is printed as one
+    --proof <digest>         an attestation this merge believed (repeatable). Cited as a
+                             digest in the merge record and pinned so retention cannot
+                             retire it; the store must be able to return it, because a
+                             digest nobody can fetch proves nothing
+    --proof-required         refused on purpose: whether a merge is *allowed* is Epic 2's
+                             policy engine, which does not exist yet, and \"no policy
+                             found, merged anyway\" is not an answer. Verify the proofs
+                             yourself and cite them with --proof
+    --dry-run                print the plan and touch nothing, like `gitiup attest gc`
+    --repository, -C, --key  where to prove the fast-forward, and who signs the record
+    --json                   the plan or the outcome: both oids, the kv key, the ref, the
+                             proofs, who signed and `via`
+
+reconcile — write the record for a merge the store already has:
+    ID                       the change whose branch already carries its head
+    --via <store|forge>      who moved it (default: store)
+    --landed <oid>           where a forge's merge left the branch, when that is not the
+                             attempt's head (its own merge commit)
+    --merge-method <how>     on a forge remote: ff (default) | merge | squash | rebase.
+                             The default is gitiup's own rule — a merge commit exists
+                             only after the merge, so no proof covers it
+
+On a forge remote a change carried by a pull request is merged by the forge: its merge
+is atomic and reviewed, and a ref write would only be an imitation of it. --json then
+says \"via\": \"forge\" and what that promise is, because the two kinds of merge are not the
+same guarantee and a script should not have to guess which one it got.
+
 All: -j, --json on anything a script reads. Passphrases follow `gitiup key`:
 --passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a script cannot
 answer.
@@ -170,14 +207,29 @@ change (say which change with --change, because your amended head cannot recompu
 own name), and an attempt ref that exists is never moved: publishing different bytes
 where an attempt already stands is refused with both digests.
 
-Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable · 6 refused (no store, no key,
-unsigned record, stale base naming both oids, attempt conflict, an id you cannot sign
-for) · 7 a signature that does not verify · 8 bytes that are not the record's own
-canonical form, or a digest that does not match its name.
+A merge refuses, exit 6, with **both oids** when the branch is not what the record says
+(\"pull first\" is the only useful advice) and when the change is not a fast-forward, and it
+names the retry when the branch moved but its record did not land (`change reconcile`).
+A refusal the store itself makes — a credential that may not write refs/heads/** — is
+passed through in the store's own words and its own exit code, never retold as an I/O
+error.
+
+Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable, a refusal the store owns (a denied
+write) · 6 refused (no store, no key, unsigned record, stale base naming both oids,
+attempt conflict, an id you cannot sign for, not a fast-forward, ancestry the tool cannot
+check, --proof-required) · 7 a signature that does not verify · 8 bytes that are not the
+record's own canonical form, or a digest that does not match its name.
 ";
 
 /// Switches `gitiup change …` accepts.
-const SWITCHES: &[&str] = &["--no-jobs", "--no-objects", "--new-attempt", "--bytes"];
+const SWITCHES: &[&str] = &[
+    "--no-jobs",
+    "--no-objects",
+    "--new-attempt",
+    "--bytes",
+    "--dry-run",
+    "--proof-required",
+];
 
 /// Valued flags `gitiup change …` accepts.
 const VALUED: &[&str] = &[
@@ -199,6 +251,11 @@ const VALUED: &[&str] = &[
     "--attempt",
     "--passphrase",
     "--passphrase-file",
+    "--expected-oid",
+    "--proof",
+    "--via",
+    "--landed",
+    "--merge-method",
 ];
 
 /// `gitiup change …`
@@ -216,9 +273,11 @@ pub fn change(args: &[String]) -> Result<(), CliError> {
         "submit" => submit(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "list" | "ls" => list(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "show" => show(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "merge" => merge(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "reconcile" => reconcile(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         other => Err(CliError::usage(format!(
             "unknown `gitiup change` command '{other}'; `gitiup change help` lists new, \
-             submit, list and show"
+             submit, list, show, merge and reconcile"
         ))),
     }
 }
@@ -539,6 +598,14 @@ impl Repo {
             }
         }
         Ok(seen.into_iter().collect())
+    }
+
+    /// Whether this repository holds the object at all.
+    ///
+    /// The fast-forward test needs both ends present; a repository that does not have one
+    /// says so instead of guessing (ADR-0003 D8 step 4).
+    fn holds(&self, hex: &str) -> bool {
+        self.raw(&["cat-file", "-e", hex], None).is_ok()
     }
 
     /// A git packfile carrying `introduced(base, head)`.
@@ -1580,6 +1647,700 @@ fn submit(args: &Args) -> Result<(), CliError> {
         );
     }
     let _ = &drafted;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// merge — the owner's side (ADR-0003 D8)
+// ---------------------------------------------------------------------------
+
+/// The refusal that keeps `--proof-required` honest.
+///
+/// There is no policy engine yet (it is Epic 2), so the honest answer is a refusal that
+/// says who is missing and what to do instead. The alternative — "no policy found, merged
+/// anyway" — is the one failure mode a merge gate must never have, and a `--dry-run` that
+/// quietly agreed would be the same failure wearing a costume.
+fn policy_engine_missing(flag: &str) -> CliError {
+    CliError::refused(
+        format!(
+            "{flag} asks whether a merge is *allowed*, and there is no policy engine in \
+             this build yet"
+        ),
+        "policy is Epic 2's, and deliberately not a field of the change record (ADR-0003 \
+         D9): a contributor who could write \"no checks needed\" into the object being \
+         merged has written their own gate. Until it lands, decide it yourself — `gitiup \
+         verify attestation <file> --trust …` answers 0/6/7/8 for one proof — and cite \
+         each proof you believed with --proof <digest>, so the merge record says what it \
+         believed rather than saying nothing",
+    )
+}
+
+/// A refusal the store owns, in the store's words.
+///
+/// `gitiup change merge` is the owner's credential against the owner's branch, and the
+/// branch is the one ref the tool does not own. A refusal from the store — a hook, a
+/// read-only token, a `pre-receive` that says no — keeps its taxonomy label, its message,
+/// its hint and the exit code its kind implies. Rewriting it into "I/O error" throws away
+/// the only useful sentence in the run.
+fn store_refusal(error: gitiup_host::HostError) -> CliError {
+    use gitiup_host::HostErrorExt as _;
+    let message = if error.is_denied() {
+        format!("{}: {}", error.kind(), error.message())
+    } else {
+        error.message()
+    };
+    CliError::scored(error.exit_code(), message, error.hint().map(str::to_string))
+}
+
+/// The `author` of a merge record: whoever signed it, which is the merger and not the
+/// change's author (D7).
+fn merger(who: &Identity) -> change::Author {
+    change::Author {
+        key_id: who.key_id.clone(),
+        principal: who.principal.clone(),
+    }
+}
+
+/// The proof digests this merge says it believed, each one checked against the store.
+///
+/// A merge record that cites a digest the store cannot return is evidence about an object
+/// nobody can produce, which is the reason `proofs` holds digests in the first place (D8:
+/// a copy can be edited; a digest you cannot fetch is no better). So a citation the store
+/// cannot honour is a refusal, and a merge may cite nothing instead — which says nothing,
+/// rather than appearing to have believed everything.
+fn cited_proofs(store: &dyn Host, args: &Args) -> Result<Vec<String>, CliError> {
+    let mut out = Vec::new();
+    for text in args.all("--proof") {
+        let hex = text.strip_prefix("sha256:").unwrap_or(&text).to_string();
+        let oid = Oid::from_hex(&hex).map_err(|_| {
+            CliError::usage(format!(
+                "--proof '{text}' is not a digest: an attestation is named by sha256:, 64 \
+                 lower hex"
+            ))
+        })?;
+        if oid.hex().len() != 64 {
+            return Err(CliError::usage(format!(
+                "--proof '{text}' is not a sha256 digest ({} hex is a {})",
+                oid.hex().len(),
+                if oid.hex().len() == 40 {
+                    "git oid, which is not what a proof is named by"
+                } else {
+                    "shortened digest, and a merge record cites the whole thing"
+                }
+            )));
+        }
+        if !proof_is_stored(store, &oid)? {
+            return Err(CliError::refused(
+                format!(
+                    "this store cannot return sha256:{}, so this merge cannot cite it",
+                    oid.hex()
+                ),
+                "file the proof first (`gitiup attest push`), or cite nothing: an empty \
+                 `proofs` says the merge believed no attestation, which is honest, while a \
+                 digest nobody can fetch is neither (ADR-0003 D8)",
+            ));
+        }
+        out.push(format!("sha256:{}", oid.hex()));
+    }
+    Ok(out)
+}
+
+/// Whether the store can return the bytes behind a digest.
+fn proof_is_stored(store: &dyn Host, digest: &Oid) -> Result<bool, CliError> {
+    Ok(store
+        .head(digest)
+        .map_err(|e| host_error("read the proof", e))?
+        .is_some())
+}
+
+/// What the local repository can honestly say about "is the branch an ancestor of the
+/// change?" (D8 step 4).
+///
+/// The objects have to be *here*: a store keeps commits as opaque bytes and a ref as a
+/// number, and the question is about parents. A repository that does not hold one of the
+/// two commits produces `Unknown`, which [`merge`] refuses — guessing a fast-forward is
+/// how other people's commits get dropped, and it is the reason this command will not
+/// "just try it" without the objects.
+fn fast_forward(args: &Args, from: &str, to: &str) -> change::Ancestry {
+    let repo = match Repo::discover(args) {
+        Ok(repo) => repo,
+        Err(why) => return change::Ancestry::Unknown(why.message),
+    };
+    for oid in [from, to] {
+        if !repo.holds(oid_hex(oid)) {
+            return change::Ancestry::Unknown(format!("{oid} is not in {}", repo.dir.display()));
+        }
+    }
+    match repo.merge_base(to, from) {
+        Ok(Some(base)) if oid_hex(&base) == oid_hex(from) => change::Ancestry::FastForward,
+        // Anything else — a merge base that is not the branch tip, two histories that
+        // never meet, a git that could not answer — is a divergence. It is the caller's
+        // job to say so rather than to hope.
+        Ok(_) | Err(_) => change::Ancestry::Diverged,
+    }
+}
+
+/// The request both `merge` and `reconcile` need, built the same way.
+fn merge_request<'a>(
+    record: &'a ChangeRecord,
+    who: &'a Identity,
+    proofs: &[String],
+    expected: Option<Oid>,
+    at_us: Option<i64>,
+) -> change::MergeRequest<'a> {
+    let mut request = change::MergeRequest::new(record, &who.key, merger(who))
+        .with_ancestry(change::Ancestry::Unknown("not computed yet".to_string()));
+    if let Some(oid) = expected {
+        request = request.with_expected(oid);
+    }
+    if let Some(at) = at_us {
+        request = request.at(at);
+    }
+    for proof in proofs {
+        request = request.with_proof(proof.clone());
+    }
+    request
+}
+
+/// `--expected-oid`, in the shape the record uses.
+fn expected_oid(text: &str, record: &ChangeRecord) -> Result<Oid, CliError> {
+    let hex = match text.split_once(':') {
+        Some((algo, hex)) if algo == "sha1" || algo == "sha256" => hex,
+        _ => text,
+    };
+    Oid::from_hex(hex).map_err(|e| {
+        CliError::usage(format!(
+            "--expected-oid '{text}' is not an oid: {e}. Spell it the way {} spells its \
+             base ({}), or give the bare hex",
+            record.base.branch, record.base.oid
+        ))
+    })
+}
+
+/// What a merge would do, printed by everything it touched nothing.
+fn print_plan(
+    store: &Opened,
+    record: &ChangeRecord,
+    plan: &change::MergePlan,
+    ancestry: &change::Ancestry,
+    who: &Identity,
+    json: bool,
+    verb: &str,
+) -> Result<(), CliError> {
+    let ancestry_word = ancestry.as_str().to_string();
+    let would_refuse = matches!(ancestry, change::Ancestry::Diverged);
+    if json {
+        print_json(json!({
+            "store": store.what,
+            "dry_run": true,
+            "verb": verb,
+            "would_write": !would_refuse,
+            "refused": would_refuse,
+            "reason": if would_refuse { "not a fast-forward" } else { "" },
+            "change": plan.change_id.as_str(),
+            "attempt": plan.attempt,
+            "change_digest": plan.change_digest,
+            "branch": plan.branch.as_str(),
+            "from": spell_oid(&plan.from, record),
+            "to": spell_oid(&plan.to, record),
+            "store_oid": spell_oid(&plan.store_oid, record),
+            "signed_base": plan.signed_base,
+            "base_overridden": plan.base_overridden,
+            "ancestry": ancestry_word,
+            "ancestry_note": ancestry.why(),
+            "merged_ref": plan.merged_ref.as_str(),
+            "kv": plan.kv,
+            "proofs": plan.proofs,
+            "via": plan.via.as_str(),
+            "merger": { "key_id": who.key_id, "principal": who.principal },
+            "head": record.head,
+            "title": record.title,
+            "notes": plan.notes,
+        }));
+        return if would_refuse {
+            Err(CliError::refused(
+                format!(
+                    "{} is not an ancestor of {}, so this merge would drop commits",
+                    plan.from, plan.to
+                ),
+                "a dry run reports the refusal it would have hit rather than a plan it \
+                 could not carry out (ADR-0003 D8 step 4)",
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    println!("plan    {verb} · nothing written (--dry-run)");
+    println!("  store   {}", store.what);
+    println!(
+        "  change  {} attempt {} · {}",
+        plan.change_id, plan.attempt, record.title
+    );
+    println!(
+        "  branch  {} {} → {}",
+        plan.branch,
+        short_id(&plan.from.to_string()),
+        short_id(&plan.to.to_string())
+    );
+    println!(
+        "  check   {} [{}] {}",
+        short_id(&plan.from.to_string()),
+        ancestry_word,
+        match ancestry {
+            change::Ancestry::FastForward => "a fast-forward: no commits would be dropped",
+            change::Ancestry::Diverged =>
+                "WOULD REFUSE — the branch has commits the change does not",
+            change::Ancestry::Unknown(why) => why.as_str(),
+        }
+    );
+    if plan.base_overridden {
+        println!(
+            "  base    the author signed {}; the CAS expects {}",
+            short_id(&plan.signed_base),
+            short_id(&plan.from.to_string())
+        );
+    }
+    println!(
+        "  record  {}/<digest of the signed record>, advertised by {}",
+        plan.kv, plan.merged_ref
+    );
+    println!(
+        "  proofs  {}",
+        if plan.proofs.is_empty() {
+            "none — the record will say the merge believed nothing".to_string()
+        } else {
+            format!("{} cited, and pinned against retention", plan.proofs.len())
+        }
+    );
+    println!("  signed  {} ({})", short(&who.key_id), who.principal);
+    for note in &plan.notes {
+        eprintln!("note: {note}");
+    }
+    if would_refuse {
+        return Err(CliError::refused(
+            format!(
+                "{} is not an ancestor of {}, so this merge would drop commits",
+                plan.from, plan.to
+            ),
+            "the plan above is what a merge would do, and this is the step it would refuse \
+             at (ADR-0003 D8 step 4)",
+        ));
+    }
+    Ok(())
+}
+
+fn merge(args: &Args) -> Result<(), CliError> {
+    if let Some(()) = args.help(CHANGE_HELP) {
+        return Ok(());
+    }
+    // First, before a store is opened or a key is touched: a flag that asks for a policy
+    // decision has to be refused while there is nothing to make it from.
+    if args.on("--proof-required") {
+        return Err(policy_engine_missing("--proof-required"));
+    }
+    let store = need_store(args)?;
+    let handle = positional_handle(args, "merge")?;
+    let found = resolve_handle(&*store.host, &handle)?;
+    let id = found.change_id.clone();
+    let record = head_record(&*store.host, &id)?;
+    let who = Identity::here(args)?;
+    let proofs = cited_proofs(&*store.host, args)?;
+    let expected = match args.get("--expected-oid") {
+        Some(text) => Some(expected_oid(text, &record)?),
+        None => None,
+    };
+    let request = merge_request(&record, &who, &proofs, expected, None);
+    // The plan is everything a merge can learn from the store without writing: this is
+    // the fresh read that is the lease, and the same call a dry run stops at.
+    let plan = change::plan_merge(&*store.host, &request).map_err(store_refusal)?;
+    let ancestry = fast_forward(
+        args,
+        &spell_oid(&plan.from, &record),
+        &spell_oid(&plan.to, &record),
+    );
+    // The one case where gitiup does not move the branch itself: a change a forge
+    // carries is merged by the forge, whose merge is atomic and reviewed, and whose
+    // ref write a bucket is only ever imitating (ADR-0003 D10). `--json` says which
+    // kind of merge happened, because they are not the same promise.
+    let forge = forge_remote(args)?;
+    let on_forge = forge.zip(
+        (record.origin.kind == change::OriginKind::Pull)
+            .then_some(record.origin.number)
+            .flatten(),
+    );
+    if let Some((forge, number)) = on_forge {
+        if args.on("--dry-run") {
+            return print_forge_plan(&store, args, &record, &plan, number, &proofs);
+        }
+        let outcome = merge_on_forge(&store, args, &plan, request.via_forge(), number, &forge)?;
+        return print_outcome(&store, &record, &outcome, &who, args.json(), Some(number));
+    }
+    if args.on("--dry-run") {
+        return print_plan(
+            &store,
+            &record,
+            &plan,
+            &ancestry,
+            &who,
+            args.json(),
+            "merge",
+        );
+    }
+    let outcome = change::merge(&*store.host, &request.with_ancestry(ancestry.clone()))
+        .map_err(store_refusal)?;
+    print_outcome(&store, &record, &outcome, &who, args.json(), None)
+}
+
+/// A forge and the credentials it asked for, kept together so the forge path reads as one
+/// thing rather than two tuple elements passed side by side.
+#[derive(Clone)]
+struct RemoteAndProfile {
+    remote: RemoteConfig,
+    profile: Option<CredentialProfile>,
+}
+
+/// What a merge did, in whichever form was asked for.
+///
+/// One printer for all three ways a merge happens — the CAS write, the reconcile of a move
+/// that already happened, and a forge's merge — because the facts worth printing are the
+/// same in each, and a third copy of the block is how `--json` and the text part ways.
+fn print_outcome(
+    store: &Opened,
+    record: &ChangeRecord,
+    outcome: &change::MergeOutcome,
+    who: &Identity,
+    json: bool,
+    pull: Option<u64>,
+) -> Result<(), CliError> {
+    if json {
+        let mut value = merge_json(store, record, outcome, who);
+        if let Some(number) = pull {
+            value["pull"] = json!(number);
+        }
+        print_json(value);
+        return Ok(());
+    }
+    println!(
+        "{}  {} attempt {}",
+        if outcome.moved { "merged" } else { "recorded" },
+        outcome.plan.change_id,
+        outcome.plan.attempt
+    );
+    println!("  store    {}", store.what);
+    println!(
+        "  branch   {} {} → {}  [{}]",
+        outcome.plan.branch,
+        short_id(&spell_oid(&outcome.plan.from, record)),
+        short_id(&spell_oid(&outcome.plan.to, record)),
+        if outcome.moved {
+            format!(
+                "cas {}",
+                short_id(&spell_oid(&outcome.plan.store_oid, record))
+            )
+        } else {
+            "untouched by this call".to_string()
+        },
+    );
+    println!(
+        "  via      {}",
+        match outcome.plan.via {
+            change::Via::Store if outcome.moved => "store (gitiup moved the ref under CAS)",
+            change::Via::Store => "store (the move had already happened; this is its record)",
+            change::Via::Forge => "forge (the forge moved it; gitiup recorded where it landed)",
+        }
+    );
+    if let Some(number) = pull {
+        println!("  pull     {number}");
+    }
+    println!("  head     {} · {}", short_id(&record.head), record.title);
+    println!(
+        "  record   {} ({} bytes) · {}",
+        outcome.plan.kv, outcome.size, outcome.reference
+    );
+    println!(
+        "  digests  change {} · merge {}",
+        short_id(&outcome.plan.change_digest),
+        short_id(&tagged(outcome.record_digest))
+    );
+    println!(
+        "  proofs   {}",
+        if outcome.proofs_pinned == 0 {
+            "none believed — the record says so".to_string()
+        } else {
+            format!(
+                "{} believed, cited as digests and pinned so retention keeps them",
+                outcome.proofs_pinned
+            )
+        }
+    );
+    println!("  signed   {} ({})", short(&who.key_id), who.principal);
+    for note in &outcome.plan.notes {
+        eprintln!("note: {note}");
+    }
+    Ok(())
+}
+
+/// `gitiup change reconcile` — the retry for D8's failure window, and the way a forge's
+/// merge gets a record.
+fn reconcile(args: &Args) -> Result<(), CliError> {
+    if let Some(()) = args.help(CHANGE_HELP) {
+        return Ok(());
+    }
+    let store = need_store(args)?;
+    let handle = positional_handle(args, "reconcile")?;
+    let found = resolve_handle(&*store.host, &handle)?;
+    let id = found.change_id.clone();
+    let record = head_record(&*store.host, &id)?;
+    let who = Identity::here(args)?;
+    let proofs = cited_proofs(&*store.host, args)?;
+    let expected = match args.get("--expected-oid") {
+        Some(text) => Some(expected_oid(text, &record)?),
+        None => None,
+    };
+    let via = match args.get("--via").unwrap_or("store") {
+        "store" => change::Via::Store,
+        "forge" => change::Via::Forge,
+        other => {
+            return Err(CliError::usage(format!(
+                "--via '{other}' is not store or forge"
+            )));
+        }
+    };
+    let mut request = merge_request(&record, &who, &proofs, expected, None);
+    if via == change::Via::Forge {
+        request = request.via_forge();
+    }
+    if let Some(text) = args.get("--landed") {
+        request = request.with_landing(expected_oid(text, &record)?);
+    }
+    if args.on("--dry-run") {
+        println!("plan    reconcile · nothing written (--dry-run)");
+        println!("  store   {}", store.what);
+        println!(
+            "  change  {} attempt {} · {}",
+            id, record.attempts.index, record.title
+        );
+        println!(
+            "  record  the branch already carries {}; write kv/merge/<digest> and advertise \
+             it by {}",
+            short_id(&record.head),
+            change::merged_ref(&id)
+        );
+        println!("  via     {via}");
+        return Ok(());
+    }
+    let outcome = change::record_merge(&*store.host, &request).map_err(store_refusal)?;
+    print_outcome(&store, &record, &outcome, &who, args.json(), None)
+}
+
+/// The merge outcome as data: what moved, where the record is, and who says so.
+fn merge_json(
+    store: &Opened,
+    record: &ChangeRecord,
+    outcome: &change::MergeOutcome,
+    who: &Identity,
+) -> Value {
+    json!({
+        "store": store.what,
+        "change": outcome.plan.change_id.as_str(),
+        "attempt": outcome.plan.attempt,
+        "change_digest": outcome.plan.change_digest,
+        "branch": outcome.plan.branch.as_str(),
+        "from": spell_oid(&outcome.plan.from, record),
+        "to": spell_oid(&outcome.plan.to, record),
+        "moved": outcome.moved,
+        "via": outcome.plan.via.as_str(),
+        "atomicity": match outcome.plan.via {
+            change::Via::Store => "a conditional write: the CAS says nobody else moved the \
+                                    branch, and the ancestry test says nothing was dropped",
+            change::Via::Forge => "the forge's own merge: atomic and reviewed, which a \
+                                   bucket's conditional write cannot promise",
+        },
+        "merged_ref": outcome.reference.as_str(),
+        "record_digest": tagged(outcome.record_digest),
+        "kv": outcome.plan.kv,
+        "size": outcome.size,
+        "proofs": outcome.record.proofs,
+        "proofs_pinned": outcome.proofs_pinned,
+        "policy_digest": outcome.record.policy_digest,
+        "merged_at": rfc3339(outcome.record.merged_at_us),
+        "merged_at_us": outcome.record.merged_at_us,
+        "merger": { "key_id": who.key_id, "principal": who.principal },
+        "head": record.head,
+        "title": record.title,
+        "notes": outcome.plan.notes,
+    })
+}
+
+/// The change's current record, read through the ref that advertises it (D8 step 1), so
+/// a record that lies about its digest or its head is refused before any branch is
+/// touched — 8 for a digest, 7 for a signature, 6 for a store binding.
+fn head_record(host: &dyn Host, id: &ChangeId) -> Result<ChangeRecord, CliError> {
+    let fetched = change::change_at(host, &change::change_head_ref(id)).map_err(store_refusal)?;
+    match fetched.record {
+        StoredRecord::Change(record) => Ok(record),
+        other => Err(CliError::refused(
+            format!(
+                "{} holds a {} record",
+                fetched.reference,
+                other.record_type()
+            ),
+            "a change's head holds a gitiup-change-1 record",
+        )),
+    }
+}
+
+/// The change the command line named.
+fn positional_handle(args: &Args, verb: &str) -> Result<String, CliError> {
+    args.positional
+        .first()
+        .cloned()
+        .or_else(|| args.get("--change").map(str::to_string))
+        .ok_or_else(|| {
+            CliError::usage(format!(
+                "say which change to {verb}: `gitiup change {verb} <ID>` (a change id, or \
+                 4+ hex of one)"
+            ))
+        })
+}
+
+/// Spell an oid the way the record spells its own, so a message and a comparison read as
+/// the same kind of thing (ADR-0001 D2).
+fn spell_oid(oid: &Oid, record: &ChangeRecord) -> String {
+    format_oid(oid, &record.base.oid)
+}
+
+// ---------------------------------------------------------------------------
+// the forge's own merge (ADR-0003 D10)
+// ---------------------------------------------------------------------------
+
+/// The forge a named `--remote` points at, with the credentials it wants.
+///
+/// Only a `gitiup.toml` remote can be a forge — `--store` names a directory — and the
+/// classification is the composition root's, so nothing in this file knows what a forge
+/// *is*; it only knows that some remotes have a merge button and some do not.
+fn forge_remote(args: &Args) -> Result<Option<RemoteAndProfile>, CliError> {
+    let named = match args.get("--remote") {
+        Some(name) => name.to_string(),
+        None => return Ok(None),
+    };
+    let Some((_path, config)) =
+        Config::load_default().map_err(|e| CliError::io(format!("gitiup.toml: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let remote = config.remote_or_default(Some(&named)).map_err(|e| {
+        CliError::refused(
+            format!("gitiup.toml: {e}"),
+            "name a remote that exists, or use --store <dir>",
+        )
+    })?;
+    if !crate::remotes::wants_forge(remote) {
+        return Ok(None);
+    }
+    Ok(Some(RemoteAndProfile {
+        remote: remote.clone(),
+        profile: config.credential_profile(remote).cloned(),
+    }))
+}
+
+/// Ask the forge to merge its own change, then write the record of what it did.
+///
+/// gitiup does not touch the branch here. The forge merged it — atomically, under its own
+/// protection rules — and the record says `via: forge` and attests only what the forge
+/// reports, which is the whole of ADR-0003 D10's budget for a pull request.
+fn merge_on_forge(
+    store: &Opened,
+    args: &Args,
+    plan: &change::MergePlan,
+    mut request: change::MergeRequest<'_>,
+    number: u64,
+    forge: &RemoteAndProfile,
+) -> Result<change::MergeOutcome, CliError> {
+    let landing = crate::remotes::forge_merge(
+        &forge.remote,
+        forge.profile.as_ref(),
+        number,
+        &plan.to,
+        &merge_method(args)?,
+    )?;
+    // gitiup did not move the branch; the forge did, to a commit no attestation can cover
+    // unless the forge fast-forwarded. So the record is a reconcile with `via: forge`, and
+    // it names the commit the store now holds rather than the one a fast-forward would
+    // have written (ADR-0003 D10).
+    request = request.via_forge().with_landing(landing);
+    change::record_merge(&*store.host, &request).map_err(store_refusal)
+}
+
+/// `--merge-method`, in the words the forge uses.
+///
+/// The default is `ff`, because gitiup's whole merge story is a fast-forward: a merge
+/// commit exists only after the merge, so no attestation can cover it. A forge whose
+/// settings forbid one is told so by the forge, and the operator can say otherwise out
+/// loud — at the cost, printed in the hint, of a merge no proof covers.
+fn merge_method(args: &Args) -> Result<String, CliError> {
+    let method = args.get("--merge-method").unwrap_or("ff").to_string();
+    if matches!(method.as_str(), "ff" | "merge" | "squash" | "rebase") {
+        return Ok(method);
+    }
+    Err(CliError::usage(format!(
+        "--merge-method '{method}' is not ff, merge, squash or rebase"
+    )))
+}
+
+/// The dry run of a forge-backed change: the plan is "ask the forge", and the CAS a store
+/// merge would have made is named as what it is — an imitation of this.
+fn print_forge_plan(
+    store: &Opened,
+    args: &Args,
+    record: &ChangeRecord,
+    plan: &change::MergePlan,
+    number: u64,
+    proofs: &[String],
+) -> Result<(), CliError> {
+    let atomicity = "the forge's own merge: atomic and reviewed, which a bucket's \
+                     conditional write cannot promise";
+    if args.json() {
+        print_json(json!({
+            "store": store.what,
+            "dry_run": true,
+            "verb": "merge",
+            "would_write": true,
+            "change": plan.change_id.as_str(),
+            "attempt": plan.attempt,
+            "pull": number,
+            "via": "forge",
+            "atomicity": atomicity,
+            "branch": plan.branch.as_str(),
+            "expect": spell_oid(&plan.to, record),
+            "merged_ref": plan.merged_ref.as_str(),
+            "kv": plan.kv,
+            "proofs": proofs,
+            "notes": plan.notes,
+        }));
+        return Ok(());
+    }
+    println!("plan    merge · nothing written (--dry-run)");
+    println!("  store   {}", store.what);
+    println!(
+        "  change  {} attempt {} · {}",
+        plan.change_id, plan.attempt, record.title
+    );
+    println!(
+        "  pull    {number} — the forge's merge is the merge; gitiup will not touch {}",
+        plan.branch
+    );
+    println!(
+        "  expect  the forge refuses unless the head is still {}",
+        short_id(&spell_oid(&plan.to, record))
+    );
+    println!(
+        "  record  {}/<digest of the signed record>, advertised by {}",
+        plan.kv, plan.merged_ref
+    );
+    for note in &plan.notes {
+        eprintln!("note: {note}");
+    }
     Ok(())
 }
 

@@ -16,7 +16,7 @@ Two goals, one tool:
 
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
-| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc` files a signed attestation in a host store and reads it back, `gitiup change new/submit/list/show` drafts and publishes a signed change record to any store, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change — the only crate that reads files, so the format crate can stay I/O-free |
+| `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc` files a signed attestation in a host store and reads it back, `gitiup change new/submit/list/show` drafts and publishes a signed change record to any store and `change merge` merges one under compare-and-swap, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change — the only crate that reads files, so the format crate can stay I/O-free |
 | `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), `gitiup.toml` remote config, and where attestations live — `kv/attestation/<digest>` advertised by `refs/attestations/<subject>/<digest>`, with the retention policy (`max age`, `max per commit`) and the rule above it: an object another live ref still points at is never pruned |
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
@@ -56,10 +56,11 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   which order, the exit codes a hook branches on (`0` accepted, `6` policy, `7` bad
   signature, `8` digest mismatch), the machine-readable verdict a merge gate reads, and
   what verification deliberately refuses to do.
-* [Contributing without a forge](docs/changes.md) — `gitiup change new|submit|list|show`:
-  the signed change record a stranger publishes when there is no pull request, what each
-  command writes and in which order, why a moved base is an exit code, and why a re-submit
-  is an attempt rather than an overwrite.
+* [Contributing without a forge](docs/changes.md) — `gitiup change new|submit|list|show`
+  and `change merge`: the signed change record a stranger publishes when there is no pull
+  request, what each command writes and in which order, why a moved base is an exit code,
+  why a re-submit is an attempt rather than an overwrite, and what a merge records about
+  itself when the branch has already moved.
 * [Signing keys and identities](docs/signing-keys.md) — where a private key lives
   (`gitiup key gen`, an age + scrypt container), how an existing ssh or gpg key is
   imported without ever being copied, what an identity claim signs and why, and which

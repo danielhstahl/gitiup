@@ -43,6 +43,23 @@
 //! exactly once and abandoned exactly once: the second attempt is a conflict, not a
 //! surprise.
 //!
+//! # What a merge is
+//!
+//! A merge is a **compare-and-swap fast-forward of a branch**, and then a signed record of
+//! it ([`plan_merge`] and [`merge`]): `refs/heads/<base>` moves from the base the author
+//! signed to the attempt's head, and `kv/merge/<hex>` plus the create-only
+//! `refs/changes/<id>/merged` say who did it, which attempt they merged and which proofs
+//! they believed. A stale base is refused with both oids, because "pull first" is the only
+//! useful advice; a non-fast-forward is refused, because a merge commit exists only after
+//! the merge and no proof can cover it; and a refusal from the store itself — the
+//! non-owner credential, the hook that says no — is passed through unedited, because the
+//! store answered the question that was asked.
+//!
+//! The branch moves before the record does, so the one crash that can happen leaves a
+//! detectable silence rather than a false statement: [`unrecorded_merge`] finds it and
+//! [`record_merge`] closes it (and is also how a forge's own merge gets a record, with
+//! `via: forge`).
+//!
 //! # Refusing, not counting twice
 //!
 //! Every write here is create-only or compare-and-swap. Publishing the same bytes
@@ -1864,6 +1881,817 @@ fn check_attempt_matches(
         .with_hint("a merge or abandon record names an attempt, and must name the one it saw"));
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------------
+// merging (ADR-0003 D8): a CAS move of the branch, then the record of it
+// --------------------------------------------------------------------------
+
+/// Who moved the branch (D7's `via`, D8's two ways to merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// gitiup moved `refs/heads/<base>` with a compare-and-swap.
+    Store,
+    /// A forge moved it, and this record was written afterwards by whoever ran
+    /// `change reconcile` (D10: a forge's merge button *is* the merge).
+    Forge,
+}
+
+impl Via {
+    /// The `via` string the record carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Store => "store",
+            Via::Forge => "forge",
+        }
+    }
+
+    /// Read the `via` string back, refusing anything else: a merge record that says
+    /// neither `store` nor `forge` is a record this build cannot explain (D7).
+    pub fn parse(text: &str) -> HostResult<Via> {
+        match text {
+            "store" => Ok(Via::Store),
+            "forge" => Ok(Via::Forge),
+            other => Err(HostError::invalid(
+                "via",
+                format!("'{other}' is neither 'store' nor 'forge'"),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the caller can honestly say about `from` being an ancestor of `to` (D8 step 4).
+///
+/// The test is not computed *here*: answering it needs the commit objects, and a store
+/// holds those as opaque bytes while the caller holds them in a repository. So the
+/// caller — the only party that can look — says which of these three it knows, and
+/// [`merge`] refuses `Unknown` rather than guessing. That is the whole of C4: the CAS
+/// says nobody moved the branch, the ancestry test says nobody's work is dropped, and a
+/// merge with neither is a force-push with good manners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ancestry {
+    /// `from` is an ancestor of `to`, checked on objects the caller has.
+    FastForward,
+    /// `from` is not an ancestor of `to`: the branch has moved somewhere the change does
+    /// not include.
+    Diverged,
+    /// The caller could not tell, and says why. Refused, not waved through.
+    Unknown(String),
+}
+
+impl Ancestry {
+    /// A stable word for `--json`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Ancestry::FastForward => "fast-forward",
+            Ancestry::Diverged => "diverged",
+            Ancestry::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The caller's reason, when there is no verdict.
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            Ancestry::Unknown(why) => Some(why.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Everything [`merge`] needs that a store cannot decide for itself.
+///
+/// Built with [`MergeRequest::new`] plus a few `with_*` calls; the fields are public so a
+/// caller can build one from its own arguments. (`Signer` is not `Debug`, so neither is
+/// this: describe the request by its plan instead.)
+#[derive(Clone)]
+pub struct MergeRequest<'a> {
+    /// The attempt being merged, already read and verified (D8 step 1).
+    pub record: &'a ChangeRecord,
+    /// The key that signs the merge record: whoever's credential moved the branch.
+    pub signer: &'a dyn Signer,
+    /// The `author` of the merge record — the merger, not the change's author (D7).
+    pub merger: Author,
+    /// The actor to record on the ref writes.
+    pub actor: Actor,
+    /// What the branch must hold, overriding the record's own `base.oid` (D8 step 3).
+    pub expected: Option<Oid>,
+    /// The caller's answer to "is this a fast-forward?" (D8 step 4).
+    pub ancestry: Ancestry,
+    /// Attestation record digests this merge believed, in the order believed (D8).
+    pub proofs: Vec<String>,
+    /// Reserved for Epic 2; `None` means no policy was applied, and the record says so.
+    pub policy_digest: Option<String>,
+    /// Store or forge (D7's `via`).
+    pub via: Via,
+    /// The claimed merge time in microseconds; `None` is now.
+    pub at_us: Option<i64>,
+    /// Where a forge's merge left the branch, when that is not the attempt's head
+    /// ([`MergeRequest::with_landing`]).
+    pub landed: Option<Oid>,
+}
+
+impl<'a> MergeRequest<'a> {
+    /// The minimal request: this attempt, signed by this key. The ancestry starts
+    /// `Unknown`, which is itself a refusal — every caller has to answer it with
+    /// [`MergeRequest::with_ancestry`], because a merge that cannot say it is a
+    /// fast-forward is not a merge.
+    pub fn new(record: &'a ChangeRecord, signer: &'a dyn Signer, merger: Author) -> Self {
+        let actor = Actor::from(short_key(&merger.key_id));
+        MergeRequest {
+            record,
+            signer,
+            merger,
+            actor,
+            expected: None,
+            ancestry: Ancestry::Unknown("the caller did not say".to_string()),
+            proofs: Vec::new(),
+            policy_digest: None,
+            via: Via::Store,
+            at_us: None,
+            landed: None,
+        }
+    }
+
+    /// Expect the branch to hold `oid` rather than the record's `base.oid`.
+    pub fn with_expected(mut self, oid: Oid) -> Self {
+        self.expected = Some(oid);
+        self
+    }
+
+    /// Say what the caller knows about the ancestry.
+    pub fn with_ancestry(mut self, ancestry: Ancestry) -> Self {
+        self.ancestry = ancestry;
+        self
+    }
+
+    /// Cite one proof digest (D8: digests, never copies, in the order believed).
+    pub fn with_proof(mut self, digest: impl Into<String>) -> Self {
+        self.proofs.push(digest.into());
+        self
+    }
+
+    /// The actor to record on the writes.
+    pub fn with_actor(mut self, actor: impl Into<Actor>) -> Self {
+        self.actor = actor.into();
+        self
+    }
+
+    /// Claim a merge time (microseconds) instead of the clock.
+    pub fn at(mut self, us: i64) -> Self {
+        self.at_us = Some(us);
+        self
+    }
+
+    /// This is a forge's merge being recorded, not a CAS write (D10).
+    pub fn via_forge(mut self) -> Self {
+        self.via = Via::Forge;
+        self
+    }
+
+    /// The policy digest Epic 2 would have supplied, if there were one.
+    pub fn with_policy(mut self, digest: impl Into<String>) -> Self {
+        self.policy_digest = Some(digest.into());
+        self
+    }
+
+    /// Say where a forge's merge left the branch, when that is not the attempt's head
+    /// (a forge's merge commit, for instance).
+    ///
+    /// Only [`record_merge`] asks, and only it may answer: the branch already moved, so
+    /// this is a report of where it landed, never a value to write (D10).
+    pub fn with_landing(mut self, oid: Oid) -> Self {
+        self.landed = Some(oid);
+        self
+    }
+}
+
+/// What a merge *would* do, computed before anything is written — which is what makes
+/// `--dry-run` a plan and not a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePlan {
+    /// Which change.
+    pub change_id: ChangeId,
+    /// Which attempt of it.
+    pub attempt: u32,
+    /// The `change_digest` the merge record will cite (D4: the attempt's, never the
+    /// merge's own body digest).
+    pub change_digest: String,
+    /// The branch the CAS moves.
+    pub branch: RefName,
+    /// What the CAS expects to find — the record's `base.oid`, or the caller's
+    /// `--expected-oid`.
+    pub from: Oid,
+    /// What the CAS writes: the attempt's `head`.
+    pub to: Oid,
+    /// What the branch holds right now, which the comparison above just proved is `from`.
+    pub store_oid: Oid,
+    /// The `base.oid` the author signed, which is not `from` when the caller overrode
+    /// it — a fact the output has to show rather than hide.
+    pub signed_base: String,
+    /// Whether `from` came from the caller and not from the record.
+    pub base_overridden: bool,
+    /// The create-only ref that will advertise the merge record.
+    pub merged_ref: RefName,
+    /// Where the record will be filed: `kv/merge/<hex>` once the bytes exist, and the
+    /// namespace alone in a dry run, which has no bytes to hash yet.
+    pub kv: String,
+    /// The proof digests that will be cited.
+    pub proofs: Vec<String>,
+    /// Store or forge.
+    pub via: Via,
+    /// Anything the caller should say out loud alongside the plan.
+    pub notes: Vec<String>,
+    /// Whether a forge, not gitiup, made the merge.
+    ///
+    /// The two are not the same promise — a forge's merge is atomic and reviewed, a
+    /// bucket's is a conditional write — so a machine reading this should not have to
+    /// guess which one happened from the transport.
+    pub via_forge: bool,
+    /// Whether the branch was already where the change wanted (D8's failure window, or a
+    /// forge's merge) rather than moved by this call.
+    pub reconciled: bool,
+}
+
+impl MergePlan {
+    /// The same facts as the words a person reads.
+    pub fn summary(&self) -> String {
+        format!(
+            "move {} {} → {}, then file the merge record at {}",
+            self.branch, self.from, self.to, self.kv
+        )
+    }
+}
+
+/// What [`merge`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The plan that was executed.
+    pub plan: MergePlan,
+    /// Whether this call moved the branch. `false` means the branch already stood where
+    /// the change wanted and only the record was missing ([`record_merge`]).
+    pub moved: bool,
+    /// The signed merge record.
+    pub record: MergeRecord,
+    /// `sha256(record bytes)` — the `kv/merge/<hex>` key.
+    pub record_digest: Oid,
+    /// The ref advertising it.
+    pub reference: RefName,
+    /// Bytes stored.
+    pub size: u64,
+    /// How many cited proofs retention must now keep ([`proof_pins`]).
+    pub proofs_pinned: usize,
+}
+
+/// Every step of D8 up to and including the comparison, and nothing after it: the
+/// read-only half of a merge, which is also what `--dry-run` prints.
+///
+/// Refusals, in the order they are checked — which is *most specific fact first* rather
+/// than D8's step order, because the reader has to be told the true reason:
+///
+/// | check | refusal |
+///|-------|---------|
+///| the host cannot CAS | [`HostError::UnsupportedCas`], exit 6 |
+///| the record is not what it claims | its own code (6/7/8) |
+///| the branch does not exist | 6, naming the branch |
+///| the change is already merged or abandoned | [`HostError::Conflict`], 6 |
+///| the branch already is the change's head | 6, pointing at `change reconcile` |
+///| the branch is not the expected oid | 6, naming **both** oids — "pull first" |
+///
+/// The last two are ordered that way because D8's failure window produces both conditions
+/// at once: a branch sitting at the change's head has by definition left its base. Saying
+/// "stale base, pull first" about a change that is already merged and merely missing its
+/// record would send the reader to rebase work they have already done.
+pub fn plan_merge(host: &dyn Host, request: &MergeRequest<'_>) -> HostResult<MergePlan> {
+    let record = request.record;
+    require_cas(host, "merge a change")?;
+    // D11 before the store: a record that cannot stand up to a reader must not be
+    // half-merged.
+    record.verify()?;
+    if request.proofs.len() > MAX_PROOFS {
+        return Err(HostError::invalid(
+            "merge",
+            format!(
+                "{} proofs is more than the {MAX_PROOFS} a merge record may cite",
+                request.proofs.len()
+            ),
+        ));
+    }
+    for proof in &request.proofs {
+        check_digest(proof, "proofs")?;
+    }
+    let branch = RefName::new(&record.base.branch)?;
+    let signed_base = record.base.oid.clone();
+    let base_oid = oid_of(&signed_base, "base.oid")?;
+    let to = oid_of(&record.head, "head")?;
+    let from = request.expected.unwrap_or(base_oid);
+
+    // Step 2: the fresh read. This read *is* the lease — everything after it is a CAS
+    // against exactly what was just seen.
+    let store = host.get_ref(&branch)?.ok_or_else(|| {
+        HostError::invalid(
+            "branch",
+            format!("the store has no {} to merge into", record.base.branch),
+        )
+        .with_hint(
+            "a merge is a compare-and-swap of a branch the store has; publish the branch \
+             first, which is the owner's act and is done with plain `git push`",
+        )
+    })?;
+    // D7's state first, ahead of the base comparison: "this change is already merged" is
+    // a truer and more useful sentence than "your base is stale" about the same store
+    // state, because a merge whose record failed to land leaves the branch at the change's
+    // head *and* the base looking stale. A change is closed exactly once (D7).
+    let merged = merged_ref(&record.change_id);
+    if let Some(existing) = host.get_ref(&merged)? {
+        return Err(
+            HostError::conflict(merged.clone(), None, Some(existing.oid)).with_hint(format!(
+                "change {} is already merged ({}); un-doing a merge is a new change, not a \
+                 second one (ADR-0003 D7)",
+                record.change_id,
+                existing.oid.short_default()
+            )),
+        );
+    }
+    if let Some(abandoned) = host.get_ref(&abandoned_ref(&record.change_id))? {
+        return Err(HostError::conflict(
+            abandoned_ref(&record.change_id),
+            None,
+            Some(abandoned.oid),
+        )
+        .with_hint(format!(
+            "change {} was abandoned ({}); a change is closed for good, and the work \
+                     it wanted is a new change against the new base",
+            record.change_id,
+            abandoned.oid.short_default()
+        )));
+    }
+    if to == store.oid {
+        return Err(HostError::invalid(
+            "merge",
+            format!(
+                "{} already is {}, so there is nothing to merge",
+                record.base.branch,
+                spell(&store.oid, &signed_base)
+            ),
+        )
+        .with_hint(format!(
+            "if this change was merged and its record did not land, `gitiup change \
+             reconcile {}` writes the record for the move the store already has (ADR-0003 \
+             D8's failure window)",
+            record.change_id
+        )));
+    }
+    // Step 3, spelled with both oids because the only useful advice is "pull first" and
+    // the person reading it has to know which of the two moved.
+    if store.oid != from {
+        return Err(HostError::invalid(
+            "stale base",
+            format!(
+                "{} is {} in this record and {} in the store",
+                record.base.branch,
+                spell(&from, &signed_base),
+                spell(&store.oid, &signed_base)
+            ),
+        )
+        .with_hint(format!(
+            "pull first: the branch moved, and merging this attempt would drop whatever \
+             moved it. Rebase onto {} (or re-draft from it) and submit a new attempt, or \
+             name the oid you are really standing on with --expected-oid (ADR-0003 D8 \
+             step 3)",
+            spell(&store.oid, &signed_base)
+        )));
+    }
+
+    let mut notes = Vec::new();
+    if from != base_oid {
+        notes.push(format!(
+            "the base was named by the caller: the author signed {} and the CAS expects {}",
+            spell(&base_oid, &signed_base),
+            spell(&from, &signed_base)
+        ));
+    }
+    if record.origin.kind == OriginKind::Pull {
+        notes.push(format!(
+            "this change is carried by {}; on a forge the forge's own merge is the merge, \
+             and the record says `via: forge`",
+            record
+                .origin
+                .number
+                .map(|number| format!("pull request {number}"))
+                .unwrap_or_else(|| "a pull request".to_string())
+        ));
+    }
+    Ok(MergePlan {
+        change_id: record.change_id.clone(),
+        attempt: record.attempts.index,
+        change_digest: record.change_digest()?,
+        branch,
+        from,
+        to,
+        store_oid: store.oid,
+        signed_base,
+        base_overridden: from != base_oid,
+        merged_ref: merged,
+        // A dry run has no bytes to hash yet, so it names the namespace it will land in.
+        kv: format!("kv/{}", MERGE_NAMESPACE.as_str()),
+        proofs: request.proofs.clone(),
+        via: request.via,
+        notes,
+        via_forge: request.via == Via::Forge,
+        reconciled: false,
+    })
+}
+
+/// Merge one attempt: a compare-and-swap fast-forward of the branch, then the signed
+/// record of it (D8 steps 4–7, in that order and for the reason given there).
+///
+/// The branch moves first and the record second, deliberately. A crash in between leaves
+/// a branch that moved without a record, which is a *detectable* silence (D7's
+/// `unrecorded` flag, closed by [`record_merge`]); the reverse order would leave a signed
+/// record claiming a merge that never happened — a false statement by an honest key, and
+/// invisible from the store. So a failure at step 7 is reported with the exact retry
+/// rather than papered over as "rolled back": there is no transaction to roll back with.
+///
+/// A refusal from the store itself — a non-owner credential, a hook that says no — is
+/// passed through **unedited**: same kind, same message, same exit code. The store
+/// answered the question that was asked, and rewriting "not allowed to update
+/// refs/heads/main" into an I/O error loses the only useful sentence in the run.
+pub fn merge(host: &dyn Host, request: &MergeRequest<'_>) -> HostResult<MergeOutcome> {
+    let plan = plan_merge(host, request)?;
+    // Step 4: the fast-forward, on the caller's objects.
+    match &request.ancestry {
+        Ancestry::FastForward => {}
+        Ancestry::Diverged => {
+            return Err(HostError::invalid(
+                "not a fast-forward",
+                format!(
+                    "{} is not an ancestor of {}, so merging would drop commits",
+                    plan.from, plan.to
+                ),
+            )
+            .with_hint(
+                "rebase the change onto the branch, or merge the branch into the change and \
+                 re-submit it as a new attempt; gitiup merges by fast-forward only, because \
+                 a merge commit exists only after the merge and no proof can cover it \
+                 (ADR-0003 D8)",
+            ));
+        }
+        Ancestry::Unknown(why) => {
+            return Err(HostError::invalid(
+                "ancestry",
+                format!(
+                    "nothing says whether {} is an ancestor of {}: {why}",
+                    plan.from, plan.to
+                ),
+            )
+            .with_hint(
+                "refusing to guess a fast-forward is the point: fetch the change into a \
+                 repository — `git fetch <remote> 'refs/changes/<id>/*'` carries the record \
+                 and the commits in one packfile — and run the merge there",
+            ));
+        }
+    }
+
+    // Step 6: the fact. No wrapping: a refusal here is the store's own sentence.
+    host.update_ref_cas(
+        &RefUpdate::replace(plan.branch.clone(), plan.from, plan.to)
+            .with_actor(request.actor.clone())
+            .with_message(format!(
+                "merge {} attempt {} ({} → {})",
+                plan.change_id, plan.attempt, plan.from, plan.to
+            )),
+    )?;
+
+    // Step 7: its record. A failure here is the named, incomplete state, not a rollback.
+    let record = build_merge_record(host, request, &plan).map_err(|why| {
+        HostError::invalid(
+            "incomplete merge",
+            format!(
+                "{} moved {} → {}, and the merge record did not land: {why}",
+                plan.branch, plan.from, plan.to
+            ),
+        )
+        .with_exit_code(why.exit_code())
+        .with_hint(format!(
+            "the branch has the merge and the store does not have its record yet: `gitiup \
+             change reconcile {}` writes the record for a move the store already has \
+             (ADR-0003 D8)",
+            plan.change_id
+        ))
+    })?;
+    let size = record.canonical_bytes()?.len() as u64;
+    let record_digest = record.digest()?;
+    let reference = publish_merge_record(host, &record, &request.actor)?;
+    let mut plan = plan;
+    plan.kv = kv_key(&MERGE_NAMESPACE, &record_digest);
+    Ok(MergeOutcome {
+        proofs_pinned: record.proofs.len(),
+        moved: true,
+        size,
+        plan,
+        record_digest,
+        reference,
+        record,
+    })
+}
+
+/// Write the record for a merge the store already has: `refs/heads/<base>` already stands
+/// at the attempt's head and there is no `merged` ref (D7's `unrecorded`, D8's failure
+/// window — and the shape a forge's merge is recorded with, `via: forge`).
+///
+/// Unlike [`merge`] this writes no branch: the fact already happened, and a record that
+/// moved the branch it was only meant to describe would be a record about something that
+/// did not happen the way it says.
+pub fn record_merge(host: &dyn Host, request: &MergeRequest<'_>) -> HostResult<MergeOutcome> {
+    let record = request.record;
+    require_cas(host, "record a merge")?;
+    record.verify()?;
+    for proof in &request.proofs {
+        check_digest(proof, "proofs")?;
+    }
+    let branch = RefName::new(&record.base.branch)?;
+    let to = oid_of(&record.head, "head")?;
+    let signed_base = record.base.oid.clone();
+    let store = host.get_ref(&branch)?.ok_or_else(|| {
+        HostError::invalid("branch", format!("the store has no {}", record.base.branch))
+            .with_hint("there is no move to record without a branch that could have moved")
+    })?;
+    let from = request
+        .expected
+        .unwrap_or(oid_of(&signed_base, "base.oid")?);
+    // A store merge moved the branch to the attempt's head, so that is what a record of
+    // it has to find. A forge merge moved it to whatever the forge builds — its own
+    // merge commit, usually — so the caller reports where it landed and the record says
+    // that, because a merge record may only state what the store shows (D10).
+    let to = match request.landed {
+        Some(landed) if request.via == Via::Forge => {
+            if store.oid != landed {
+                return Err(HostError::invalid(
+                    "nothing to reconcile",
+                    format!(
+                        "{} is {} in the store and the forge said it landed at {}",
+                        record.base.branch,
+                        spell(&store.oid, &signed_base),
+                        spell(&landed, &signed_base)
+                    ),
+                )
+                .with_hint(
+                    "the forge's answer and the store's do not agree; record the merge \
+                     from whichever one you can show (ADR-0003 D10)",
+                ));
+            }
+            landed
+        }
+        _ => {
+            if store.oid != to {
+                return Err(HostError::invalid(
+                    "nothing to reconcile",
+                    format!(
+                        "{} is {} in the store and attempt {} proposes {}",
+                        record.base.branch,
+                        spell(&store.oid, &signed_base),
+                        record.attempts.index,
+                        spell(&to, &signed_base)
+                    ),
+                )
+                .with_hint(
+                    "a merge record describes a move the store has. If the branch has not \
+                     moved, that is `gitiup change merge`; if it moved to something else, \
+                     that is a different change (ADR-0003 D8)",
+                ));
+            }
+            to
+        }
+    };
+    let plan = MergePlan {
+        change_id: record.change_id.clone(),
+        attempt: record.attempts.index,
+        change_digest: record.change_digest()?,
+        branch,
+        from,
+        to,
+        store_oid: store.oid,
+        signed_base,
+        // The move is a fact; the "from" is the point the record was signed against,
+        // which is what a reconcile can honestly claim.
+        base_overridden: true,
+        merged_ref: merged_ref(&record.change_id),
+        kv: format!("kv/{}", MERGE_NAMESPACE.as_str()),
+        proofs: request.proofs.clone(),
+        via: request.via,
+        notes: vec![
+            "the branch had already moved; this record describes a merge that happened \
+             without one"
+                .to_string(),
+        ],
+        via_forge: request.via == Via::Forge,
+        reconciled: true,
+    };
+    let record = build_merge_record(host, request, &plan)?;
+    let size = record.canonical_bytes()?.len() as u64;
+    let record_digest = record.digest()?;
+    let reference = publish_merge_record(host, &record, &request.actor)?;
+    let mut plan = plan;
+    plan.kv = kv_key(&MERGE_NAMESPACE, &record_digest);
+    Ok(MergeOutcome {
+        proofs_pinned: record.proofs.len(),
+        moved: false,
+        size,
+        plan,
+        record_digest,
+        reference,
+        record,
+    })
+}
+
+/// Build, sign and file the merge record D8 asks for, without advertising it.
+///
+/// The bytes go through the same gates [`publish_merge`] uses — the store must file them
+/// under their own digest, and a merge record that disagrees with the attempt it names is
+/// refused by `check_attempt_matches` — so a merge cannot cite an attempt it did not see.
+fn build_merge_record(
+    host: &dyn Host,
+    request: &MergeRequest<'_>,
+    plan: &MergePlan,
+) -> HostResult<MergeRecord> {
+    let record = request.record;
+    let unsigned = MergeRecord {
+        change_digest: plan.change_digest.clone(),
+        change_id: record.change_id.clone(),
+        attempt: record.attempts.index,
+        base: MergeBase {
+            branch: record.base.branch.clone(),
+            from: spell(&plan.from, &plan.signed_base),
+            to: spell(&plan.to, &plan.signed_base),
+        },
+        merged_at_us: request
+            .at_us
+            .unwrap_or_else(|| Timestamp::now().as_unix() as i64 * 1_000_000),
+        via: request.via.as_str().to_string(),
+        proofs: request.proofs.clone(),
+        policy_digest: request.policy_digest.clone(),
+        author: request.merger.clone(),
+        schema_version: SCHEMA_VERSION,
+        record_type: MERGE_TYPE.to_string(),
+        signatures: Vec::new(),
+        annotations: None,
+    };
+    let signed = unsigned.sign(request.signer)?;
+    let bytes = signed.canonical_bytes()?;
+    let digest = signed.digest()?;
+    require_cas(host, "publish a merge record")?;
+    check_state_absent(host, &plan.merged_ref, &record.change_id, "merged")?;
+    put_record(host, &MERGE_NAMESPACE, &bytes, &digest)?;
+    check_attempt_matches(
+        host,
+        record.change_id.as_str(),
+        record.attempts.index,
+        &plan.change_digest,
+    )?;
+    Ok(signed)
+}
+
+/// File the create-only `merged` ref that makes a merge record a state (D7).
+fn publish_merge_record(
+    host: &dyn Host,
+    record: &MergeRecord,
+    actor: &Actor,
+) -> HostResult<RefName> {
+    let digest = record.digest()?;
+    let reference = merged_ref(&record.change_id);
+    host.update_ref_cas(
+        &RefUpdate::create(reference.clone(), digest)
+            .with_actor(actor.clone())
+            .with_message(format!("change {} merged", record.change_id)),
+    )?;
+    Ok(reference)
+}
+
+/// A change that is merged in fact and not in record (D7's `unrecorded` flag).
+///
+/// The fact happened and its record did not land: `refs/heads/<base>` stands at the head
+/// of one of the change's attempts and there is no `merged` ref. This is the *detectable*
+/// half of D8's failure window, and it is printed rather than quietly reconciled — a
+/// merge record is a claim about who merged on what proof, and a tool cannot invent the
+/// beliefs of whoever did it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unrecorded {
+    /// Which attempt the branch now carries.
+    pub attempt: u32,
+    /// The branch that moved.
+    pub branch: RefName,
+    /// The commit it carries, which is the attempt's head.
+    pub head: String,
+    /// What the branch holds (the same commit, spelled as the store spells it).
+    pub store_oid: Oid,
+}
+
+/// Whether a change's newest attempt is sitting on the base branch with no merge record.
+///
+/// Only the newest attempt is looked at: a merge is a move to the newest head, so an
+/// *older* attempt on the branch tip is either a much older failure window (which
+/// `change_history` still shows) or a coincidence of oids that is not this change's
+/// business.
+pub fn unrecorded_merge(
+    host: &dyn Host,
+    summary: &ChangeSummary,
+) -> HostResult<Option<Unrecorded>> {
+    if summary.merged.is_some() || summary.abandoned.is_some() {
+        return Ok(None);
+    }
+    let Some(digest) = summary.newest_attempt_digest() else {
+        return Ok(None);
+    };
+    let Some((StoredRecord::Change(record), _)) = read_stored(host, &digest)? else {
+        return Ok(None);
+    };
+    let branch = RefName::new(&record.base.branch)?;
+    let Some(store) = host.get_ref(&branch)? else {
+        return Ok(None);
+    };
+    let Ok(head) = oid_of(&record.head, "head") else {
+        return Ok(None);
+    };
+    if store.oid != head {
+        return Ok(None);
+    }
+    Ok(Some(Unrecorded {
+        attempt: record.attempts.index,
+        branch,
+        head: record.head.clone(),
+        store_oid: store.oid,
+    }))
+}
+
+/// Every proof digest cited by a merge record in this store, mapped to why it is pinned.
+///
+/// This is [`crate::attest::pin`] made automatic instead of left to the operator: a digest
+/// inside a record is not a ref, so [`crate::attest::referenced`] cannot see it, and a
+/// merge whose cited proof has since been pruned is a merge that cannot be audited. Anyone
+/// running `attest gc` owes these digests a pin, and this is how they pay it without
+/// knowing what a merge is.
+pub fn proof_pins(host: &dyn Host) -> HostResult<BTreeMap<Oid, String>> {
+    let mut pins = BTreeMap::new();
+    for reference in host.list_refs(&RefQuery::prefix(ns::CHANGES))? {
+        if !matches!(parse_ref(&reference.name), Some(ChangeRef::Merged { .. })) {
+            continue;
+        }
+        let Some((StoredRecord::Merge(record), _)) = read_stored(host, &reference.oid)? else {
+            continue;
+        };
+        for proof in &record.proofs {
+            let Ok(oid) = Oid::from_hex(digest_hex(proof)) else {
+                continue;
+            };
+            crate::attest::pin(
+                &mut pins,
+                oid,
+                format!("merge record of {}", record.change_id),
+            );
+        }
+    }
+    Ok(pins)
+}
+
+/// The hex body of a `sha256:…` digest string.
+fn digest_hex(digest: &str) -> &str {
+    digest.split_once(':').map(|(_, hex)| hex).unwrap_or(digest)
+}
+
+/// An oid string from a record as an [`Oid`], in the algorithm the record names.
+fn oid_of(tagged: &str, what: &str) -> HostResult<Oid> {
+    commit_oid(tagged).ok_or_else(|| {
+        HostError::invalid(
+            what,
+            format!("'{tagged}' is not an algorithm-tagged oid a store can compare"),
+        )
+    })
+}
+
+/// Spell an [`Oid`] the way the record it is being compared to spells its own, so the two
+/// oids in a message read as the same kind of thing (ADR-0001 D2).
+fn spell(oid: &Oid, like: &str) -> String {
+    let algo = like.split_once(':').map(|(algo, _)| algo).unwrap_or("sha1");
+    format!("{algo}:{}", oid.hex())
+}
+
+/// A short form of a key id, for the actor a ref write records.
+fn short_key(key_id: &str) -> String {
+    let tail = key_id.rsplit(':').next().unwrap_or(key_id);
+    let count = tail.chars().count();
+    if count > 12 {
+        let keep: String = tail.chars().take(8).collect();
+        let end: String = tail.chars().skip(count - 4).collect();
+        format!("{keep}\u{2026}{end}")
+    } else {
+        tail.to_string()
+    }
 }
 
 // --------------------------------------------------------------------------

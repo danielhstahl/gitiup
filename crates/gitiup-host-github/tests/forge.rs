@@ -375,3 +375,84 @@ fn a_forge_remote_without_the_adapter_names_the_feature() {
 
 #[allow(dead_code)]
 fn unused(_: &dyn BlobStore, _: &Namespace, _: &dyn Host) {}
+
+#[test]
+fn the_forge_merges_its_own_change_and_says_where_it_landed() {
+    // ADR-0003 D10: on a forge the forge's merge *is* the merge. The adapter asks for it
+    // and then reports only what the forge said — a state, a commit, a branch — because a
+    // ref write here would be an imitation of a thing that is atomic and reviewed.
+    let forge = forge();
+    let host = hosted(&forge);
+    let head = forge.refs()["refs/heads/main"].clone();
+    forge.open_pull(7, "Teach the adapter to ask", &head, "2026-01-05T10:00:00Z");
+
+    let merged = host
+        .merge_change(7, &head_oid(&forge, "main"), "ff")
+        .expect("the forge merged");
+    assert_eq!(merged.state, ChangeState::Merged, "the forge's own answer");
+    assert_eq!(
+        merged.landed,
+        Some(head_oid(&forge, "main")),
+        "and the commit it put on the branch, which for a fast-forward is the head"
+    );
+    assert_eq!(merged.branch.as_deref(), Some("main"));
+    assert_eq!(
+        forge.refs()["refs/heads/main"],
+        head,
+        "the branch really moved: that is the fact the merge record will state"
+    );
+    let change = host
+        .changes("all")
+        .expect("changes")
+        .into_iter()
+        .find(|change| change.id == "gh-7")
+        .expect("the pull is still listed");
+    assert_eq!(
+        change.state,
+        ChangeState::Merged,
+        "and the change is merged as a state the forge reports, not one gitiup asserted"
+    );
+}
+
+#[test]
+fn a_forge_that_will_not_merge_is_refused_rather_than_worked_around() {
+    let forge = forge();
+    let host = hosted(&forge);
+    let head = head_oid(&forge, "main");
+    forge.open_pull(
+        7,
+        "Teach the adapter to ask",
+        &head.hex(),
+        "2026-01-05T10:00:00Z",
+    );
+
+    // The forge re-checks the commit the caller believes is being merged. Naming the wrong
+    // one is the forge's own compare-and-swap failing, and it is a refusal: 409.
+    let other = {
+        let mut hex = head.hex().to_string();
+        hex.pop();
+        hex.push(if hex.ends_with('a') { 'b' } else { 'a' });
+        Oid::from_hex(&hex).expect("a same-shaped oid")
+    };
+    let stale = host
+        .merge_change(7, &other, "ff")
+        .expect_err("the forge will not merge a commit it does not have on top");
+    assert_eq!(stale.exit_code(), 6, "{stale}");
+    assert!(
+        stale.to_string().contains("head") || stale.to_string().contains("conflict"),
+        "and it says what the forge said: {stale}"
+    );
+
+    // Merged once, not mergeable twice: the forge's refusal survives as a refusal, in the
+    // forge's words, rather than becoming a success or a silent no-op.
+    host.merge_change(7, &head, "ff").expect("the merge");
+    let twice = host
+        .merge_change(7, &head, "ff")
+        .expect_err("a merged pull is not mergeable");
+    assert_eq!(twice.exit_code(), 6, "{twice}");
+    assert!(
+        twice.to_string().contains("will not merge pull 7"),
+        "the forge's own sentence, not a rewrite: {twice}"
+    );
+}
+

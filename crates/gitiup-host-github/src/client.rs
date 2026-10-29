@@ -531,6 +531,29 @@ impl Client {
         Ok(())
     }
 
+    /// A PUT that reads the answer. The forge's merge endpoint is a PUT, and its
+    /// answer ("merged", and with which commit) is the whole point of calling it.
+    pub fn put<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> HostResult<T> {
+        let response = self.send(self.with_body(self.request(Method::Put, path, &[]), body)?)?;
+        response.json::<T>().map_err(invalid_body)
+    }
+
+    /// A PUT that may answer one of `allowed` statuses (a merge refuses with 405 and
+    /// 409, and both are answers the caller has to tell apart).
+    pub fn put_allowing(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        allowed: &[u16],
+    ) -> HostResult<Response> {
+        let request = self.with_body(self.request(Method::Put, path, &[]), body)?;
+        self.send_allowing(request, allowed)
+    }
+
     /// A PATCH whose answer is not read.
     pub fn patch(&self, path: &str, body: &serde_json::Value) -> HostResult<()> {
         self.send(self.with_body(self.request(Method::Patch, path, &[]), body)?)?;

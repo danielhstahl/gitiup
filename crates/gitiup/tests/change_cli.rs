@@ -906,8 +906,21 @@ fn the_help_text_and_the_top_level_usage_agree_about_the_verbs() {
         let output = harness.run(&args, None);
         assert!(output.status.success(), "{}", stderr(&output));
         let text = stdout(&output);
-        for verb in ["new", "submit", "list", "show"] {
+        for verb in ["new", "submit", "list", "show", "merge", "reconcile"] {
             assert!(text.contains(verb), "{args:?} does not document {verb}");
+        }
+        for flag in [
+            "--dry-run",
+            "--expected-oid",
+            "--proof",
+            "--via",
+            "--merge-method",
+            "pull first",
+        ] {
+            assert!(
+                text.contains(flag),
+                "{args:?} does not document {flag}, which is how a merge is driven"
+            );
         }
         assert!(
             text.contains("6 refused"),

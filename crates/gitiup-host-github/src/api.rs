@@ -15,7 +15,7 @@
 //!   parts of this host honest, and which is also why writing anything is a
 //!   three-step dance (blob → tree → commit) followed by one ref move.
 
-use gitiup_host::{HostError, HostResult, Timestamp};
+use gitiup_host::{HostError, HostResult, Oid, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
@@ -618,6 +618,94 @@ pub fn create_pull(
         "title": title, "head": head, "base": base, "body": body, "draft": draft,
     });
     client.post(&path(client.repo(), "pulls"), &payload)
+}
+
+/// What the forge says when it merges (`PUT /pulls/<n>/merge`).
+///
+/// Only three fields, because only three are the forge's own facts: that it merged,
+/// which commit it put on the base branch, and which branch moved. Everything else in
+/// GitHub's answer is a rendering of a page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeAnswer {
+    /// Whether the forge says it merged. A `false` here with a 200 is GitHub being
+    /// GitHub, and is reported as a refusal, not as a silent success.
+    #[serde(default)]
+    pub merged: bool,
+    /// The commit the forge put on the base branch (its own merge commit, or the head
+    /// for a fast-forward).
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// The branch that moved.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// The forge's refusal, when it refused.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Merge a pull request with the forge's own merge (D10: on a forge, the forge's
+/// merge button *is* the merge — atomic and reviewed, which is more than a bucket can
+/// promise, and not something gitiup should imitate with a ref write).
+///
+/// `sha` is the commit the caller believes is being merged: the forge re-checks it and
+/// refuses if the head moved, which is the forge's own compare-and-swap and the reason
+/// gitiup does not need one here.
+pub fn merge_pull(
+    client: &Client,
+    number: u64,
+    sha: &str,
+    method: &str,
+) -> HostResult<MergeAnswer> {
+    let path = path(client.repo(), &format!("pulls/{number}/merge"));
+    let payload = serde_json::json!({
+        "sha": sha,
+        "merge_method": method,
+    });
+    let response = client.put_allowing(&path, &payload, &[405, 409])?;
+    let answer: MergeAnswer = if response.body.is_empty() {
+        MergeAnswer {
+            merged: response.status == 200 || response.status == 204,
+            sha: None,
+            base_branch: None,
+            message: None,
+        }
+    } else {
+        response
+            .json::<MergeAnswer>()
+            .map_err(|why| HostError::invalid("forge merge", why.to_string()))?
+    };
+    match response.status {
+        200 | 204 if answer.merged => Ok(answer),
+        405 => Err(HostError::invalid(
+            "forge merge",
+            format!(
+                "the forge will not merge pull {number}: {}",
+                answer
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "it is not mergeable".into())
+            ),
+        )
+        .with_hint(
+            "the forge refuses because of its own rules — branch protection, a required \
+             check, or a conflicted head. Nothing was merged and gitiup will not imitate \
+             the merge with a ref write (ADR-0003 D10)",
+        )),
+        409 => Err(
+            HostError::conflict(format!("pull {number}"), Some(Oid::from_hex(sha)?), None)
+                .with_hint(
+                    "the forge says the head is not what it was when the change was opened, or the \
+             branches conflict: push a new attempt and let the forge re-check",
+                ),
+        ),
+        other => Err(HostError::invalid(
+            "forge merge",
+            format!(
+                "the forge answered {other} and did not say it merged: {}",
+                answer.message.clone().unwrap_or_default()
+            ),
+        )),
+    }
 }
 
 /// Close or reopen a pull request.

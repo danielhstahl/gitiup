@@ -787,6 +787,14 @@ fn gc(args: &Args) -> Result<(), CliError> {
     // they all arrive as refs, so nothing here needs to know what a quorum is.
     let mut pins = attest::referenced(&*store.host)
         .map_err(|e| CliError::io(format!("what is still referenced: {e}")))?;
+    // …plus the one thing a ref cannot show: a merge cites its proofs as digests *inside*
+    // its record, and a digest inside a record is not a ref. Without this the evidence a
+    // merge was made on is exactly what a retention policy would retire (ADR-0003 D8).
+    for (digest, why) in gitiup_host::change::proof_pins(&*store.host)
+        .map_err(|e| CliError::io(format!("what a merge cited: {e}")))?
+    {
+        attest::pin(&mut pins, digest, why);
+    }
     for keep in args.all("--keep") {
         let oid = Oid::from_hex(keep.trim())
             .map_err(|e| CliError::usage(format!("--keep '{keep}' is not a digest: {e}")))?;

@@ -79,6 +79,9 @@ COMMANDS:
     change submit [OPTIONS]        publish one attempt of it to the store you name
     change list [OPTIONS]          the changes a store advertises (--state open)
     change show <ID> [OPTIONS]     one change, its attempts, and its merge record
+    change merge <ID> [OPTIONS]    the owner's merge: compare-and-swap the branch, then
+                                   a signed record of it (--dry-run first)
+    change reconcile <ID> [OPTS]   write that record for a merge the store already has
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·

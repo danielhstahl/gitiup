@@ -291,6 +291,79 @@ fn forge_host(
     }
 }
 
+/// Ask a forge to merge one of its own changes (ADR-0003 D10).
+///
+/// On a forge, the forge's merge *is* the merge: atomic, reviewed, and governed by the
+/// forge's own protection rules, which is more than a conditional ref write can promise
+/// and therefore not something gitiup should imitate. `expect` is the commit the caller
+/// believes is being merged — the forge re-checks it, so this carries the same
+/// compare-and-swap guarantee the store path gets from `Expect::Is`.
+///
+/// Returns the commit the forge put on the base branch, which is what the merge record
+/// names as `to`: with a fast-forward that is the change's head, and with a merge commit
+/// it is a commit no attestation can cover — which is why `ff` is the default and why the
+/// record says `via: forge` rather than pretending.
+#[cfg(feature = "hosts-github")]
+pub fn forge_merge(
+    remote: &RemoteConfig,
+    profile: Option<&CredentialProfile>,
+    number: u64,
+    expect: &gitiup_host::Oid,
+    method: &str,
+) -> Result<gitiup_host::Oid, CliError> {
+    let transport = gitiup_host_github::curl::default_transport(remote)
+        .map_err(|e| CliError::io(format!("remote '{}': {e}", remote.name)))?;
+    let host = gitiup_host_github::GitHubHost::with_transport(remote, transport, profile)
+        .map_err(|e| CliError::io(format!("remote '{}': {e}", remote.name)))?;
+    let merged = host
+        .merge_change(number, expect, method)
+        .map_err(|e| store_says(&e))?;
+    if merged.state != gitiup_host_github::ChangeState::Merged {
+        return Err(CliError::refused(
+            format!("the forge closed pull {number} rather than merging it"),
+            "the forge answered, and its answer was not a merge: its own checks, its \
+             protection rules or a human said no. Nothing was merged, and gitiup will not \
+             write a merge record for a change the forge refused (ADR-0003 D10)",
+        ));
+    }
+    merged.landed.ok_or_else(|| {
+        CliError::refused(
+            format!("the forge merged pull {number} and did not say which commit landed"),
+            "the merge record has to name the commit that moved onto the branch; check the \
+             forge's own answer, or reconcile from a clone that can see the branch",
+        )
+    })
+}
+
+/// The same refusal on a build with no adapter in it. Reaching it at all means the remote
+/// was accepted, which [`classify`] already refuses — so this is a belt, not the braces.
+#[cfg(not(feature = "hosts-github"))]
+pub fn forge_merge(
+    remote: &RemoteConfig,
+    _profile: Option<&CredentialProfile>,
+    _number: u64,
+    _expect: &gitiup_host::Oid,
+    _method: &str,
+) -> Result<gitiup_host::Oid, CliError> {
+    let _ = remote;
+    Err(CliError::refused(
+        format!("this gitiup cannot reach a forge at all ({FORGE_FEATURE} is off)"),
+        format!("rebuild with `--features {FORGE_FEATURE}`"),
+    ))
+}
+
+/// A store's own words, kept: taxonomy label, message, hint, and the code its kind
+/// implies. See `change::store_refusal`.
+fn store_says(error: &gitiup_host::HostError) -> CliError {
+    use gitiup_host::HostErrorExt as _;
+    let message = if error.is_denied() {
+        format!("{}: {}", error.kind(), error.message())
+    } else {
+        error.message()
+    };
+    CliError::scored(error.exit_code(), message, error.hint().map(str::to_string))
+}
+
 /// The parts of a host this command prints, held without a trait object so the
 /// adapter-specific `advice()` call stays where it belongs.
 struct Opened {

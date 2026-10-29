@@ -7,15 +7,17 @@
 
 > A change is the object a stranger publishes when there is no forge. Not a pull request,
 > not a patch email: one signed record in a content-addressed store, advertised by a ref,
-> whose merge is a compare-and-swap a bucket can honour. This document is the contributor's
-> half — the four commands, what each one promises, and the refusals that are refusals
-> rather than advice.
+> whose merge is a compare-and-swap a bucket can honour. This document is both halves — the
+> contributor's four commands, the owner's merge, what each one promises, and the refusals
+> that are refusals rather than advice.
 
 ```text
 gitiup change new    --base main          draft a signed record from local commits
 gitiup change submit --record … --remote …   publish one attempt of it
 gitiup change list   [--state open] [--json]  what a store advertises
 gitiup change show   <id> [--attempt n]    one change, read back through its ref
+gitiup change merge     <id> [--expected-oid OID] [--proof DIGEST]   merge it, or --dry-run
+gitiup change reconcile <id>              write the merge record for a move that happened
 ```
 
 ## The whole path, in one screen
@@ -251,6 +253,173 @@ attempt; `--bytes` prints the exact stored bytes.
 | `head_tracks_newest` | whether `head` names the newest attempt, or a half-finished submit left it behind |
 | `fetch` | the refspec a reviewer fetches: one `git fetch` on a git host brings the record and every commit it proposes |
 
+## Merging: a compare-and-swap, then a signed record of it
+
+`merge` is the owner's command, and it is two writes in a fixed order (ADR-0003 D8). First
+the fact: `refs/heads/<base>` moves from the oid the merge expected to the attempt's head,
+under compare-and-swap, which is the whole of what "merged" means on a store with no
+merge button and no locking — a bucket can do it, a git host does it with
+`--force-with-lease`, and a host that can do neither is refused rather than force-pushed
+through. Then the record of the fact: a signed `gitiup-merge-1` naming the **attempt** by
+its `change_digest` (not the change id, which moves between attempts), the branch, both
+oids, `via`, who merged, and which proofs were believed — filed at `kv/merge/<digest>` and
+advertised by `refs/changes/<id>/merged`, which is what makes *merged* a state a mirror can
+see (D7).
+
+The branch moves first and the record second, deliberately. A crash in between leaves a
+branch that moved without a record, which is a **detectable** silence with a retry
+(`change reconcile`, below); the reverse order would leave a signed record asserting a merge
+that never happened — a false statement by an honest key, and invisible from the store.
+
+```console
+$ gitiup change merge chg-786c8cc2698531c5 --store ../store --dry-run
+plan    merge · nothing written (--dry-run)
+  store   fs store /tmp/docdemo/store
+  change  chg-786c8cc2698531c5 attempt 0 · Fix the ref parser for peeled refs
+  branch  refs/heads/main 19c6b71b…28b4 → 672f77f9…228f
+  check   19c6b71b…28b4 [fast-forward] a fast-forward: no commits would be dropped
+  record  kv/merge/<digest of the signed record>, advertised by refs/changes/chg-786c8cc2698531c5/merged
+  proofs  none — the record will say the merge believed nothing
+  signed  PKtAbJYt…INU4 (gitiup)
+
+$ gitiup change merge chg-786c8cc2698531c5 --store ../store
+merged  chg-786c8cc2698531c5 attempt 0
+  store    fs store /tmp/docdemo/store
+  branch   refs/heads/main sha1:19c6b71b…28b4 → sha1:672f77f9…228f  [cas sha1:19c6b71b…28b4]
+  via      store (gitiup moved the ref under CAS)
+  head     sha1:672f77f9…228f · Fix the ref parser for peeled refs
+  record   kv/merge/5d9675a2e122f1517fc4ecab80ff02f2a757d8c907c9e59f20ee0f87ecb1a824 (768 bytes) · refs/changes/chg-786c8cc2698531c5/merged
+  digests  change sha256:bbc980ca…2d29 · merge sha256:5d9675a2…a824
+  proofs   none believed — the record says so
+  signed   PKtAbJYt…INU4 (gitiup)
+```
+
+`--dry-run` is `gitiup attest gc --dry-run`'s promise: the whole comparison, including the
+fresh read of the branch, and nothing written. Its `--json` says `"dry_run": true` and
+`"would_write"`, and the one case where a dry run *fails* is the refusal it would have hit —
+a plan that claims a merge is available when the base has moved is worse than no plan.
+
+### What is checked, in which order, and why not D8's order
+
+| refusal | exit |
+|---------|------|
+| the store cannot compare-and-swap a ref | 6, and nothing is force-pushed |
+| the record does not re-hash, re-derive or verify | 8, 7, 6 — read through its ref before anything is touched |
+| the store has no such branch | 6, naming the branch: publishing one is the owner's act, done with plain `git push` |
+| the change is already merged or abandoned | 6 — *most specific fact first* |
+| the branch already is the change's head | 6, pointing at `change reconcile` |
+| the branch is not the expected oid | 6, naming **both** oids — "pull first" |
+| the branch is not an ancestor of the head | 6 — a merge would drop commits |
+| a proof digest cited cannot be returned by the store | 6 |
+
+The two middle rows are in that order because D8's failure window produces both at once: a
+branch sitting at the change's head has by definition left its base. Telling someone who is
+*already merged, with the record missing* to "pull first and rebase" would send them to
+re-do work that is done.
+
+```console
+$ gitiup change merge chg-297e5eade7a8a99f --store ../store
+gitiup: refs/heads/main is sha1:bdb67584f952d9d9c1424176d193ae4dbfcd2f9d in this record and sha1:26528a3d2b4159862498a0727e78da24b30d7b2c in the store
+hint: pull first: the branch moved, and merging this attempt would drop whatever moved it.
+      Rebase onto sha1:26528a3d2b4159862498a0727e78da24b30d7b2c (or re-draft from it) and
+      submit a new attempt, or name the oid you are really standing on with --expected-oid
+```
+
+Both oids, in the same spelling, every time: a refusal that says "stale" without saying
+which of the two moved is advice nobody can act on.
+
+**The fast-forward is proved, not assumed.** Whether `base` is an ancestor of `head` is a
+question about parents, and a store keeps commits as opaque bytes and refs as numbers, so
+the answer comes from a local repository that holds both oids — `change checkout`
+(`giti-b2z.5`) is what guarantees one exists for a change read out of a store. With neither
+oid present, `merge` refuses: that is the reason it will not "just try it" from a directory
+that is not a checkout. gitiup merges by fast-forward only, which is also why it does not
+produce a merge commit — a merge commit exists only *after* the merge, so no attestation can
+ever have covered it.
+
+**`--expected-oid`** is the owner overriding the base the author signed, and it is a decision
+rather than a bypass: the CAS moves to the same place either way, and the override is printed
+as a note and recorded in the merge record's `base.from`. The honest default is the signed
+base — that is the oid the author could actually have merged, and the one they could not have
+expected to land on top of anything else.
+
+```console
+$ gitiup change merge chg-297e5eade7a8a99f --store ../store --expected-oid sha1:26528a3d2b4159862498a0727e78da24b30d7b2c
+merged  chg-297e5eade7a8a99f attempt 0
+  branch   refs/heads/main sha1:26528a3d…7b2c → sha1:7bf3a084…fffb  [cas sha1:26528a3d…7b2c]
+  …
+note: the base was named by the caller: the author signed sha1:bdb67584…2f9d and the CAS expects sha1:26528a3d…7b2c
+```
+
+### Proofs a merge says it believed
+
+`--proof <digest>` (repeatable) cites attestations in the merge record — as digests, never
+as copies, because a copy in the record could be edited and a digest cannot (D8). Two things
+follow. The store must be able to **return** each digest, so a citation nobody can fetch is
+refused; and a digest inside a record is not a ref, so `attest gc` cannot see it the way it
+sees a quorum submission — the merge writes the citation as a pin (`merge record of
+chg-…`), which is why a retired-proof policy keeps what a merge was made on. `gc --json`
+counts them in `report.pinned`; the same policy on the same store, before the merge, prunes
+the identical attestation.
+
+`--proof-required` is refused, on purpose, before a store is opened or a key is touched.
+Whether a merge is *allowed* is Epic 2's policy engine, which is deliberately not a field of
+the change record (D9: a contributor who could write "no checks needed" into the object being
+merged has written their own gate), and "no policy found, merged anyway" is not an answer
+anyone wants in a log. Until the engine exists the mergeer is the policy engine: run
+`gitiup verify attestation <file> --trust …` — which answers 0/6/7/8 for one proof — and
+cite what you believed with `--proof`.
+
+### When the record does not land
+
+```console
+$ gitiup change merge chg-34b2879bb78dfb84 --store ../store
+gitiup: refs/heads/main already is sha1:13f49cfee1f14277339cff82e0b4bbd429f33fd6, so there is nothing to merge
+hint: if this change was merged and its record did not land, `gitiup change reconcile
+      chg-34b2879bb78dfb84` writes the record for the move the store already has
+
+$ gitiup change reconcile chg-34b2879bb78dfb84 --store ../store
+recorded  chg-34b2879bb78dfb84 attempt 0
+  store    fs store ../store
+  branch   refs/heads/main sha1:ad20d36a…3a1b → sha1:6648bac3…848d  [untouched by this call]
+  via      store (the move had already happened; this is its record)
+  head     sha1:6648bac3…848d · Drop the Mac-only path
+  record   kv/merge/4bb218e17940561b15c6a48dc3a45aef17dcb342d2b1789fd86be7f71dfc6727 (768 bytes) · refs/changes/chg-34b2879bb78dfb84/merged
+  digests  change sha256:4a3835ef…fbcd · merge sha256:4bb218e1…6727
+  proofs   none believed — the record says so
+  signed   PKtAbJYt…INU4 (gitiup)
+note: the branch had already moved; this record describes a merge that happened without one
+```
+Reported exactly as a merge is, because after it there is no difference between them.
+
+`reconcile` writes no branch move: the fact already happened, and a record that moved the
+branch it was only meant to describe would be a record about something that did not happen
+the way it says. If the branch has *not* moved it refuses and sends the operator to
+`change merge` — a merge record may only describe a move the store shows.
+
+### On a forge, the forge merges
+
+A change carried by a pull request is merged by the forge, whose merge is atomic, reviewed
+and governed by its own protection rules — more than a conditional ref write can promise,
+and therefore not something gitiup should imitate (ADR-0003 D10). gitiup asks the forge to
+merge, then records what it reports with `via: "forge"`, and `--json` distinguishes the two
+kinds of merge instead of leaving a script to infer the weaker guarantee from the transport.
+A forge merge lands whatever the forge builds — its own merge commit, usually — so the
+record names that commit as `to` (`--landed`, cross-checked against the store) rather than
+pretending the attempt's head is what moved. `--merge-method ff|merge|squash|rebase` defaults
+to `ff`, which is gitiup's own rule restated in the forge's vocabulary: the commits a proof
+covers are the commits that end up on the branch.
+
+| field (`--json`) | what it answers |
+|-------|-----------------|
+| `from` / `to` | the two ends of the move: what the CAS expected (the signed base, or the oid named with `--expected-oid`) and the attempt's head it wrote |
+| `moved` | whether this call moved the branch. `false` means the branch already stood where the change wanted and only the record was missing |
+| `via` + `atomicity` | which kind of merge this was — `store` (a conditional write) or `forge` (atomic and reviewed) — spelled out, because they are not the same guarantee and a script should not infer the weaker one from the transport |
+| `merged_ref`, `kv`, `record_digest` | where the record is: the create-only ref that makes it a state, the content-addressed key it is filed under, and the digest both name |
+| `proofs`, `proofs_pinned` | what the merge said it believed, and how many digests retention now owes a pin |
+| `notes` | the remarks that are only true sometimes: a base override, a reconcile |
+| `merger` | who signed the merge record — the merger, not the change's author (D7) |
+
 ## Exit codes
 
 The same table as the rest of `gitiup` (ADR-0001 D7, ADR-0003 D11) — a script does not
@@ -258,10 +427,10 @@ branch on the transport and does not branch on the verb either:
 
 | exit | when |
 |------|------|
-| 0 | published, listed, shown (including the idempotent `already: true`) |
-| 2 | usage: unknown verb or flag, missing `--base`, a handle shorter than 4 hex |
-| 3 | I/O, an unreachable store, git failing |
-| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, an ambiguous handle |
+| 0 | published, listed, shown, merged, reconciled (including the idempotent `already: true`) |
+| 2 | usage: unknown verb or flag, missing `--base`, a handle shorter than 4 hex, a `--proof` or `--expected-oid` that cannot mean anything to the store |
+| 3 | I/O, an unreachable store, git failing — and a refusal the **store** owns, passed through in the store's own taxonomy (a credential that may not write `refs/heads/**` stays `permission denied`, never retold as an I/O error or a generic 6) |
+| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, an ambiguous handle — and for a merge: not a fast-forward, an ancestry the tool cannot check, a branch that has already moved (reconcile instead), a change already merged or abandoned, a proof the store cannot return, `--proof-required` with no policy engine |
 | 7 | a signature that does not verify, or a `key_id` that is not the fingerprint of the key offered |
 | 8 | bytes that are not their own canonical form, a record that does not re-hash to the name it is filed under, a `change_id` that does not re-derive |
 
@@ -283,7 +452,7 @@ inside the record rather than leaving it to be inferred from where you read it.
 
 ## Not this ticket
 
-Merging (`gitiup change merge`, `giti-b2z.4`), checking a change out (`giti-b2z.5`), the
+Checking a change out (`giti-b2z.5`), the
 change-workflow conformance suite run against MinIO and `git-http-backend` (`giti-b2z.6`),
 GitHub adapter parity for these verbs (`giti-b2z.7`), opening quorum rounds on submit
 (`giti-zp1.2`) and `gitiup verify change` (`giti-91m.4`). What this ticket had to get right

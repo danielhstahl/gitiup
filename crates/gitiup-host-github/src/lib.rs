@@ -72,7 +72,8 @@ pub use auth::{Auth, Environment, FixedEnvironment, Secret, TokenSource};
 pub use client::{ClientOptions, RateBudget, RepoRef};
 pub use curl::CurlTransport;
 pub use forge::{
-    AttestationRecord, AttestationSource, ChangeFeedCursor, ChangeOrigin, ChangeRecord, ChangeState,
+    AttestationRecord, AttestationSource, ChangeFeedCursor, ChangeOrigin, ChangeRecord,
+    ChangeState, ForgeMerge,
 };
 pub use host::GitHubHost;
 pub use transport::{Method, Request, Response, Transport, TransportError};

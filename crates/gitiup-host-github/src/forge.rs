@@ -229,6 +229,20 @@ pub struct ChangeFeedCursor {
     pub highest_number: u64,
 }
 
+/// What a forge's merge says it did, in gitiup's shapes: a state, an oid, a branch
+/// name. No wire vocabulary crosses this boundary — that is the rule the crate exists for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMerge {
+    /// Merged, or closed without merging: the forge's answer, re-read rather than
+    /// assumed.
+    pub state: ChangeState,
+    /// The commit the forge put on the base branch (its merge commit, or the head for a
+    /// fast-forward), when it said.
+    pub landed: Option<Oid>,
+    /// The branch that moved, when the forge said.
+    pub branch: Option<String>,
+}
+
 impl GitHubHost {
     /// Every change, newest change first (`state`: `all`, `open`, `closed`).
     ///
@@ -304,6 +318,36 @@ impl GitHubHost {
     ) -> HostResult<ChangeRecord> {
         let pull = api::create_pull(self.client(), title, head_branch, base_branch, body, draft)?;
         Ok(ChangeRecord::from_pull(&pull))
+    }
+
+    /// Merge a change the forge carries, with the forge's own merge (D10).
+    ///
+    /// This is the one place gitiup *uses* a forge instead of routing around it. A
+    /// forge's merge is atomic and reviewed; a bucket's is a conditional write
+    /// pretending to be one, which is why the same verb is a CAS write on a store and
+    /// this call on a forge. `sha` is handed to the forge as the caller's expectation —
+    /// the forge's own compare-and-swap, and the reason no ref write is needed here.
+    ///
+    /// The change is re-read afterwards rather than assumed: a pull that closed without
+    /// merging comes back as closed, because printing "merged" for a change that was
+    /// merely refused is the kind of lie a merge gate exists to catch.
+    pub fn merge_change(&self, number: u64, sha: &Oid, method: &str) -> HostResult<ForgeMerge> {
+        let answer = api::merge_pull(self.client(), number, &sha.hex(), method)?;
+        let pull = api::get_pull(self.client(), number)?.ok_or_else(|| {
+            gitiup_host::HostError::not_found("pull request", number.to_string()).with_hint(
+                "the forge merged and then would not show the change; check the repository \
+                 the remote points at",
+            )
+        })?;
+        let change = ChangeRecord::from_pull(&pull);
+        Ok(ForgeMerge {
+            state: change.state,
+            landed: answer
+                .sha
+                .as_deref()
+                .and_then(|hex| Oid::from_hex(hex).ok()),
+            branch: answer.base_branch,
+        })
     }
 
     /// Close a change without merging it.

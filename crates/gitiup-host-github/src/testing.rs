@@ -717,6 +717,60 @@ impl MockForge {
             ("GET", "check-runs", _) => self.check_runs_get(state, query),
             ("POST", "check-runs", _) => self.check_runs_post(state, request),
             ("POST", "pulls", _) => self.pulls_post(state, request),
+            ("PUT", "pulls", rest) => {
+                // `PUT /pulls/<n>/merge` — the forge's own merge, the one thing a
+                // bucket cannot offer and the one thing gitiup must therefore *use*
+                // rather than imitate (ADR-0003 D10). The mock does what the forge
+                // does: the base branch moves, the pull closes with `merged_at` set,
+                // and a change that is not open — or a head the forge does not agree
+                // is the head — is refused, because a merge that answers "merged"
+                // when it did not merge is the failure every caller is written to
+                // avoid.
+                let Some(number) = rest
+                    .strip_suffix("/merge")
+                    .and_then(|head| head.parse::<u64>().ok())
+                else {
+                    return json(404, serde_json::json!({"message": "Not Found"}));
+                };
+                let want = body_json(request)
+                    .and_then(|body| {
+                        body.get("sha")
+                            .and_then(|sha| sha.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let Some(pull) = state.pulls.iter_mut().find(|pull| pull["number"] == number)
+                else {
+                    return json(404, serde_json::json!({"message": "Not Found"}));
+                };
+                if pull["state"] != "open" {
+                    return json(
+                        405,
+                        serde_json::json!({"message": "Pull Request is not mergeable"}),
+                    );
+                }
+                let head = pull["head"]["sha"].as_str().unwrap_or_default().to_string();
+                if !want.is_empty() && want != head {
+                    return json(
+                        409,
+                        serde_json::json!({"message": "Head branch was modified. Review and try the merge again."}),
+                    );
+                }
+                let base = pull["base"]["ref"].as_str().unwrap_or("main").to_string();
+                pull["state"] = serde_json::Value::String("closed".to_string());
+                pull["merged_at"] = serde_json::Value::String("2026-01-01T00:00:00Z".into());
+                pull["merge_commit_sha"] = serde_json::Value::String(head.clone());
+                pull["updated_at"] = serde_json::Value::String("2026-01-01T00:00:00Z".into());
+                // The branch move is the fact the merge actually is; `merged_at` on the
+                // pull is the forge's own record of having done it.
+                state
+                    .refs
+                    .insert(format!("refs/heads/{base}"), head.clone());
+                json(
+                    200,
+                    serde_json::json!({"merged": true, "sha": head, "base_branch": base}),
+                )
+            }
             ("PATCH", "pulls", rest) => {
                 let Some(number) = rest.parse::<u64>().ok() else {
                     return json(404, serde_json::json!({"message": "Not Found"}));
