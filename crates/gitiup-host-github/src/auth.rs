@@ -7,10 +7,11 @@
 //!    gitiup does not, because a URL is logged by proxies, shells, history files
 //!    and bug reports, and a header is not. The transport asserts this on every
 //!    request.
-//! 2. **a token is only ever sent to the API host this remote was configured for**
-//!    ([`Auth::may_send_to`]). An `api-base` that points somewhere else does not
-//!    get the token unless the operator names that host in `token-host`. That is
-//!    also why the client refuses redirects instead of following them.
+//! 2. **a token is only ever sent to the API origin this remote was configured for**
+//!    ([`Auth::header`], scoped by [`gitiup_host::scope`]). An `api-base` that points
+//!    somewhere else does not get the token unless the operator names that host in
+//!    `token-host`. That is also why the client refuses redirects instead of following
+//!    them.
 //! 3. **a token is never printed.** [`Secret`] redacts in `Debug` and `Display`;
 //!    error text names the *source* of the token, never the value.
 //! 4. **plain `http://` is refused unless the host is loopback**, so a token cannot
@@ -23,6 +24,7 @@
 
 use std::fmt;
 
+use gitiup_host::scope::{self, Breach, Origin};
 use gitiup_host::{AuthModel, CredentialProfile, HostError, HostResult, RemoteConfig};
 
 use crate::codec::is_loopback_host;
@@ -169,8 +171,9 @@ impl TokenSource {
 pub struct Auth {
     token: Option<Secret>,
     source: TokenSource,
-    /// The only host the token may be sent to.
-    allowed_host: String,
+    /// The only origins the token may be sent to: the API origin this remote names,
+    /// plus any extra one the operator spelled out in `token-host`.
+    allowed: Vec<Origin>,
 }
 
 impl Auth {
@@ -183,18 +186,19 @@ impl Auth {
     pub fn resolve(
         remote: &RemoteConfig,
         profile: Option<&CredentialProfile>,
-        api_host: &str,
+        api_base: &str,
     ) -> Auth {
-        Auth::resolve_in(remote, profile, api_host, &ProcessEnvironment)
+        Auth::resolve_in(remote, profile, api_base, &ProcessEnvironment)
     }
 
     /// [`Auth::resolve`] against an explicit environment.
     pub fn resolve_in(
         remote: &RemoteConfig,
         profile: Option<&CredentialProfile>,
-        api_host: &str,
+        api_base: &str,
         env: &dyn Environment,
     ) -> Auth {
+        let allowed = allowed_origins(remote, api_base);
         let mut candidates: Vec<(String, TokenSource)> = Vec::new();
         if let Some(variable) = remote.option("token-env") {
             candidates.push((
@@ -230,13 +234,13 @@ impl Auth {
             return Auth {
                 token: Some(Secret::new(value)),
                 source,
-                allowed_host: api_host.to_ascii_lowercase(),
+                allowed,
             };
         }
         Auth {
             token: None,
             source: TokenSource::Anonymous,
-            allowed_host: api_host.to_ascii_lowercase(),
+            allowed,
         }
     }
 
@@ -245,7 +249,7 @@ impl Auth {
         Auth {
             token: None,
             source: TokenSource::Anonymous,
-            allowed_host: String::new(),
+            allowed: Vec::new(),
         }
     }
 
@@ -254,7 +258,7 @@ impl Auth {
         Auth {
             token: Some(token),
             source: TokenSource::Env("provided".into()),
-            allowed_host: api_host.to_ascii_lowercase(),
+            allowed: allowed_origins_no_options(api_host),
         }
     }
 
@@ -265,27 +269,50 @@ impl Auth {
 
     /// The `Authorization` header value, or `None` when anonymous.
     ///
-    /// `host` is the host the request is actually going to: sending a token to a
-    /// host the operator did not name is the leak this exists to prevent, and a
-    /// redirect is the usual way it would happen.
-    pub fn header(&self, host: &str) -> HostResult<Option<String>> {
+    /// `target` is where the request is actually going — a full URL, or a bare
+    /// `host[:port]` when that is all the caller knows. Sending a token to a host the
+    /// operator did not name is the leak [`Auth`] exists to prevent, and a redirect is
+    /// the usual way it would happen, so this is refused with
+    /// [`gitiup_host::scope::refusal`]: exit **3**, both hosts named.
+    pub fn header(&self, target: &str) -> HostResult<Option<String>> {
         let Some(secret) = &self.token else {
             return Ok(None);
         };
-        let host = host.to_ascii_lowercase();
-        if !self.allowed_host.is_empty() && host != self.allowed_host {
-            return Err(HostError::denied(format!(
-                "sending a token to {host} (it was resolved for {})",
-                self.allowed_host
-            ))
-            .with_hint(
-                "a token is only ever sent to the API host its remote names; if this \
-                 enterprise server is genuinely the same forge, set `token-host` in the \
-                 remote's options — and note that redirects are never followed for \
-                 exactly this reason",
-            ));
+        let target = target.trim();
+        let given = target.contains("://");
+        let origin = Origin::parse(target)?;
+        // A bare host is compared by host and port; a full URL is compared as an
+        // origin, so an `https` API answered by an `http` host is a refusal even if the
+        // name matches.
+        let allowed = self.allowed.iter().any(|candidate| {
+            if given {
+                candidate.same_as(&origin)
+            } else {
+                candidate.host() == origin.host() && candidate.port() == origin.port()
+            }
+        });
+        if allowed {
+            return Ok(Some(format!("Bearer {}", secret.expose())));
         }
-        Ok(Some(format!("Bearer {}", secret.expose())))
+        let Some(configured) = self.allowed.first().cloned() else {
+            return Err(HostError::denied(
+                "there is no api-base for this token to belong to",
+            ));
+        };
+        let refusal = scope::refusal(&configured, &origin, Breach::Plain);
+        let advice = refusal.hint().unwrap_or_default().to_string();
+        Err(refusal.with_hint(format!(
+            "{advice} If this forge genuinely answers at two addresses, name the second one in \
+             the remote's `token-host` option — and note that redirects are never followed for \
+             exactly this reason."
+        )))
+    }
+
+    /// The origins this token may be sent to, as labels. Safe to print, and worth
+    /// printing: "which host would my token have gone to" is the first thing an
+    /// operator wants after a refusal.
+    pub fn allowed_hosts(&self) -> Vec<String> {
+        self.allowed.iter().map(Origin::label).collect()
     }
 
     /// Where the token came from (safe to print).
@@ -313,6 +340,17 @@ impl Auth {
                     .to_string(),
             );
             return out;
+        }
+        // Where the token may go, printed rather than guessed at: after a refusal this is
+        // the first question an operator has, and a scope nobody can see is a scope nobody
+        // can check (giti-g5c.5).
+        let allowed = self.allowed_hosts();
+        if !allowed.is_empty() {
+            out.push(format!(
+                "the token from {} is sent to {} and nowhere else",
+                self.source.describe(),
+                allowed.join(", ")
+            ));
         }
         if self.source.is_workflow_token() {
             out.push(format!(
@@ -362,6 +400,71 @@ impl Auth {
         }
         Ok(())
     }
+}
+
+/// The origins a token resolved for `remote` may be sent to.
+///
+/// The API origin the remote names, first and always; then whatever the operator added in
+/// `token-host`, which exists for the one honest case — an enterprise forge that answers
+/// at two addresses (the API host and a data host) and where the operator, and only the
+/// operator, can say they are the same forge. A redirect never adds to this list: the
+/// list is built from this machine's config, once, before anything is sent.
+///
+/// `token-host` is a comma-separated list, and the entries are checked by the same two
+/// rules the API base is: it must name an origin, and it must not be a route out of TLS.
+fn allowed_origins(remote: &RemoteConfig, api_base: &str) -> Vec<Origin> {
+    /// Why a `token-host` entry that leaves TLS is refused.
+    const CLEAR_TEXT: &str = "plain http:// to a host that is not this machine: a bearer \
+                              token must not cross a network unencrypted";
+    let mut origins = allowed_origins_no_options(api_base);
+    // Split on commas only. Splitting on whitespace as well would turn one mistyped entry
+    // into three — and `Origin::parse` reads a bare word as a hostname, so a sentence
+    // typed into a host list would quietly *widen* the scope instead of being refused.
+    for extra in remote
+        .option("token-host")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+    {
+        let extra = extra.trim();
+        if extra.is_empty() {
+            continue;
+        }
+        // The same rule as `api-base`, applied to the entry rather than to the base:
+        // a `token-host` that says `http://` to a host off this machine is an instruction
+        // to send the bearer token unencrypted, which is the leak this whole module is a
+        // refusal of (see [`Auth::check_base_url`], which says it for the base URL).
+        let origin = match Origin::parse(extra) {
+            Ok(origin) => origin,
+            // A `token-host` that does not parse is a typo, and a typo in a list of
+            // places a token may go is the one thing this file may not guess about.
+            Err(err) => {
+                eprintln!(
+                    "warning: ignoring token-host '{extra}' for remote '{}': {err}",
+                    remote.name
+                );
+                continue;
+            }
+        };
+        if origin.scheme() == "http" && !is_loopback_host(origin.host()) {
+            eprintln!(
+                "warning: ignoring token-host '{extra}' for remote '{}': {CLEAR_TEXT}",
+                remote.name
+            );
+            continue;
+        }
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins
+}
+
+/// [`allowed_origins`] with nothing in `token-host`: one origin, or none for a bare host
+/// that cannot be parsed.
+fn allowed_origins_no_options(api_base: &str) -> Vec<Origin> {
+    Origin::parse(api_base)
+        .map(|origin| vec![origin])
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -487,6 +590,144 @@ mod tests {
                 .any(|line| line.contains("authored by the bot")),
             "{:?}",
             auth.advice()
+        );
+    }
+
+    #[test]
+    fn the_advice_names_the_origins_a_token_may_reach() {
+        // A scope nobody can see is a scope nobody can check, so `gitiup remote show`
+        // prints it (giti-g5c.5) — and prints the origins, never the secret.
+        let env = FixedEnvironment::new([("GH_TOKEN", "ghp_not_a_real_token")]);
+        let extras = || {
+            remote("https://github.com/o/r.git").with_option("token-host", "data.github.example")
+        };
+        for (what, config) in [
+            ("a plain remote", remote("https://github.com/o/r.git")),
+            ("a remote naming a second forge address", extras()),
+        ] {
+            let auth = Auth::resolve_in(&config, None, "https://api.github.com", &env);
+            let joined = auth.advice().join("\n");
+            assert!(
+                joined.contains("https://api.github.com"),
+                "{what}: the advice has to say where the token goes: {joined}"
+            );
+            assert!(
+                !joined.contains("ghp_not_a_real_token"),
+                "{what}: advice is printed, so it must not carry the secret: {joined}"
+            );
+        }
+        let auth = Auth::resolve_in(&extras(), None, "https://api.github.com", &env);
+        assert!(
+            auth.allowed_hosts()
+                .contains(&"https://data.github.example".to_string()),
+            "`token-host` widens the scope the operator named: {:?}",
+            auth.allowed_hosts()
+        );
+    }
+
+    #[test]
+    fn token_host_widens_the_scope_but_a_typo_does_not() {
+        let env = FixedEnvironment::new([("GH_TOKEN", "x")]);
+        let auth = Auth::resolve_in(
+            &remote("https://github.com/o/r.git"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        // Without the option, only the API origin: the data host of a real enterprise
+        // forge is a *different* origin until somebody says so.
+        assert!(auth.header("https://github.githubassets.com/x").is_err());
+        let widened = Auth::resolve_in(
+            &remote("https://github.com/o/r.git")
+                .with_option("token-host", "github.githubassets.com"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        assert!(widened.header("https://github.githubassets.com/x").is_ok());
+        // Still not the rest of the internet, and the refusal still names both hosts.
+        let err = widened.header("https://decoy.example/x").unwrap_err();
+        assert_eq!(err.kind(), gitiup_host::HostErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(
+            text.contains("api.github.com") && text.contains("decoy.example"),
+            "{text}"
+        );
+        // An entry that is not an origin is a typo in the list of places a token may go,
+        // and the safe reading of a typo is the narrower one: the good entry still works,
+        // the junk one grants nothing.
+        let typoed = Auth::resolve_in(
+            &remote("https://github.com/o/r.git")
+                .with_option("token-host", "not a url, api.github.com"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        assert_eq!(
+            typoed.allowed_hosts(),
+            vec!["https://api.github.com".to_string()]
+        );
+        assert!(typoed.header("https://api.github.com/repos/o/r").is_ok());
+        // And an entry that would take the token out of TLS is refused the same way,
+        // whatever the hostname it names: `token-host` widens *where* a token may go, not
+        // whether it has to stay encrypted on the way (`Auth::check_base_url` says the
+        // same thing about `api-base`).
+        let downgrading = Auth::resolve_in(
+            &remote("https://github.com/o/r.git")
+                .with_option("token-host", "http://data.example.com"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        assert_eq!(
+            downgrading.allowed_hosts(),
+            vec!["https://api.github.com".to_string()],
+            "a clear-text token-host grants nothing"
+        );
+        // Loopback is the exception it always was: the local test server, on http.
+        let local = Auth::resolve_in(
+            &remote("https://github.com/o/r.git")
+                .with_option("token-host", "http://127.0.0.1:9999"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        assert!(
+            local
+                .allowed_hosts()
+                .contains(&"http://127.0.0.1:9999".to_string()),
+            "{:?}",
+            local.allowed_hosts()
+        );
+    }
+
+    #[test]
+    fn a_full_url_target_is_compared_as_an_origin_not_as_a_hostname() {
+        // The difference the ticket turns on: a caller that hands over the whole URL gets
+        // a scheme check with it, because "same host, now speaking http" is the leak a
+        // redirect is most often asking for. A caller that only knows a hostname still
+        // gets the hostname compared.
+        let env = FixedEnvironment::new([("GH_TOKEN", "x")]);
+        let auth = Auth::resolve_in(
+            &remote("https://github.com/o/r.git"),
+            None,
+            "https://api.github.com",
+            &env,
+        );
+        assert!(auth.header("https://api.github.com:443/repos/o/r").is_ok());
+        let err = auth.header("http://api.github.com/repos/o/r").unwrap_err();
+        assert_eq!(
+            err.kind(),
+            gitiup_host::HostErrorKind::PermissionDenied,
+            "{err}"
+        );
+        assert!(
+            auth.header("API.GitHub.com").is_ok(),
+            "a bare host is a bare host"
+        );
+        assert!(
+            auth.header("").is_err(),
+            "nothing to compare is not a match"
         );
     }
 }

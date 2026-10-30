@@ -30,7 +30,7 @@
 use std::cell::RefCell;
 
 use crate::bodies::{Body, Ctx, Shape};
-use crate::registration::{Denial, DenialOutcome, Knobs, Registration, Session};
+use crate::registration::{Decoy, Denial, DenialOutcome, Knobs, Registration, Session};
 
 /// Where CI names the hosts that must be running.
 pub const REQUIRE_HOSTS: &str = "GITIUP_CONFORMANCE_REQUIRE_HOSTS";
@@ -60,6 +60,10 @@ pub struct Setup {
     host: Option<Session>,
     peer: Option<Session>,
     degraded: Option<Session>,
+    /// The same store as a stranger sees it: no credential at all.
+    anonymous: Option<Session>,
+    /// The redirect-to-decoy run.
+    decoy: Option<Decoy>,
     denial: Option<Denial>,
     knobs: Knobs,
 }
@@ -92,6 +96,8 @@ pub fn plan(body: &Body, registration: &'static Registration) -> Plan {
                     host: None,
                     peer: None,
                     degraded: None,
+                    anonymous: None,
+                    decoy: None,
                     denial: Some(denial),
                     knobs: Knobs::default(),
                 })),
@@ -145,6 +151,16 @@ pub fn plan(body: &Body, registration: &'static Registration) -> Plan {
     {
         return Plan::Skip(note);
     }
+    if body.shape == Shape::Anonymous
+        && let Some(note) = registration.anonymous_skip_note()
+    {
+        return Plan::Skip(note);
+    }
+    if body.shape == Shape::Decoy
+        && let Some(note) = registration.decoy_skip_note()
+    {
+        return Plan::Skip(note);
+    }
     let degraded = match body.shape {
         Shape::Degraded => {
             let make = registration
@@ -163,10 +179,53 @@ pub fn plan(body: &Body, registration: &'static Registration) -> Plan {
         _ => None,
     };
 
+    // The stranger reads a store the registration seeded, with no credential anywhere in
+    // the process; a store that cannot be opened that way is a failure of the host, not a
+    // skip.
+    let anonymous = match body.shape {
+        Shape::Anonymous => {
+            let make = registration
+                .anonymous
+                .expect("anonymous_skip_note says a variant was declared");
+            match make() {
+                Ok(session) => Some(session),
+                Err(err) => {
+                    return Plan::Fail(format!(
+                        "cannot make a no-credential read of {}: {err}",
+                        registration.name
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // The decoy run is its own store on its own endpoint: the body judges either the
+    // refusal or the session, and looks for the token either way.
+    let decoy = match body.shape {
+        Shape::Decoy => {
+            let make = registration
+                .decoy
+                .expect("decoy_skip_note says a variant was declared");
+            match make() {
+                Ok(decoy) => Some(decoy),
+                Err(err) => {
+                    return Plan::Fail(format!(
+                        "cannot make the redirect-to-decoy variant of {}: {err}",
+                        registration.name
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
     Plan::Run(Box::new(Setup {
         host: Some(host),
         peer,
         degraded,
+        anonymous,
+        decoy,
         denial: None,
         knobs: Knobs::from_environment(registration.knobs),
     }))
@@ -213,6 +272,8 @@ fn execute(body: &Body, setup: &Setup) {
         peer: setup.peer.as_ref().map(Session::host),
         denial: setup.denial.as_ref(),
         degraded: setup.degraded.as_ref().map(Session::host),
+        anonymous: setup.anonymous.as_ref().map(Session::host),
+        decoy: setup.decoy.as_ref(),
         knobs: setup.knobs,
     };
     (body.run)(&ctx);
@@ -437,11 +498,7 @@ pub fn account(registration: &'static Registration) -> Vec<String> {
         if reason.trim().is_empty() {
             problems.push(format!("`{name}` is skipped without a reason"));
         }
-        let offered = match found.shape {
-            Shape::Denied => registration.denied.is_some(),
-            Shape::Degraded => registration.degraded.is_some(),
-            Shape::Single | Shape::Pair => false,
-        };
+        let offered = shape_offered(registration, found.shape);
         if offered {
             problems.push(format!(
                 "`{name}` is both skipped and offered by a variant of this host: drop one"
@@ -450,11 +507,7 @@ pub fn account(registration: &'static Registration) -> Vec<String> {
     }
 
     for body in known {
-        let offered = match body.shape {
-            Shape::Single | Shape::Pair => true,
-            Shape::Denied => registration.denied.is_some(),
-            Shape::Degraded => registration.degraded.is_some(),
-        };
+        let offered = shape_offered(registration, body.shape);
         if !offered && registration.skip_reason(body.name).is_none() {
             problems.push(format!(
                 "{} does not run `{}` and does not say why: either stand up the variant or \
@@ -482,16 +535,27 @@ pub fn account(registration: &'static Registration) -> Vec<String> {
     problems
 }
 
+/// Whether this registration can offer a body of this shape at all.
+///
+/// One place, because [`account`] asks it twice (once about skips that should not
+/// exist, once about bodies that are neither run nor explained) and [`summary`]
+/// counts it: three lists of the same fact is three chances to disagree.
+pub fn shape_offered(registration: &Registration, shape: Shape) -> bool {
+    match shape {
+        Shape::Single | Shape::Pair => true,
+        Shape::Denied => registration.denied.is_some(),
+        Shape::Degraded => registration.degraded.is_some(),
+        Shape::Anonymous => registration.anonymous.is_some(),
+        Shape::Decoy => registration.decoy.is_some(),
+    }
+}
+
 /// One line per host for the CI summary: what it offers and what it declines.
 pub fn summary(registration: &'static Registration) -> String {
     let known = crate::bodies::bodies();
     let offered = known
         .iter()
-        .filter(|body| match body.shape {
-            Shape::Single | Shape::Pair => true,
-            Shape::Denied => registration.denied.is_some(),
-            Shape::Degraded => registration.degraded.is_some(),
-        })
+        .filter(|body| shape_offered(registration, body.shape))
         .count();
     format!(
         "{:<12} {:<7} {:>2}/{} bodies offered, {} skipped by registration{}",

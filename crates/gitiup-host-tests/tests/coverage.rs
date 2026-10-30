@@ -8,7 +8,7 @@
 //! the second failure mode.
 
 use gitiup_host::HostKind;
-use gitiup_host_tests::bodies::{Shape, bodies};
+use gitiup_host_tests::bodies::bodies;
 use gitiup_host_tests::hosts;
 use gitiup_host_tests::registration::Registration;
 
@@ -83,7 +83,40 @@ const REQUIRED_EDGES: &[(&str, &[&str])] = &[
             "a_refused_policy_publish_writes_nothing",
         ],
     ),
+    (
+        "anonymous read of a public store",
+        &["a_public_store_reads_with_no_credential"],
+    ),
+    (
+        "a credential never leaves its own origin",
+        &["a_credential_never_arrives_at_the_redirect_target"],
+    ),
 ];
+
+/// The edges whose only covering body is offered by a feature-gated registration.
+///
+/// With that feature off this build contains no code that could run the body at all —
+/// the same exemption `every_shipped_host_kind_is_measured` makes for
+/// [`HostKind::Github`] — so a hermetic `cargo test -p gitiup-host-tests` says which
+/// feature would measure the edge instead of either failing that run or going quiet
+/// about it. The exemption is checked against the *feature*, never against the host
+/// list, so a build that does compile the gate and still does not run the body fails.
+const FEATURE_GATED_EDGES: &[(&str, &str)] = &[
+    // The decoy run drives a real credential over a real socket to a second origin that
+    // reports what arrived; the mock forge cannot answer that question, because the
+    // double and the code under test share an author.
+    ("a credential never leaves its own origin", "github"),
+];
+
+/// Whether a feature named in [`FEATURE_GATED_EDGES`] is compiled into this test binary.
+fn feature_enabled(name: &str) -> bool {
+    match name {
+        "github" => cfg!(feature = "github"),
+        "s3" => cfg!(feature = "s3"),
+        // An unknown name must not silently exempt an edge.
+        _ => true,
+    }
+}
 
 /// Every host kind a gitiup build can ship. A new one here means a new host, and a
 /// new host that nothing measures is the drift this file is for.
@@ -134,20 +167,26 @@ fn every_required_edge_is_actually_run_by_some_host() {
                 let Some(body) = bodies().iter().find(|body| body.name == *name) else {
                     return false;
                 };
-                let offered = match body.shape {
-                    Shape::Single | Shape::Pair => true,
-                    Shape::Denied => host.denied.is_some(),
-                    Shape::Degraded => host.degraded.is_some(),
-                };
+                let offered = gitiup_host_tests::runner::shape_offered(host, body.shape);
                 offered && host.skip_reason(name).is_none()
             })
         });
-        if !covered {
-            problems.push(format!(
-                "`{edge}` is not run by any host: every body that could cover it \
-                 ({names:?}) is skipped or unoffered everywhere"
-            ));
+        if covered {
+            continue;
         }
+        if let Some((_, gate)) = FEATURE_GATED_EDGES.iter().find(|(name, _)| *name == *edge)
+            && !feature_enabled(gate)
+        {
+            eprintln!(
+                "note: `{edge}` is measured by no host in this build: the only registration \
+                 that offers it needs `--features {gate}`"
+            );
+            continue;
+        }
+        problems.push(format!(
+            "`{edge}` is not run by any host: every body that could cover it \
+             ({names:?}) is skipped or unoffered everywhere"
+        ));
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

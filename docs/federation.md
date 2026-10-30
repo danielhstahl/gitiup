@@ -322,9 +322,60 @@ The account of the run is filed in the store it built, at
 records `gitiup fetch` writes: *how did this get here*, answerable from inside the store,
 granting nothing.
 
+## Anonymous read, and where a credential may go
+
+A mirror exists so a stranger can read it, and a stranger has nothing to show. Two
+properties follow, and neither one used to be tested.
+
+**A public store reads with no credential, and "empty" is a different answer from "not
+allowed".** A handle built without a credential reports an auth model that says so
+(`anonymous`, or `filesystem` for a path) and is served: refs, records, and the bytes
+behind them. The absence of a *thing* is an `Ok` with nothing in it — a ref that is not
+there, an object nobody published, a namespace nobody wrote to — while the absence of
+*permission* is `permission-denied`, exit **3**, from every entry point. Those two must
+never be confused, because a mirror that answers "no such ref" to a caller it may not
+serve is indistinguishable from a mirror that is simply empty, and that is how a policy
+that was never published comes to be read as a policy that does not exist. The pair of
+bodies `a_public_store_reads_with_no_credential` and `refused_credentials_are_denied_not_dropped`
+is one property measured from opposite sides.
+
+**A credential is good for exactly one origin** — the scheme, host and port its own remote
+names — **and every way of ending up somewhere else is a refusal, not a reuse.** There are
+three ways a client ends up at a second host, and [`Breach`](../crates/gitiup-host/src/scope.rs)
+names all three: a **redirect** (`302` with a `Location:` on another host), a **URL
+rewrite** (an `insteadOf`, a pointer record that named a different host, a `git config`
+rewrite on the box), and a host **introduced** by bytes that came out of the first store —
+a `gitiup.toml` that arrived with a mirror, a record pointing at a mirror of a mirror.
+All three answer `permission-denied`, exit **3**, and the message **names both hosts**:
+the one the credential belongs to and the one it was about to reach. "Which two hosts?" is
+the whole question an operator has to answer, and a refusal that does not say them is a
+mystery to debug rather than a fixable configuration.
+
+What makes that a rule rather than an intention is that the transports here are the ones
+that cannot be trusted with it: `curl` runs with `--no-location` because a redirect would
+carry the `Authorization` header with it, and `git` is never handed a token gitiup could
+not scope — which is also why a `token-env` on a plain-git remote is refused before a byte
+moves, and why an `https` endpoint that redirects to `http` is refused even though the
+hostname did not move. Two spellings of one origin are one origin (`https://host` and
+`https://host:443`, `Host` and `host`, a redirect to a *path*); the only way a token
+legally reaches a second address is `token-host`, which an operator writes and a redirect
+never appends to. A host named by somebody else's bytes gets no credential at all unless
+*this* machine's own `gitiup.toml` names that origin — the entry in this file authorises a
+token, the mention in a fetched one does not.
+
+The proof is a conformance body, not a unit test: `a_credential_never_arrives_at_the_redirect_target`
+stands up two loopback origins — one that answers everything with a `302` at the other —
+configures a token for the first, and then asks the second what arrived. It fails if a
+token ever appears there, if the redirect is followed at all *even with the header
+stripped*, and — the half that a broken transport can fake — if the credential never
+reached the origin it *was* configured for either. That last assertion is what caught a
+real bug: the `curl` transport was handing `curl` the redacted command line it prints for
+humans, so the far end was being asked to accept the literal text of a variable name.
+
 ## Exit codes
 
-`0` ok · `2` usage · `3` I/O or an unreachable store · `6` refused (a read-only
+`0` ok · `2` usage · `3` I/O, an unreachable store, or a credential that was about to
+leave the origin it belongs to · `6` refused (a read-only
 destination, a budget busted, a pointer that had diverged, an unfinished migration, or any
 refusal at all under `--strict`) · `8` bytes that are not the bytes their name promises.
 
@@ -342,4 +393,8 @@ something was skipped.
 * **mirror eviction** — a store can now tell it is a mirror, because it has arrival
   records, so `mirror_may_not_prune_by_age` and capacity eviction (`eviction_needs_source`)
   are now buildable (D8 rule 2).
-* **anonymous read scoping** (`.5`), which is a credential question and has no code here.
+* **a bucket that serves anonymous reads through this build's S3 transport** — the
+  `anonymous` option is understood, and refused by the AWS transport rather than answered
+  by signing as the owner: an anonymous `GET` is an unsigned one, and a read that succeeded
+  under the owner's own credentials would look like a working public mirror while proving
+  nothing about it. Public mirrors that need no credential are served over `git+https://`.

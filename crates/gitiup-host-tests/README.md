@@ -64,6 +64,16 @@ checking them makes that body *fail*, on purpose.
 | a refused policy publish writes nothing | `a_refused_policy_publish_writes_nothing` |
 | multi-ref atomicity | `multi_ref_writes_are_all_or_nothing` |
 | capability honesty | `describe_and_capabilities` |
+| anonymous read of a public store | `a_public_store_reads_with_no_credential` |
+| a credential that never leaves its own origin | `a_credential_never_arrives_at_the_redirect_target` |
+
+The last two are one property read from opposite sides: "empty" must not look like "not
+allowed", and "not allowed" must not look like "empty". The decoy body is the one that
+sends a real credential over a real socket to an endpoint that redirects to a second
+origin recording what arrived — see `fixtures::decoy_pair` and
+`tests/fixtures/git-decoy.py` — and it fails if a token arrives there, if the redirect is
+followed at all, or if the credential never reached the origin it *was* configured for
+(which is how it caught the `curl` transport handing `curl` its own redacted command line).
 
 Every body runs against a **fresh** store, and each is a `#[test]` of its own, so
 a diverging host shows up by name and is rerunnable with `--exact`.
@@ -107,14 +117,14 @@ back so both stores agree the change is merged.
 
 ## The hosts measured here
 
-| host | shape | refused-credentials variant | `cas = false` variant |
-|------|-------|-----------------------------|------------------------|
-| `fs` | a scratch directory | — (auth model is the filesystem) | — (a lock file always offers CAS) |
-| `git-file` | a bare repository over `file://` | — (authorised by the filesystem) | — (leases are always available) |
-| `git-http` | a bare repository served by `git-http-backend` | an endpoint that answers 403 to everything | the same repository published to a static file server |
-| `s3-memory` | a bucket that is a second implementation of the transport contract | a bucket that answers 403 to everything | a bucket whose endpoint ignores conditional writes |
-| `s3-minio` | a live MinIO/S3 bucket (feature `s3`) | CI's revoked-credential step | the same endpoint told `conditional-writes = "off"` |
-| `github` | the adapter, against the in-process mock forge (feature `github`) | a forge that answers 401 | — (the mock refuses rather than ignores) |
+| host | shape | refused-credentials variant | `cas = false` variant | no-credential variant | redirect-to-decoy variant |
+|------|-------|-----------------------------|------------------------|----------------------|------------------------|
+| `fs` | a scratch directory | — (auth model is the filesystem) | — (a lock file always offers CAS) | — (a path's reader is authorised by the OS) | — (a path cannot redirect) |
+| `git-file` | a bare repository over `file://` | — (authorised by the filesystem) | — (leases are always available) | — (as above) | — (`file://` has no origin) |
+| `git-http` | a bare repository served by `git-http-backend` | an endpoint that answers 403 to everything | the same repository published to a static file server | the same repository read with no credential of any kind | — (`git` owns that credential, and a token named for a git remote is refused) |
+| `s3-memory` | a bucket that is a second implementation of the transport contract | a bucket that answers 403 to everything | a bucket whose endpoint ignores conditional writes | a public-read bucket: every read served, every write refused | — (an in-process bucket has no socket for a `302` to travel on) |
+| `s3-minio` | a live MinIO/S3 bucket (feature `s3`) | CI's revoked-credential step | the same endpoint told `conditional-writes = "off"` | — (needs a bucket policy the suite would have to set, unset and prove unset) | — (a live endpoint that redirected to a decoy would be a misconfigured service) |
+| `github` | the adapter, against the in-process mock forge (feature `github`) | a forge that answers 401 | — (the mock refuses rather than ignores) | the mock serving a public repository to a handle with no credential | **the decoy body**: the real `curl` transport, a redirecting `api-base`, and a second loopback origin that reports what it was sent |
 
 ## Adding a host
 
@@ -153,4 +163,9 @@ it. Point two runs at the same bucket at once and they will sweep each other: us
 `GITIUP_S3_LIVE_BUCKET` to separate them instead.
 
 Nothing in this crate is linked into a release build: `gitiup` does not depend on
-it, and the hermetic default run touches no network and needs no credentials.
+it, and the hermetic default run touches no network and needs no credentials. The
+two credential bodies are the exception to "no network" in the strictest sense: the
+decoy pair is a `python3` fixture listening on two loopback ports, and the decoy run
+drives the credential over the `curl` binary rather than the mock, because a leak
+that only happens through the real transport is exactly the one a mock would agree
+not to notice. Either missing is a skip with a reason, never a pass.

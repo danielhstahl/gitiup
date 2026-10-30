@@ -314,6 +314,7 @@ not an error but appear in `advice()`, so a typo surfaces in
 | `profile` | `AWS_PROFILE`/chain | shared-config profile to use |
 | `force-path-style` | `false` | what most S3-compatible servers expect |
 | `require-versioning` | `true` | refuse buckets that do not keep history |
+| `anonymous` | `false` | the bucket is public-read: reads only, no credential sent (refused by the AWS transport — see below) |
 | `conditional-writes` | `auto` | `auto` probes, `on` demands, `off` accepts a dumb bucket |
 | `multipart-threshold-mib` | 8 | objects at least this big go up as multipart |
 | `part-size-mib` | 8 | part size (S3's own minimum is 5) |
@@ -327,7 +328,12 @@ get-caller-identity` would use. A `gitiup.toml` credentials profile that names a
 token for an `s3://` remote is refused outright by
 `S3Host::check_credentials`: it would be useless here and is a leak waiting to
 happen. `describe()` names the endpoint, region and which chain member is in
-play, and never a credential value.
+play, and never a credential value. A bucket declared `anonymous = true` is a
+public-read mirror: no credential is sent, the host is read-only, `auth` says
+`anonymous`, and the bucket-admin probes an anonymous caller is not allowed to make
+(versioning, conditional writes) are not asked. This build's AWS transport refuses
+the declaration outright rather than sign as the owner and call it an anonymous
+read.
 
 **The transport is a trait, so the host is testable without a bucket.** Every
 bucket call goes through `hosts::s3::bucket::Bucket` (`facts`, `info`, `get`,
@@ -364,6 +370,16 @@ http://127.0.0.1:8080/repo.git    plain HTTP, accepted for a loopback server onl
 Plain `http://` is accepted only for a loopback host (an ephemeral server in a
 test, a local mirror). Anywhere else it is refused with a hint to use `https://`,
 so a credential never goes out unencrypted by accident.
+
+**The credential is git's, not gitiup's, and that is said rather than pretended
+about.** `git` authenticates — an ssh key, an agent, a credential helper, or an
+anonymous read of a public repository — and gitiup hands it nothing, because it
+cannot scope what `git` then does with a token across a redirect or an
+`insteadOf` rewrite. So a credentials profile naming `token-env` for a plain-git
+remote is refused by `GitHost::check_credentials` (exit 6, with the alternatives
+named), and an `http(s)` git remote reports `auth: anonymous` rather than a token
+it does not hold. The mirror of a private repository is a bucket, a forge, or a
+repository git itself is configured to reach.
 
 **A ref that names a gitiup record points at a pointer commit.** A git ref can
 only name a git object, but a change or an attestation is addressed by the
@@ -510,6 +526,7 @@ what `gitiup` may ask of a forge is four methods on one struct
 |--------------------|-------------------|
 | `api-base` | the API root, for GitHub Enterprise (`https://github.com/api/v3` off-host, `https://api.github.com` on github.com) |
 | `token-env` | which environment variable holds the token (before the profile's `token-env`, before `GITIUP_GITHUB_TOKEN`/`GITHUB_TOKEN`) |
+| `token-host` | extra origin, comma-separated, the token may also be sent to — for a forge that really does answer at two addresses (`unset`) |
 | `accept-host` | `true`: this host really is GitHub although the URL does not say so |
 | `host-type` | `github`: the explicit spelling of the same thing (its other values are the store kinds in [Choosing a host](#choosing-a-host)) |
 | `per-page`, `max-pages` | listing page size and the ceiling on pages (`100`, `200`) |
@@ -518,7 +535,13 @@ what `gitiup` may ask of a forge is four methods on one struct
 | `read-only` | refuse writes up front, for a token that may only read (`false`) |
 
 A token is never put in a URL — it is an `Authorization` header, sent only to the
-API host the remote names, and a redacted `Secret` everywhere it might be printed.
+API origin the remote names (plus whatever `token-host` spells out, and never to an
+`http://` entry there), and a redacted `Secret` everywhere it might be printed. A
+redirect to another origin is refused rather than followed, because the header would
+travel with it: exit **3**, both hosts named. See
+[the scope note in `gitiup-host`](../crates/gitiup-host/README.md#credential-scope-scope)
+for the three ways a client can end up at a second host and what each one's refusal
+says.
 
 Testing: the mock forge in `src/testing.rs` implements the *semantics* of the
 endpoints (create-only refusal, fast-forward refusal, `Link` pagination, primary and

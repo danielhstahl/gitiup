@@ -1379,6 +1379,58 @@ impl Config {
         })
     }
 
+    /// Resolve the credentials for `remote`, then check them against the origin the
+    /// request is really going to.
+    ///
+    /// The check is the whole ticket: a redirect, a rewrite or a mirror that moved is a
+    /// different origin, and a token does not cross that line. The refusal is
+    /// [`crate::scope::refusal`] — exit **3**, both hosts named — and it is raised *before*
+    /// anything is sent, so the answer is a refusal rather than a leaked secret.
+    pub fn credentials_for_target(
+        &self,
+        remote: &RemoteConfig,
+        target: &crate::scope::Origin,
+    ) -> HostResult<Credentials> {
+        let scope = crate::scope::Scope::for_origin(crate::scope::Origin::of_remote(remote));
+        scope.guard(target)?;
+        self.credentials_for(remote)
+    }
+
+    /// The configured remote whose URL covers `origin`, if this machine named that origin
+    /// itself.
+    ///
+    /// This is the question that decides whether a host discovered in somebody else's
+    /// bytes may have a credential: not where the name was read from, but whether *this*
+    /// config independently names the origin.
+    pub fn remote_for_origin(&self, origin: &crate::scope::Origin) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|remote| {
+            crate::scope::Origin::maybe_of_remote(remote)
+                .is_some_and(|candidate| candidate.same_as(origin))
+        })
+    }
+
+    /// Credentials for a host named by bytes that arrived from another store.
+    ///
+    /// The third breach ([`crate::scope::Breach::Introduced`]): a `gitiup.toml` that came
+    /// over with a mirror, or a record naming "the other store", is *data*, and data does
+    /// not get to spend a credential. If this machine's own config already names the
+    /// origin, the credential for that remote is used — the name in the foreign file
+    /// changed nothing, the entry in this one did. Otherwise there is no credential to
+    /// give, and the answer is the refusal rather than silence: exit **3**, both hosts
+    /// named, so a mirror of a mirror reads anonymously instead of quietly authenticating
+    /// to somewhere new.
+    pub fn credentials_for_introduced(
+        &self,
+        target: &crate::scope::Origin,
+        from: &crate::scope::Origin,
+        source: &str,
+    ) -> HostResult<Credentials> {
+        if let Some(remote) = self.remote_for_origin(target) {
+            return self.credentials_for_target(remote, target);
+        }
+        Err(crate::scope::Scope::for_origin(from.clone()).refuse_introduced(target, source))
+    }
+
     /// Where this config came from, for status and error lines.
     pub fn source(&self) -> String {
         self.path

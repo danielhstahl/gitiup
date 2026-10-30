@@ -34,6 +34,8 @@ macro_rules! conformance_body_names {
             "describe_and_capabilities",
             "refused_credentials_are_denied_not_dropped",
             "a_host_without_cas_refuses_cas_writes",
+            "a_public_store_reads_with_no_credential",
+            "a_credential_never_arrives_at_the_redirect_target",
         ]
     };
 }
@@ -147,6 +149,17 @@ macro_rules! each_conformance_body {
         fn a_host_without_cas_refuses_cas_writes() {
             $crate::runner::require_body("a_host_without_cas_refuses_cas_writes", &$registration);
         }
+        #[test]
+        fn a_public_store_reads_with_no_credential() {
+            $crate::runner::require_body("a_public_store_reads_with_no_credential", &$registration);
+        }
+        #[test]
+        fn a_credential_never_arrives_at_the_redirect_target() {
+            $crate::runner::require_body(
+                "a_credential_never_arrives_at_the_redirect_target",
+                &$registration,
+            );
+        }
     };
 }
 
@@ -244,6 +257,18 @@ macro_rules! test_host {
                 if let Some(note) = $registration.degradation_skip_note() {
                     eprintln!(
                         "skip [{}] a_host_without_cas_refuses_cas_writes: {note}",
+                        $registration.name
+                    );
+                }
+                if let Some(note) = $registration.anonymous_skip_note() {
+                    eprintln!(
+                        "skip [{}] a_public_store_reads_with_no_credential: {note}",
+                        $registration.name
+                    );
+                }
+                if let Some(note) = $registration.decoy_skip_note() {
+                    eprintln!(
+                        "skip [{}] a_credential_never_arrives_at_the_redirect_target: {note}",
                         $registration.name
                     );
                 }

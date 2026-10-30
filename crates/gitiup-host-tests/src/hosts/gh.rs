@@ -14,17 +14,25 @@
 
 use std::sync::Arc;
 
-use gitiup_host::{HostKind, HostResult, RemoteConfig};
+use gitiup_host::{HostError, HostKind, HostResult, RemoteConfig};
+use gitiup_host_github::CurlTransport;
 use gitiup_host_github::GitHubHost;
 use gitiup_host_github::testing::MockForge;
 use gitiup_host_github::transport::{Request, Response, Transport, TransportError};
 
-use crate::registration::{Knobs, Registration, Session};
+use crate::registration::{Decoy, DecoyOutcome, Knobs, Registration, Session};
 
 /// The variable the token is read from — named for this crate's tests, so a
 /// leaked value is obviously the suite's own.
 const TOKEN_ENV: &str = "GITIUP_HOST_TESTS_TOKEN";
 const TOKEN: &str = "conformance-token-4f0c19";
+
+/// The variable the **decoy** run's token is read from.
+///
+/// A name of its own, on purpose: the other registrations in this binary run concurrently
+/// and assert what `GITIUP_HOST_TESTS_TOKEN` resolves to, so the decoy run must not be
+/// able to move it.
+const DECOY_TOKEN_ENV: &str = "GITIUP_HOST_TESTS_DECOY_TOKEN";
 
 fn remote() -> RemoteConfig {
     // SAFETY: this variable is named for this crate's tests, and every test in
@@ -86,6 +94,75 @@ fn make_github_denied() -> HostResult<Session> {
     Ok(Session::new(host).with(transport))
 }
 
+/// The forge as a **public repository**: nothing configured, reads allowed, writes
+/// refused.
+///
+/// The mock serves unauthenticated `GET`s exactly as a public repository does, so this is
+/// the adapter's anonymous path rather than a stand-in for it — including the part that
+/// matters, which is that a host with no credential must still describe itself honestly
+/// instead of claiming a token it does not have.
+fn make_github_anonymous() -> HostResult<Session> {
+    let forge = fresh_forge();
+    // The owner publishes first, through the forge with a token: this is the same body's
+    // story everywhere — somebody made the store worth reading, and then a stranger with
+    // nothing has to be able to read it.
+    let owner = GitHubHost::with_transport(&remote(), forge.transport(), None)?;
+    super::seed_public_store(&owner)?;
+    drop(owner);
+    // No `token-env`, no credentials profile: whatever the environment happens to hold,
+    // nothing was configured for *this* remote.
+    let stranger =
+        RemoteConfig::new("origin", "https://github.com/gitiup/mock").expect("a github url");
+    let host = GitHubHost::with_transport(&stranger, forge.transport(), None)?;
+    Ok(Session::new(host).with(forge))
+}
+
+/// A token configured for the decoy pair's origin, driven over the **real** transport:
+/// `curl`, a socket, and a `302` to a second origin that reports what it was sent.
+///
+/// Not the mock, deliberately. The mock is my own code, so a leak that only happens
+/// through it is a leak I would have written twice; here the token really is resolved, the
+/// request really leaves with it, and the answer really is a redirect — the only thing
+/// under test is whether the second request is ever made.
+fn make_github_decoy() -> HostResult<Decoy> {
+    let pair = crate::fixtures::decoy_pair().ok_or_else(|| {
+        HostError::invalid(
+            "github-decoy",
+            "no redirect-to-decoy endpoint could be started",
+        )
+    })?;
+    // The repository name is the probe: it appears in the path of every arrival, which is
+    // how a body ties an arrival to *this* run when the decoy is shared by the whole test
+    // binary.
+    let probe = format!("decoy-{}", crate::fixtures::next());
+    let token = format!("gitiup-github-decoy-token-{probe}");
+    // SAFETY: a uniquely named variable that nothing else reads (the remote below names
+    // it in `token-env`), set once, before the host is built.
+    unsafe { std::env::set_var(DECOY_TOKEN_ENV, &token) };
+    let remote = RemoteConfig::new("origin", &format!("https://github.com/gitiup/{probe}"))
+        .expect("a github url")
+        // The redirecting endpoint stands in for a forge, and `api-base` is the option that
+        // says so — the same one that names a GitHub Enterprise address, and the address the
+        // requests actually go to.
+        .with_option("api-base", pair.origin())
+        .with_option("accept-host", "true")
+        .with_option("token-env", DECOY_TOKEN_ENV);
+    let outcome = match GitHubHost::open(&remote) {
+        Ok(host) => DecoyOutcome::Built {
+            session: Session::new(host),
+        },
+        Err(error) => DecoyOutcome::Refused { error },
+    };
+    Ok(Decoy {
+        label: "github",
+        outcome,
+        token,
+        configured: pair.origin().to_string(),
+        target: pair.decoy().to_string(),
+        probe,
+    })
+}
+
 /// The github adapter: the forge demoted to one host among several, and measured
 /// like one.
 pub const GITHUB: Registration = Registration {
@@ -113,4 +190,11 @@ pub const GITHUB: Registration = Registration {
     degraded: None,
     degraded_available: || false,
     degraded_unavailable: "this host declares no cas=false variant",
+    anonymous: Some(make_github_anonymous),
+    anonymous_available: || true,
+    anonymous_unavailable: "",
+    decoy: Some(make_github_decoy),
+    decoy_available: || crate::fixtures::decoy_pair().is_some() && CurlTransport::new().is_ok(),
+    decoy_unavailable: "the decoy endpoint is a python fixture, and this run drives the \
+         credential over the curl binary the github transport uses",
 };

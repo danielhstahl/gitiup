@@ -390,9 +390,15 @@ pub fn open(
         // A `github` declaration is answered above, with the adapter or with the
         // refusal; reaching here with one means the URL is a plain git one and the
         // operator said so, which is what a declaration is for.
-        Declared::Git | Declared::Github => Ok(Box::new(
-            gitiup_host::hosts::git::GitHost::open_or_init_remote(remote)?,
-        )),
+        Declared::Git | Declared::Github => {
+            // A token this host cannot hold must not be configured for it: git
+            // authenticates for itself, and gitiup cannot scope what git then does with
+            // a credential across a redirect (giti-g5c.5).
+            gitiup_host::hosts::git::GitHost::check_credentials(remote, profile)?;
+            Ok(Box::new(
+                gitiup_host::hosts::git::GitHost::open_or_init_remote(remote)?,
+            ))
+        }
     }
 }
 

@@ -84,6 +84,14 @@ pub type Available = fn() -> bool;
 /// an error is a leak, and the denial body checks exactly that.
 pub type DeniedSecret = fn() -> Option<String>;
 
+/// Stands up one decoy run: a host whose endpoint answers every request with a redirect
+/// to a second origin, plus the credential that must never arrive there.
+///
+/// A separate `Make` shape rather than a plain one because the run needs to hand back
+/// more than a host: the body has to know which token to look for and which slice of the
+/// shared decoy's log is this run's.
+pub type DecoyMake = fn() -> HostResult<Decoy>;
+
 /// How heavy the two size-shaped bodies should be for this host.
 ///
 /// Defaults are tuned for a laptop run; CI raises them (a bucket's LIST pages
@@ -188,6 +196,63 @@ impl Denial {
     }
 }
 
+/// How a host reacted when its endpoint redirected to a decoy origin while a credential
+/// was configured for it.
+///
+/// Same two shapes as a denial, for the same reason: some transports find out on the
+/// first call and some refuse at open. What is not a shape is "it worked, and the token
+/// went along" — that is the failure the body exists to catch.
+#[derive(Debug)]
+pub enum DecoyOutcome {
+    /// The host refused to be built at all (the usual honest answer: a credential this
+    /// host cannot scope is refused before a byte moves).
+    Refused {
+        /// The refusal.
+        error: gitiup_host::HostError,
+    },
+    /// The host built; every call it makes is under the redirect's shadow.
+    Built {
+        /// The session to poke.
+        session: Session,
+    },
+}
+
+/// One decoy run, as the registration set it up.
+///
+/// The body needs four facts and cannot rediscover any of them: which token must not
+/// arrive, where it was configured to go, where the redirect pointed, and which slice of
+/// the shared decoy's log belongs to this run (`probe` — a unique path fragment, because
+/// the decoy is process-wide and other registrations may be redirecting over it at the
+/// same time).
+#[derive(Debug)]
+pub struct Decoy {
+    /// What the registration called this variant.
+    pub label: &'static str,
+    /// What the host answered.
+    pub outcome: DecoyOutcome,
+    /// The credential value that must never reach the decoy.
+    pub token: String,
+    /// The origin the credential was configured for.
+    pub configured: String,
+    /// The decoy origin the redirect pointed at.
+    pub target: String,
+    /// The unique path fragment this run's requests carry.
+    pub probe: String,
+}
+
+impl Decoy {
+    /// Everything this run did that either port saw.
+    ///
+    /// `None` when the endpoint could not be asked at all (a broken fixture — say so, do
+    /// not read it as an empty list). The list is normally empty on the decoy side and
+    /// non-empty on the origin side, and both halves of that matter: an origin with no
+    /// arrival means the run never made the request, which would make "nothing reached the
+    /// decoy" true for the wrong reason.
+    pub fn arrivals(&self) -> Option<Vec<crate::fixtures::Arrival>> {
+        crate::fixtures::decoy_pair()?.arrivals(&self.probe)
+    }
+}
+
 /// One host the suite covers.
 ///
 /// `make` is called once per body; `skips` is the audit trail; `denied` and
@@ -222,6 +287,21 @@ pub struct Registration {
     pub denied_unavailable: &'static str,
     /// The credential value `denied` plays with, which no error may print.
     pub denied_secret: DeniedSecret,
+    /// A variant reached as a **stranger**: no credential of any kind, on a store that
+    /// has content in it. `None` where there is no such thing — a directory's credential
+    /// is the filesystem.
+    pub anonymous: Option<Make>,
+    /// Whether that variant can be produced here.
+    pub anonymous_available: Available,
+    /// What to print when it cannot.
+    pub anonymous_unavailable: &'static str,
+    /// A variant whose endpoint redirects a **configured credential** to a decoy origin
+    /// (giti-g5c.5). `None` where the transport has no origin to redirect from.
+    pub decoy: Option<DecoyMake>,
+    /// Whether that variant can be produced here.
+    pub decoy_available: Available,
+    /// What to print when it cannot.
+    pub decoy_unavailable: &'static str,
     /// A variant that reports `cas = false`.
     pub degraded: Option<Make>,
     /// Whether that variant can be produced here.
@@ -249,6 +329,30 @@ impl Registration {
             None
         } else {
             Some(self.denied_unavailable)
+        }
+    }
+
+    /// Why the stranger (no-credential) variant is not available, if it is not.
+    pub fn anonymous_skip_note(&self) -> Option<&'static str> {
+        if self.anonymous.is_none() {
+            return Some("this host declares no no-credential variant");
+        }
+        if (self.anonymous_available)() {
+            None
+        } else {
+            Some(self.anonymous_unavailable)
+        }
+    }
+
+    /// Why the redirect-to-decoy variant is not available, if it is not.
+    pub fn decoy_skip_note(&self) -> Option<&'static str> {
+        if self.decoy.is_none() {
+            return Some("this host declares no redirect-to-decoy variant");
+        }
+        if (self.decoy_available)() {
+            None
+        } else {
+            Some(self.decoy_unavailable)
         }
     }
 

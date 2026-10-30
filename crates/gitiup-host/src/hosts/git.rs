@@ -749,6 +749,51 @@ impl GitHost {
         }
     }
 
+    /// Refuse a `gitiup.toml` that asks the plain-git host to spend a token.
+    ///
+    /// The bucket host refuses a static token for the same reason
+    /// ([`S3Host::check_credentials`](crate::S3Host::check_credentials)), and here the
+    /// reason is stronger: gitiup does not carry a git transport's credential at all.
+    /// `git` authenticates — an ssh key, an agent, a credential helper — and gitiup cannot
+    /// scope what `git` then does with it across a redirect or a rewrite, which is exactly
+    /// the promise [giti-g5c.5](../../../docs/federation.md) makes about every credential.
+    /// So a `token-env` on a git remote means one of two bad things: the operator believes
+    /// they are authenticated and are not, or a token would be handed to a transport that
+    /// can spend it anywhere. Both are worth refusing before a byte moves — and the
+    /// refusal is a capability answer (exit **6**), not the cross-origin refusal
+    /// ([`crate::scope::refusal`], exit **3**), because nothing ever left for this host to
+    /// be refused *about*.
+    ///
+    /// A profile that only says `auth = "token"` is advice, not a refusal: git's own
+    /// credential helper may well be in use, and gitiup can see that it is not the one
+    /// carrying the credential without forbidding it.
+    pub fn check_credentials(
+        remote: &RemoteConfig,
+        profile: Option<&crate::config::CredentialProfile>,
+    ) -> HostResult<()> {
+        let Some(profile) = profile else {
+            return Ok(());
+        };
+        if let Some(variable) = &profile.token_env {
+            return Err(HostError::unsupported(
+                "token-credentials",
+                format!(
+                    "the credentials profile for remote '{}' names token-env = \"{variable}\", \
+                     and the plain-git host has no token to send: git authenticates for itself",
+                    remote.name
+                ),
+            )
+            .with_hint(
+                "drop token-env from the profile. For a private repository over ssh use \
+                 auth = \"ssh-key\" with key-path; over https let git use its own credential \
+                 helper (gitiup never passes a token to git, because git would spend it on \
+                 whatever host it ends up talking to), or put the store on a host gitiup \
+                 authenticates to directly — a bucket, or a forge adapter",
+            ));
+        }
+        Ok(())
+    }
+
     /// The URL to hand git for this remote.
     fn git_url_for(remote: &RemoteConfig) -> String {
         match remote.scheme() {
@@ -1335,10 +1380,15 @@ impl GitHost {
 /// A capability promise is a claim about the transport, so it is derived from the
 /// transport rather than configured.
 fn capabilities_for(remote: &RemoteConfig, read_only: bool) -> Capabilities {
+    // What gitiup *holds*, not what the transport might arrange behind its back. A
+    // git remote over `http(s)://` is authenticated by git's own helper, an agent or an
+    // anonymous read — never by a credential gitiup carries (see
+    // [`GitHost::check_credentials`]) — so claiming `token` here would be a capability
+    // lie, and a caller has a right to branch on this field.
     let auth = match remote.scheme() {
-        RemoteScheme::File | RemoteScheme::Http => AuthModel::Filesystem,
+        RemoteScheme::File => AuthModel::Filesystem,
         RemoteScheme::Ssh => AuthModel::SshKey,
-        RemoteScheme::Https => AuthModel::Token,
+        RemoteScheme::Http | RemoteScheme::Https => AuthModel::Anonymous,
         RemoteScheme::S3 => AuthModel::Anonymous,
     };
     if read_only {

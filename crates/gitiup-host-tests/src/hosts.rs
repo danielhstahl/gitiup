@@ -25,8 +25,8 @@ use gitiup_host::{BlobStore, RefStore};
 use gitiup_host::{FsHost, HostError, HostKind, HostResult, Namespace, RemoteConfig, S3Host};
 
 use crate::fixtures::{
-    BareRepo, DeniedBucket, GitServer, Scratch, dumb_bucket, paged_bucket, refused_server,
-    served_git_server, shared, static_server,
+    BareRepo, DeniedBucket, GitServer, PublicBucket, Scratch, dumb_bucket, paged_bucket,
+    refused_server, served_git_server, shared, static_server,
 };
 use crate::registration::{Knobs, Registration, Session};
 
@@ -70,6 +70,16 @@ pub const FS: Registration = Registration {
             "a directory with a lock file can always promise compare-and-swap, so there is no \
              degraded shape of this host to measure",
         ),
+        (
+            "a_public_store_reads_with_no_credential",
+            "a directory's credential is the filesystem: there is no anonymous reader of a path \
+             who is not also somebody the operating system already authorised",
+        ),
+        (
+            "a_credential_never_arrives_at_the_redirect_target",
+            "a path cannot redirect: the decoy run needs a transport with an origin, which the \
+             smart-HTTP and forge registrations have",
+        ),
     ],
     denied: None,
     denied_available: always,
@@ -78,6 +88,12 @@ pub const FS: Registration = Registration {
     degraded: None,
     degraded_available: always,
     degraded_unavailable: "",
+    anonymous: None,
+    anonymous_available: always,
+    anonymous_unavailable: "",
+    decoy: None,
+    decoy_available: always,
+    decoy_unavailable: "",
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +139,16 @@ pub const GIT_FILE: Registration = Registration {
             "a local bare repository has refs --force-with-lease, so it always has CAS; the \
              smart-HTTP registration covers the read-only mirror that does not",
         ),
+        (
+            "a_public_store_reads_with_no_credential",
+            "a repository under a path is readable by whoever the filesystem allows; the \
+             smart-HTTP registration covers the anonymous reader over a transport",
+        ),
+        (
+            "a_credential_never_arrives_at_the_redirect_target",
+            "file:// has no origin to redirect from; the decoy run needs a client that carries \
+             its own token, which the forge registration has",
+        ),
     ],
     denied: None,
     denied_available: always,
@@ -131,6 +157,12 @@ pub const GIT_FILE: Registration = Registration {
     degraded: None,
     degraded_available: always,
     degraded_unavailable: "",
+    anonymous: None,
+    anonymous_available: always,
+    anonymous_unavailable: "",
+    decoy: None,
+    decoy_available: always,
+    decoy_unavailable: "",
 };
 
 fn make_git_http() -> HostResult<Session> {
@@ -174,7 +206,14 @@ pub const GIT_HTTP: Registration = Registration {
         ref_count: 20,
         writers: 4,
     },
-    skips: &[],
+    skips: &[(
+        "a_credential_never_arrives_at_the_redirect_target",
+        "the plain-git host holds no credential to leak: `git` owns that transport, and a \
+         profile that names a token for a git remote is refused as a contradiction before any \
+         subprocess starts (`refused_credentials_are_denied_not_dropped`, and \
+         `GitHost::check_credentials`). The decoy run needs a client that carries its own \
+         token, which is the forge registration over the decoy endpoint",
+    )],
     denied: Some(make_git_refused),
     denied_available: have_git,
     denied_unavailable: "the refusing endpoint needs the git binary",
@@ -182,7 +221,64 @@ pub const GIT_HTTP: Registration = Registration {
     degraded: Some(make_git_dumb_http),
     degraded_available: have_git,
     degraded_unavailable: "the static-file endpoint needs the git binary",
+    anonymous: Some(make_git_http_anonymous),
+    anonymous_available: || have_git() && GitServer::available(),
+    anonymous_unavailable: crate::fixtures::NO_SMART_HTTP,
+    decoy: None,
+    decoy_available: always,
+    decoy_unavailable: "",
 };
+
+/// Publish one change and one attestation, through the transport the *owner* has, so a
+/// stranger has something to read.
+///
+/// Both registrations with an anonymous shape use it, over whatever handle can write: the
+/// point is only that the store is not empty when the stranger arrives, because "public
+/// but empty" and "not allowed" must be told apart and there has to be a *something* to
+/// tell apart.
+fn seed_public_store(host: &dyn gitiup_host::Host) -> HostResult<()> {
+    let record = br#"{"id":"public-1","state":"open"}"#;
+    let record_oid = host.put_cas(&Namespace::ATTESTATION, record)?;
+    host.update_ref_cas(
+        &gitiup_host::RefUpdate::create(gitiup_host::RefName::attestation(&record_oid), record_oid)
+            .with_actor("owner"),
+    )?;
+    Ok(())
+}
+
+/// The same served repository, read by somebody with nothing.
+///
+/// No profile, no token, no `GIT_*` credential anywhere: this is the stranger a public
+/// mirror exists for, and every assertion the body makes is made through this handle. The
+/// publish half runs over `file://` — the owner's shell, not the stranger's transport —
+/// which is exactly how a public mirror really gets its content.
+fn make_git_http_anonymous() -> HostResult<Session> {
+    let server = served_git_server().ok_or_else(|| {
+        HostError::invalid(
+            "git-http-backend",
+            "no smart-HTTP endpoint is available for this registration",
+        )
+    })?;
+    let scratch = Scratch::new("git-http-anonymous");
+    let name = format!("public-{}", crate::fixtures::next());
+    let repo = BareRepo::create(&server.root(), &name)?;
+    let owner = remote_at(
+        &format!("file://{}", repo.path.display()),
+        &scratch.join("owner"),
+    );
+    let published = GitHost::open_or_init(&owner)?;
+    seed_public_store(&published)?;
+    drop(published);
+
+    let stranger = remote_at(
+        &format!("{}/{name}.git", server.base()),
+        &scratch.join("mirror"),
+    );
+    let host = GitHost::open(&stranger)?;
+    Ok(Session::new(host)
+        .with(scratch)
+        .with(Cleanup(repo.path.clone())))
+}
 
 /// A smart-HTTP endpoint that refuses every request: what an expired token or a
 /// pulled key looks like to a client that still has the URL.
@@ -263,7 +359,12 @@ pub const S3_MEMORY: Registration = Registration {
         ref_count: 40,
         writers: 6,
     },
-    skips: &[],
+    skips: &[(
+        "a_credential_never_arrives_at_the_redirect_target",
+        "the in-process bucket has no HTTP origin to redirect from — there is no socket for a \
+         `302` to travel on, and asking a live endpoint to redirect to a decoy would be asking \
+         it to be misconfigured",
+    )],
     denied: Some(make_s3_denied),
     denied_available: always,
     denied_unavailable: "",
@@ -271,7 +372,35 @@ pub const S3_MEMORY: Registration = Registration {
     degraded: Some(make_s3_dumb),
     degraded_available: always,
     degraded_unavailable: "",
+    anonymous: Some(make_s3_public),
+    anonymous_available: always,
+    anonymous_unavailable: "",
+    decoy: None,
+    decoy_available: always,
+    decoy_unavailable: "",
 };
+
+/// The same bucket as a stranger reads it: a public-read policy, so objects and listings
+/// are served to anybody and no write is.
+///
+/// This is what a public mirror of a private repository actually is, and the shape an
+/// operator most often gets wrong: the host has to open it read-only and say so, rather
+/// than refuse it for failing the bucket-admin probes (versioning, conditional writes)
+/// that an anonymous caller is not allowed to make.
+fn make_s3_public() -> HostResult<Session> {
+    let name = format!("gitiup-public-{}", crate::fixtures::next());
+    let public = PublicBucket::named(&name);
+    let remote = memory_remote(&name).with_option("anonymous", "true");
+    // The owner, holding real credentials, publishes one attestation into the same
+    // bucket; the handle with nothing is what the body then reads.
+    let owner = public.owner();
+    let published = S3Host::open_or_init(shared(&owner), &remote)?;
+    seed_public_store(&published)?;
+    drop(published);
+    drop(owner);
+    let host = S3Host::open(shared(&public), &remote)?;
+    Ok(Session::new(host).with(public))
+}
 
 /// A bucket that answers every request the way a bucket answers a revoked key.
 fn make_s3_denied() -> HostResult<Session> {

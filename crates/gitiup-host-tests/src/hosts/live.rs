@@ -290,7 +290,16 @@ pub const S3_MINIO: Registration = Registration {
         ref_count: 40,
         writers: 6,
     },
-    skips: &[],
+    skips: &[
+        (
+            "a_public_store_reads_with_no_credential",
+            "an anonymous read of a live bucket needs a bucket policy this suite would have to set, unset and prove unset, and the AWS transport refuses an anonymous declaration rather than sign as the owner; the contract is measured against the in-process public bucket and the smart-HTTP server instead",
+        ),
+        (
+            "a_credential_never_arrives_at_the_redirect_target",
+            "a real endpoint cannot be asked to redirect to a decoy origin, and a bucket that did would be a misconfiguration of the service rather than a host to conform",
+        ),
+    ],
     denied: Some(make_minio_denied),
     denied_available: minio_denial_configured,
     denied_unavailable: "a refused-credential run needs GITIUP_CONFORMANCE_S3_DENIED=1 \
@@ -303,6 +312,12 @@ pub const S3_MINIO: Registration = Registration {
     degraded: Some(make_minio_degraded),
     degraded_available: minio_live_available,
     degraded_unavailable: "the cas=false variant needs the same endpoint as the live host",
+    anonymous: None,
+    anonymous_available: || true,
+    anonymous_unavailable: "",
+    decoy: None,
+    decoy_available: || true,
+    decoy_unavailable: "",
 };
 
 /// The same endpoint with conditional writes declared unavailable — which is what

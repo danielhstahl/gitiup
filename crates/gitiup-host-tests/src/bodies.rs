@@ -28,8 +28,8 @@ use gitiup_host::{
 
 use crate::changes;
 use crate::policy;
-use crate::registration::Denial;
 use crate::registration::Knobs;
+use crate::registration::{Decoy, DecoyOutcome, Denial};
 
 /// Which slot of a [`crate::Registration`] a body needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,11 @@ pub enum Shape {
     Denied,
     /// The registration's `degraded` variant.
     Degraded,
+    /// The registration's `anonymous` variant: the same store as a stranger sees it.
+    Anonymous,
+    /// The registration's `decoy` variant: a credential configured for an endpoint that
+    /// redirects it to a second origin.
+    Decoy,
 }
 
 /// What a body is handed.
@@ -55,6 +60,10 @@ pub struct Ctx<'a> {
     pub denial: Option<&'a Denial>,
     /// The `cas = false` variant — for `Degraded`.
     pub degraded: Option<&'a dyn Host>,
+    /// The stranger's handle on a public store — for `Anonymous`.
+    pub anonymous: Option<&'a dyn Host>,
+    /// The redirect-to-decoy run — for `Decoy`.
+    pub decoy: Option<&'a Decoy>,
     /// How heavy the size-shaped bodies should be.
     pub knobs: Knobs,
 }
@@ -80,6 +89,17 @@ impl Ctx<'_> {
     pub fn degraded(&self) -> &dyn Host {
         self.degraded
             .expect("runner: degraded body without a degraded host")
+    }
+
+    /// The stranger's handle, or a clear failure.
+    pub fn anonymous(&self) -> &dyn Host {
+        self.anonymous
+            .expect("runner: anonymous body without a no-credential host")
+    }
+
+    /// The decoy run, or a clear failure.
+    pub fn decoy(&self) -> &Decoy {
+        self.decoy.expect("runner: decoy body without a decoy run")
     }
 }
 
@@ -1103,6 +1123,310 @@ fn a_host_without_cas_refuses_cas_writes(ctx: &Ctx<'_>) {
     }
 }
 
+/// A public store reads with no credential at all, and "empty" is a different answer
+/// from "not allowed".
+///
+/// This is the whole reason a mirror exists: a stranger — a volunteer with no key, a CI
+/// job with no secret, the person who found the URL in a README — must be able to read
+/// it. The failure mode this body refuses to allow is the one that turns a missing
+/// credential into a missing fact: a store that answers "no such ref", or an empty
+/// listing, to a caller it is not allowed to serve. That is the same confusion
+/// [`refused_credentials_are_denied_not_dropped`] exists for, seen from the other side —
+/// there the credential was refused and must not look like an absence; here there is no
+/// credential, and an absence must not look like a refusal.
+///
+/// The two halves are therefore read together: this body pins what *"public, and nothing
+/// here"* answers like (`Ok`, with nothing in it), and the denied body pins what *"you
+/// may not"* answers like (`permission-denied`, exit 3, from every entry point). The
+/// pair is the property; neither body alone is.
+fn a_public_store_reads_with_no_credential(ctx: &Ctx<'_>) {
+    let host = ctx.anonymous();
+
+    // No credential was handed to this handle, so the first thing it must not do is claim
+    // one: a capability matrix that says `token` for a handle with no token is a lie a
+    // caller acts on (the forge adapter refuses CAS on exactly this field).
+    let caps = host.capabilities();
+    assert!(
+        matches!(
+            caps.auth,
+            gitiup_host::AuthModel::Anonymous | gitiup_host::AuthModel::Filesystem
+        ),
+        "a store read with no credential must not describe itself as authenticated: {caps:?}"
+    );
+
+    // Reads answer. This is the sentence the ticket is about: public means readable by
+    // somebody who has nothing to show.
+    let listed = host
+        .list_refs(&RefQuery::all())
+        .expect("a stranger may list the refs of a public store");
+    assert!(
+        !listed.is_empty(),
+        "the registration seeded this store as the owner, so a stranger must see something: \
+         an empty listing here means the store refused the anonymous read rather than serving it"
+    );
+    for reference in &listed {
+        let read = host
+            .get_ref(&reference.name)
+            .expect("a ref that was advertised is readable")
+            .unwrap_or_else(|| panic!("{} was advertised and then was not there", reference.name));
+        assert_eq!(read.oid, reference.oid);
+        // And the bytes behind it, which is the whole point of reading a mirror: the
+        // proof, not just the name of the proof.
+        let bytes = host
+            .get(&read.oid)
+            .expect("reading the record a ref names is not an error")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} names {} which the store cannot return",
+                    reference.name, read.oid
+                )
+            });
+        assert!(!bytes.is_empty(), "and the bytes are the bytes");
+    }
+
+    // "Public and empty" is an `Ok` with nothing in it, from every entry point. Not an
+    // error, not a refusal, not a `PermissionDenied` dressed up as an absence.
+    let ghost = Oid::hash_bytes(b"never published by anyone");
+    assert!(
+        host.get(&ghost)
+            .expect("a missing object is an answer, not a refusal")
+            .is_none(),
+        "and the answer is 'not here'"
+    );
+    assert!(!host.exists(&ghost).expect("exists answers too"));
+    assert!(
+        host.get_ref(&RefName::branch("no-such-branch").unwrap())
+            .expect("a missing ref is an answer")
+            .is_none()
+    );
+    assert!(
+        host.list_refs(&RefQuery::prefix(gitiup_host::refs::ns::CHANGES))
+            .expect("an empty namespace lists empty")
+            .is_empty()
+    );
+    assert!(
+        host.list(&Namespace::ROSTER)
+            .expect("a namespace nobody wrote to lists empty")
+            .is_empty()
+    );
+
+    // The one entry point that has to *err* on an absence — a pack want nobody holds —
+    // errors with the absence, not with a permission. That is the pair the denied body
+    // asserts the other half of: same question, two different words.
+    if let Err(err) = host.fetch_pack(&PackRequest::new([ghost])) {
+        assert!(
+            !err.is_denied(),
+            "a stranger asking for one missing object was told '{}': a public store that \
+             cannot answer is 'not found', and 'not allowed' is reserved for the store that \
+             knows who is asking ({err})",
+            err.kind()
+        );
+        assert_eq!(err.kind(), HostErrorKind::NotFound, "{err}");
+    }
+}
+
+/// A credential configured for one origin never arrives at another, not even when the
+/// first origin redirects every request to the second.
+///
+/// The decoy is a real HTTP origin on a loopback port (`fixtures::decoy_pair`) that
+/// records the credential headers of everything that reaches it. The registration's
+/// `decoy` variant points a remote at an endpoint that answers every request with a
+/// `302` at it, and configures a credential for that remote — the exact shape of a
+/// server that moved, a host an attacker controls the DNS for, or a mirror of a mirror.
+///
+/// Three things are asserted, and the order is not accidental:
+///
+/// 1. **the tripwire works** — the decoy recorded its own control credential. Without
+///    this, "nothing arrived" is a property of a broken fixture;
+/// 2. **no token arrived** — the ticket's own words. Nothing in the decoy's log carries
+///    the value this run configured, and nothing under this run's path carries any
+///    `Authorization` at all;
+/// 3. **the client said so** — a host that built must answer the redirect in the
+///    taxonomy (a refusal with a hint, never a silent success), and a host that refused
+///    to build did so *because* of the credential, with a hint naming the fix.
+///
+/// "Nothing arrived" includes the case where the client never followed the redirect at
+/// all, which is the usual one and the correct one: `curl` runs with `--no-location`, and
+/// git is never handed a token gitiup could not scope.
+fn a_credential_never_arrives_at_the_redirect_target(ctx: &Ctx<'_>) {
+    let decoy = ctx.decoy();
+    let pair = crate::fixtures::decoy_pair()
+        .expect("the registration said a redirect-to-decoy endpoint was available, and it is not");
+
+    // 1. The tripwire proves itself armed before anything is concluded from it. Its own
+    //    control credential went to the decoy port over the same recording path as any
+    //    other request, so an empty log from here on means "nothing arrived" and not
+    //    "nothing is recorded".
+    assert!(
+        pair.control_seen(),
+        "the decoy did not record its own control credential, so 'no token arrived' would \
+         prove nothing: {} is not recording arrivals",
+        pair.decoy()
+    );
+
+    // 2. Ask the host, and keep whatever it said. The reads go before the log is read,
+    //    because they are what could put something in it.
+    let attempted: Vec<(&str, HostError)> = match &decoy.outcome {
+        DecoyOutcome::Built { session } => {
+            let host: &dyn Host = session.host();
+            let ghost = Oid::hash_bytes(b"nothing was ever published behind this redirect");
+            // Every read is attempted: none may be answered as though nothing had moved.
+            // A redirect out from under a credential is a store that is not there, not an
+            // empty store and not a slower one.
+            vec![
+                (
+                    "list_refs",
+                    host.list_refs(&RefQuery::all())
+                        .expect_err("list_refs must not be answered through a redirect"),
+                ),
+                (
+                    "get",
+                    host.get(&ghost)
+                        .expect_err("a blob read must not be answered through a redirect"),
+                ),
+                (
+                    "get_ref",
+                    host.get_ref(&RefName::branch("main").unwrap())
+                        .expect_err("a ref read must not be answered through a redirect"),
+                ),
+            ]
+        }
+        // A registration that refused to build the host at all — because it looked at the
+        // credential and the endpoint and said no — gets that refusal judged below, and it
+        // is still judged against the decoy's log: refusing is not a licence to have sent
+        // something on the way out.
+        DecoyOutcome::Refused { .. } => Vec::new(),
+    };
+
+    // 3. What the two ports recorded for this run.
+    let all = decoy
+        .arrivals()
+        .expect("the endpoint did not answer the request for its log");
+    let at_decoy: Vec<&crate::fixtures::Arrival> = all
+        .iter()
+        .filter(|arrival| arrival.origin == "decoy")
+        .collect();
+
+    // 4. Nothing this run configured reached the other origin.
+    let leaked: Vec<&crate::fixtures::Arrival> = at_decoy
+        .iter()
+        .filter(|arrival| {
+            arrival.credential.contains(&decoy.token) || arrival.path.contains(&decoy.token)
+        })
+        .copied()
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the credential configured for {} arrived at {}: that is the leak this body exists to \
+         refuse: {leaked:?}",
+        decoy.configured,
+        decoy.target
+    );
+    // And nothing at the decoy carried a credential at all, which catches a run that sent
+    // one under a different name than the one this body generated.
+    let carried: Vec<&crate::fixtures::Arrival> = at_decoy
+        .iter()
+        .filter(|arrival| arrival.credential != "-")
+        .copied()
+        .collect();
+    assert!(
+        carried.is_empty(),
+        "a request reached the decoy origin carrying a credential: {carried:?}"
+    );
+    // Stronger still: the decoy was never asked anything. A client that stripped the
+    // `Authorization` header and followed the redirect anyway would leave a clean log
+    // while believing it had read a repository that is not the one it was configured for.
+    assert!(
+        at_decoy.is_empty(),
+        "{}: a credential was configured for {}, and the client followed a redirect to {} \
+         anyway ({} request(s) arrived there: {:?}). A cross-origin redirect is refused, never \
+         followed",
+        decoy.label,
+        decoy.configured,
+        decoy.target,
+        at_decoy.len(),
+        at_decoy
+    );
+
+    // 5. And the origin really was asked, under this run's own probe: a run that made no
+    //    request at all would also leave the decoy quiet, and that silence is a different
+    //    fact — it means the endpoint was never contacted.
+    let at_origin: Vec<&crate::fixtures::Arrival> = all
+        .iter()
+        .filter(|arrival| arrival.origin == "origin")
+        .collect();
+    assert!(
+        !at_origin.is_empty(),
+        "{}: the configured origin recorded no request under '{}', so the decoy being quiet \
+         proved nothing — the endpoint was never asked anything",
+        decoy.label,
+        decoy.probe
+    );
+
+    // 5b. The other half of the guarantee, and the half a broken transport can fake: the
+    //     credential really did go to the origin it belongs to. A client that sent a
+    //     credential *nowhere* would satisfy every assertion above, and this fixture is
+    //     what caught exactly that: the curl transport used to hand the placeholder it
+    //     prints for a human the same vector it hands `curl`, so the far end was asked to
+    //     accept the literal text of a variable name (giti-g5c.5).
+    if matches!(decoy.outcome, DecoyOutcome::Built { .. }) {
+        let carried_to_origin = at_origin
+            .iter()
+            .any(|arrival| arrival.credential.contains(&decoy.token));
+        assert!(
+            carried_to_origin,
+            "{}: none of the {} arrival(s) at {} carried the credential configured for it, so \
+             this run proved nothing about where a credential goes: it was not sending one",
+            decoy.label,
+            at_origin.len(),
+            decoy.configured
+        );
+    }
+
+    // 6. The answer, in the taxonomy: the cross-origin refusal (exit **3**, both hosts
+    //    named), or — for a registration that would not build a host at all — that refusal
+    //    judged the same way.
+    match &decoy.outcome {
+        DecoyOutcome::Built { .. } => {
+            for (what, error) in &attempted {
+                assert_redirect_refusal(decoy, what, error);
+            }
+        }
+        DecoyOutcome::Refused { error } => assert_redirect_refusal(decoy, "open", error),
+    }
+}
+
+/// Assert that one refusal is the *right* refusal for a credential crossing an origin.
+///
+/// Either the cross-origin refusal the design specifies — exit **3**, both hosts named —
+/// or a host that refuses to hold a credential for this transport at all (exit **6**, with
+/// the advice that names what to do instead). Anything else passing here would be a guard
+/// that guards nothing: "could not reach", "not a git repository" and a timeout all prove
+/// as little about credential scope as a run that never made a request.
+fn assert_redirect_refusal(decoy: &crate::registration::Decoy, what: &str, error: &HostError) {
+    if error.is_denied() {
+        let text = error.to_string();
+        assert!(
+            text.contains(&decoy.configured) && text.contains(&decoy.target),
+            "{}: {what} refused a credential crossing from {} to {}, so the refusal must name \
+             both hosts (the design's rule: name the host the credential belongs to and the one \
+             it was about to be sent to). Got: {text}",
+            decoy.label,
+            decoy.configured,
+            decoy.target
+        );
+        return;
+    }
+    assert!(
+        error.is_unsupported() && error.hint().is_some(),
+        "{}: {what} answered the redirect run with {} ({error}); it must either be the \
+         cross-origin refusal (exit 3, both hosts named) or an unsupported-capability refusal \
+         that says what to do instead",
+        decoy.label,
+        error.kind()
+    );
+}
+
 /// Assert that a fetched pack holds exactly the objects that were sent: the same
 /// digests, each with the namespace and length it was written under.
 ///
@@ -1158,7 +1482,7 @@ pub fn bodies() -> &'static [Body] {
     &BODIES
 }
 
-static BODIES: [Body; 20] = [
+static BODIES: [Body; 22] = [
     Body {
         name: "blobs_round_trip",
         shape: Shape::Single,
@@ -1298,6 +1622,20 @@ static BODIES: [Body; 20] = [
         requires_cas: false,
         note: "a host that cannot CAS says so from every direction, and keeps serving reads",
         run: a_host_without_cas_refuses_cas_writes,
+    },
+    Body {
+        name: "a_public_store_reads_with_no_credential",
+        shape: Shape::Anonymous,
+        requires_cas: false,
+        note: "a stranger with nothing to show reads it, and 'empty' is an answer, not a refusal",
+        run: a_public_store_reads_with_no_credential,
+    },
+    Body {
+        name: "a_credential_never_arrives_at_the_redirect_target",
+        shape: Shape::Decoy,
+        requires_cas: false,
+        note: "an endpoint that redirects to a decoy origin never gets the token",
+        run: a_credential_never_arrives_at_the_redirect_target,
     },
 ];
 

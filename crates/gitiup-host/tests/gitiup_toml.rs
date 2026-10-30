@@ -492,3 +492,137 @@ fn file_remotes_wire_straight_into_the_fs_host() {
         b"via remote"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Credential scope: a credential belongs to the origin its remote names, and to
+// nothing else (giti-g5c.5).
+// ---------------------------------------------------------------------------
+
+/// A config with one token-bearing remote and the secret it points at.
+///
+/// The variable is named for this binary and set here, because the whole point of the
+/// profile is that the token is in the environment: a test that resolved credentials
+/// without one would be testing the missing-token path instead.
+const SCOPE_TOKEN: &str = "gitiup-toml-scope-token";
+
+fn scoped_config() -> gitiup_host::Config {
+    // SAFETY: no other test in this binary names this variable.
+    unsafe { std::env::set_var("GITIUP_IT_SCOPE_TOKEN", SCOPE_TOKEN) };
+    parse(
+        "[[remote]]\nname = \"origin\"\nurl = \"https://forge.example.com/r.git\"\ncredentials-profile = \"ci\"\n\
+         [[remote]]\nname = \"pull\"\nurl = \"https://pull.example.com/r.git\"\n\
+         [credentials.ci]\nauth = \"token\"\ntoken-env = \"GITIUP_IT_SCOPE_TOKEN\"\n",
+    )
+}
+
+fn origin(url: &str) -> gitiup_host::scope::Origin {
+    gitiup_host::scope::Origin::parse(url).expect("{url} is an origin")
+}
+
+#[test]
+fn a_credential_is_resolved_only_for_the_origin_that_names_it() {
+    let config = scoped_config();
+    let remote = config.remote("origin").unwrap();
+
+    // The origin the remote itself names: resolved, and the token is there.
+    let same = config
+        .credentials_for_target(remote, &origin("https://forge.example.com/r.git"))
+        .expect("the configured origin is the credential's own");
+    assert_eq!(same.auth, AuthModel::Token);
+
+    // The same origin spelled with its default port is the same origin, and a
+    // credential that broke over that would break on every proxy that spells ports
+    // out loud.
+    config
+        .credentials_for_target(remote, &origin("https://forge.example.com:443/"))
+        .expect("an explicit default port is the same origin");
+}
+
+#[test]
+fn a_credential_never_crosses_to_another_host_and_says_which_two() {
+    let config = scoped_config();
+    let remote = config.remote("origin").unwrap();
+    // The rewrite case: something turned `forge.example.com` into a mirror — a
+    // `insteadOf`, a copy-paste, a DNS answer from a failover — and the request is now
+    // going somewhere else. Asking for credentials *for that target* is the moment the
+    // crossing would happen, and it is refused before a request exists.
+    for target in [
+        "https://mirror.example.com/r.git",
+        // A downgrade is a crossing too: the token would go unencrypted, and the
+        // host that answers plain http is not the one that was named.
+        "http://forge.example.com/r.git",
+        // A different port is a different origin even on the same host: a second
+        // service there is a second service.
+        "https://forge.example.com:8443/r.git",
+    ] {
+        let error = config
+            .credentials_for_target(remote, &origin(target))
+            .expect_err(&format!("{target} must not receive this credential"));
+        assert_eq!(error.kind(), HostErrorKind::PermissionDenied, "{error}");
+        assert_eq!(
+            error.exit_code(),
+            3,
+            "the cross-origin refusal is exit 3: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("forge.example.com") && text.contains(&origin(target).host().to_string()),
+            "the refusal has to name both hosts — where the credential belongs and where it \
+             was about to go. Got: {text}"
+        );
+        assert!(
+            !text.contains(SCOPE_TOKEN),
+            "a refusal must not print the secret: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_host_named_by_foreign_bytes_gets_no_credential() {
+    let config = scoped_config();
+    let from = origin("https://forge.example.com/r.git");
+
+    // The third case: a host resolved out of bytes that came from another store — a
+    // `gitiup.toml` that arrived with a mirror, a record naming "the other end". Data
+    // does not get to spend a credential, so there is nothing to hand out, and the
+    // answer is the refusal rather than a silent anonymous request.
+    let introduced = origin("https://elsewhere.example.net/r.git");
+    let error = config
+        .credentials_for_introduced(&introduced, &from, "gitiup.toml in the pack from origin")
+        .expect_err("a host nobody configured here gets no credential");
+    assert_eq!(error.kind(), HostErrorKind::PermissionDenied, "{error}");
+    assert_eq!(error.exit_code(), 3, "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("elsewhere.example.net") && text.contains("forge.example.com"),
+        "both hosts named: where the credential was configured and where it was about to \
+         go. Got: {text}"
+    );
+
+    // But a host this machine names for itself is not "introduced" at all: the entry in
+    // this file is what authorises a credential, not the mention in somebody else's. And
+    // what it gets is *its own* — `pull` has no profile, so it gets nothing, not the token
+    // that `origin`'s profile holds.
+    let locally_named = config
+        .credentials_for_introduced(
+            &origin("https://pull.example.com/r.git"),
+            &from,
+            "a foreign file",
+        )
+        .expect("a locally named remote is resolved by this config, on its own terms");
+    assert_eq!(
+        locally_named.auth,
+        AuthModel::Anonymous,
+        "`pull` names no credential, so an introduced read of it holds none"
+    );
+    assert!(
+        !locally_named.has_token(),
+        "the token belonging to `origin` must not travel to a remote that did not ask for it"
+    );
+    assert!(
+        config
+            .remote_for_origin(&origin("https://pull.example.com/r.git"))
+            .is_some_and(|found| found.name == "pull"),
+        "this machine's own config is the authority on which origins it knows"
+    );
+}

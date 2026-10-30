@@ -141,6 +141,28 @@ mod aws {
     /// questions that become the host's capabilities.
     pub fn connect(remote: &RemoteConfig) -> HostResult<Arc<AwsBucket>> {
         let (options, _) = S3Options::from_remote(remote)?;
+        if options.anonymous {
+            // Say it here rather than let the SDK sign with whatever the chain found,
+            // because "public-read" and "signed as the owner" are different requests and
+            // only one of them is what the operator asked for. An anonymous `GET` is an
+            // unsigned one; the SDK in this build always signs, so this transport cannot
+            // make the request the declaration describes — and a read that succeeded
+            // under the owner's own credentials would look like a working public mirror
+            // while proving nothing about it.
+            return Err(HostError::unsupported(
+                "anonymous",
+                format!(
+                    "remote '{}' is declared anonymous (public-read), and this build's S3 \"
+                     transport signs every request",
+                    remote.name
+                ),
+            )
+            .with_hint(
+                "drop anonymous from [remote.options] to read this bucket as yourself; a \
+                 public mirror that needs no credential is served today over `git+https://` \
+                 or a plain HTTPS endpoint, where there is nothing to sign",
+            ));
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

@@ -97,6 +97,9 @@ pub mod hosts;
 pub mod oid;
 pub mod pack;
 pub mod refs;
+/// The credential scope: which origin a credential may travel to, and the refusal when it
+/// would not (giti-g5c.5).
+pub mod scope;
 pub mod time;
 
 pub use blob::{BlobEntry, BlobStore, Namespace, Prefix};
@@ -120,6 +123,7 @@ pub use hosts::s3::{
 pub use oid::{Oid, OidKind};
 pub use pack::{Pack, PackFormat, PackRequest};
 pub use refs::{Actor, Expect, Ref, RefDeletion, RefName, RefQuery, RefStore, RefUpdate};
+pub use scope::{Breach, Origin, Scope};
 pub use time::Timestamp;
 
 /// Schema version of the host-facing on-disk formats written by this crate

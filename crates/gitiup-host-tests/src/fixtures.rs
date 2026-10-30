@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gitiup_host::{
-    BucketError, BucketFacts, BucketInfo, HostError, HostResult, Object, ObjectMeta, PutCond,
+    BucketError, BucketFacts, BucketInfo, HostError, HostResult, MemoryBucket, Object, ObjectMeta,
+    PutCond,
 };
 
 /// A process-wide counter so concurrent bodies never share a name.
@@ -364,6 +365,181 @@ pub fn refused_server() -> Option<&'static Server> {
     SERVER.get_or_init(Server::refusing).as_ref()
 }
 
+// ---------------------------------------------------------------------------
+// The redirect origin and its decoy (giti-g5c.5).
+// ---------------------------------------------------------------------------
+
+/// The redirect/redirect-target pair, started once per process.
+///
+/// One fixture, two ports: an origin that answers every request with a `302` at the
+/// decoy, and the decoy itself, which records what arrived and refuses. The pair is
+/// process-wide for the same reason the smart-HTTP server is — starting a web server is
+/// far too expensive to do per body — and a body keeps its own space by putting a unique
+/// path under the origin and asking the decoy only about arrivals at that path.
+pub struct DecoyPair {
+    origin: String,
+    decoy: String,
+    child: Child,
+}
+
+impl Drop for DecoyPair {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One request the decoy pair saw.
+///
+/// Four fields, all of them always present (the fixture prints `-` for an absent
+/// credential), because the assertion a body makes on this is "no arrival under my path
+/// carried a credential", and a parse that could silently drop a field would make that
+/// assertion pass by accident.
+#[derive(Debug, Clone)]
+pub struct Arrival {
+    /// `GET`, `POST`, \.
+    pub method: String,
+    /// Which of the pair was asked: `origin` or `decoy`.
+    pub origin: String,
+    /// The path it was asked for.
+    pub path: String,
+    /// The credential header it arrived with, or `-`.
+    pub credential: String,
+}
+
+impl std::fmt::Display for Arrival {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {}",
+            self.method, self.origin, self.path, self.credential
+        )
+    }
+}
+
+impl DecoyPair {
+    /// The origin a credential is configured for, and which redirects to the decoy.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The decoy origin: the host that must never see a token.
+    pub fn decoy(&self) -> &str {
+        &self.decoy
+    }
+
+    /// The arrivals whose path or credential headers mention `needle`, parsed.
+    ///
+    /// `None` when the endpoint could not be asked at all — which is a broken fixture, and
+    /// the caller must treat it as one rather than as an empty list.
+    pub fn arrivals(&self, needle: &str) -> Option<Vec<Arrival>> {
+        Some(
+            self.find(needle)?
+                .iter()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    Some(Arrival {
+                        method: fields.next()?.to_string(),
+                        origin: fields.next()?.to_string(),
+                        path: fields.next()?.to_string(),
+                        credential: fields.next()?.to_string(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// The arrival lines whose path or credential headers mention `needle`.
+    pub fn find(&self, needle: &str) -> Option<Vec<String>> {
+        let body = http_get(&format!(
+            "{}/__gitiup_arrivals__?find={}",
+            self.decoy, needle
+        ))?;
+        Some(
+            body.lines()
+                .map(str::to_string)
+                .filter(|line| !line.trim().is_empty())
+                .collect(),
+        )
+    }
+
+    /// Whether the decoy recorded its own control credential.
+    ///
+    /// This is asserted before anything else: "no token arrived" is only a fact about a
+    /// decoy that demonstrably records one.
+    pub fn control_seen(&self) -> bool {
+        self.find("gitiup-control")
+            .is_some_and(|lines| !lines.is_empty())
+    }
+
+    /// A path under the origin, for a body that wants its own namespace.
+    pub fn url_under(&self, path: &str) -> String {
+        format!("{}/{}", self.origin, path.trim_start_matches('/'))
+    }
+}
+
+/// The pair, started on first use.
+pub fn decoy_pair() -> Option<&'static DecoyPair> {
+    static PAIR: OnceLock<Option<DecoyPair>> = OnceLock::new();
+    PAIR.get_or_init(|| {
+        let python = which("python3")?;
+        let script = git_fixture_dir()?.join("git-decoy.py");
+        let mut command = Command::new(python);
+        command
+            .arg(&script)
+            .arg("0")
+            .arg("0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().ok()?;
+        let announced = BufReader::new(child.stdout.take()?).lines().next()?.ok()?;
+        let mut ports = announced.split_whitespace();
+        let origin_port: u16 = ports.next()?.parse().ok()?;
+        let decoy_port: u16 = ports.next()?.parse().ok()?;
+        if !(wait_until_listening(origin_port) && wait_until_listening(decoy_port)) {
+            return None;
+        }
+        Some(DecoyPair {
+            origin: format!("http://127.0.0.1:{origin_port}"),
+            decoy: format!("http://127.0.0.1:{decoy_port}"),
+            child,
+        })
+    })
+    .as_ref()
+}
+
+/// One plain HTTP `GET`, read to the end, with no HTTP library.
+///
+/// The suite asks a fixture a question and reads the answer; that is the whole use, and
+/// linking an HTTP client into the conformance suite to make one request would drag in
+/// a TLS stack to talk to `127.0.0.1`.
+fn http_get(url: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let (_scheme, rest) = url.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (authority, 80u16),
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    // The body starts after the blank line that ends the headers.
+    let (_, body) = text.split_once("\r\n\r\n")?;
+    Some(body.to_string())
+}
+
 /// A static file server for one directory: cheap enough to own per body, so a
 /// mirrored repository can be deleted along with the body that made it.
 pub fn static_server(root: &Path) -> Option<Server> {
@@ -435,6 +611,78 @@ impl gitiup_host::Bucket for DeniedBucket {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
         Err(self.denied(prefix))
+    }
+}
+
+/// A bucket that answers a stranger the way a bucket with a public-read policy does: every
+/// object reads, listings work, and every write — and every bucket-admin question the
+/// anonymous reader has no business asking — is refused.
+///
+/// The owner's handle is the inner [`MemoryBucket`], so a registration can seed the store
+/// the way an owner would and then hand the *same* bucket to a host that has nothing to
+/// authenticate with. That is the whole shape of a public mirror: the bytes are the same
+/// bytes, and the difference is who is asking.
+#[derive(Debug, Clone)]
+pub struct PublicBucket {
+    owner: MemoryBucket,
+}
+
+impl PublicBucket {
+    /// A public-read bucket that starts empty (for the owner to fill).
+    pub fn named(name: &str) -> PublicBucket {
+        PublicBucket {
+            owner: MemoryBucket::forge(name),
+        }
+    }
+
+    /// The handle the owner writes with — what a credentials-bearing caller has.
+    pub fn owner(&self) -> MemoryBucket {
+        self.owner.clone()
+    }
+
+    fn denied(&self, key: &str) -> BucketError {
+        BucketError::Denied {
+            key: key.to_string(),
+            message: format!(
+                "AccessDenied: the request does not have 's3:GetObject' permission on {key} \\n                 (this bucket is public-read)"
+            ),
+        }
+    }
+}
+
+impl gitiup_host::Bucket for PublicBucket {
+    fn info(&self) -> BucketInfo {
+        BucketInfo {
+            credentials: "anonymous (public-read bucket policy)".to_string(),
+            ..self.owner.info()
+        }
+    }
+
+    fn facts(&self) -> Result<BucketFacts, BucketError> {
+        // The bucket is versioned — that is a fact about it, not about the caller — but a
+        // stranger cannot ask, cannot run the conditional-write probe, and cannot write,
+        // so the only facts it may rely on are the ones that make it read-only.
+        Ok(BucketFacts {
+            versioning: gitiup_host::VersioningState::Enabled,
+            object_lock: false,
+            conditional_writes: false,
+        })
+    }
+
+    fn get(&self, key: &str) -> Result<Option<Object>, BucketError> {
+        self.owner.get(key)
+    }
+
+    fn head(&self, key: &str) -> Result<Option<ObjectMeta>, BucketError> {
+        self.owner.head(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, BucketError> {
+        self.owner.list(prefix)
+    }
+
+    fn put(&self, key: &str, _bytes: &[u8], _cond: PutCond) -> Result<ObjectMeta, BucketError> {
+        Err(self.denied(key))
     }
 }
 

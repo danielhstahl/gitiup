@@ -330,6 +330,23 @@ pub struct S3Options {
     pub cas_backoff: Duration,
     /// `cas-backoff-cap` — ceiling for that backoff.
     pub cas_backoff_cap: Duration,
+    /// `anonymous` — the bucket serves **public reads**: no credential is sent, and no
+    /// write is possible.
+    ///
+    /// This is a declaration by the operator, because a bucket that answers anonymous
+    /// `GET`s and one that answers them today only because it is misconfigured look
+    /// identical from here, and the difference decides whether a stranger may read the
+    /// mirror or someone may overwrite it. Saying it turns the host read-only, makes
+    /// [`Capabilities::auth`] honest about holding no credential, and stops the bucket
+    /// being interrogated for facts an anonymous caller is not allowed to know
+    /// (versioning, conditional writes) — those are bucket-admin questions, and refusing
+    /// them says nothing about the objects (giti-g5c.5).
+    ///
+    /// The AWS transport refuses this declaration rather than pretending: an anonymous
+    /// `GET` is an unsigned one, and the SDK signs everything it is given, so a read
+    /// "from a public bucket" through it would really be a read as the owner. Public
+    /// mirrors that need no credential are served over `git+https://` or plain HTTPS.
+    pub anonymous: bool,
 }
 
 impl Default for S3Options {
@@ -347,6 +364,7 @@ impl Default for S3Options {
             cas_attempts: DEFAULT_CAS_ATTEMPTS,
             cas_backoff: DEFAULT_CAS_BACKOFF,
             cas_backoff_cap: DEFAULT_CAS_BACKOFF_CAP,
+            anonymous: false,
         }
     }
 }
@@ -382,6 +400,10 @@ impl S3Options {
                 }
                 "require-versioning" => {
                     options.require_versioning = parse_bool(&key, &value)?;
+                    true
+                }
+                "anonymous" | "public-read" => {
+                    options.anonymous = parse_bool(&key, &value)?;
                     true
                 }
                 "conditional-writes" => {
@@ -641,7 +663,7 @@ enum Probe {
     Skip,
 }
 
-fn capabilities_for(facts: &BucketFacts) -> Capabilities {
+fn capabilities_for(facts: &BucketFacts, anonymous: bool) -> Capabilities {
     Capabilities {
         // No conditional writes means `cas = false`, and every write that gates a
         // merge refuses there. That is the design rule, not a limitation to work
@@ -652,7 +674,14 @@ fn capabilities_for(facts: &BucketFacts) -> Capabilities {
         // default implementation applies updates in order and rolls back on a
         // failure, so callers have to be told it is not atomic.
         atomic_multi_write: false,
-        auth: AuthModel::CloudRole,
+        // "Which credential does this handle hold" is a question a caller branches on,
+        // and the answer for a public-read bucket is: none. Saying `cloud-role` there
+        // would promise an identity the transport never sends.
+        auth: if anonymous {
+            AuthModel::Anonymous
+        } else {
+            AuthModel::CloudRole
+        },
     }
 }
 
@@ -907,9 +936,23 @@ impl S3Host {
         if options.ref_cache_ttl == Duration::ZERO {
             advice.push("ref-cache-ttl = 0s: every ref read goes back to the bucket".to_string());
         }
+        if options.anonymous {
+            advice.push(
+                "this remote is declared anonymous (public-read): no credential is sent, so \
+                 every write is refused here before it reaches the bucket — which is what a \
+                 public mirror of a private repository is for"
+                    .to_string(),
+            );
+            // The two probe questions a public bucket cannot answer: versioning and the
+            // conditional-write probe are bucket-admin calls an anonymous caller is
+            // refused, and being refused them says nothing about the objects. Without
+            // this, a perfectly served public bucket would fail to open.
+            options.require_versioning = false;
+            options.conditional_writes = ConditionalWrites::Off;
+        }
         advice.extend(facts.advice());
         options.cas_attempts = options.cas_attempts.min(16);
-        let capabilities = capabilities_for(&facts);
+        let capabilities = capabilities_for(&facts, options.anonymous);
         Ok(S3Host {
             inner: Arc::new(Inner {
                 bucket,

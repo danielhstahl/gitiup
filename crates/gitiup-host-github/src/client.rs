@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gitiup_host::scope::{Origin, Scope};
 use gitiup_host::{HostError, HostResult, RemoteConfig, config::parse_timeout};
 
 use crate::auth::Auth;
@@ -665,7 +666,6 @@ impl Client {
 
     /// Add the identity headers. Split out so a test can look at what would be sent.
     fn prepare(&self, request: &Request) -> HostResult<Request> {
-        let host = codec::url_host(&request.url);
         let mut prepared = request.clone();
         if let Some(userinfo) = codec::split_url(&request.url)
             .map(|(origin, _)| origin)
@@ -684,7 +684,7 @@ impl Client {
                 && !name.eq_ignore_ascii_case("user-agent")
                 && !name.eq_ignore_ascii_case("x-github-api-version")
         });
-        if let Some(header) = self.auth.header(&host)? {
+        if let Some(header) = self.auth.header(&request.url)? {
             prepared.headers.push(("Authorization".into(), header));
         }
         prepared
@@ -789,6 +789,50 @@ impl Client {
         None
     }
 
+    /// What a redirect answers as.
+    ///
+    /// Never followed, whatever the answer is: `curl` is run with `--no-location` for
+    /// this exact reason (see [`crate::curl`]). What differs is which refusal a caller
+    /// gets, and the difference is the ticket:
+    ///
+    /// * the forge pointed at *another origin* while this adapter was holding a token —
+    ///   [`gitiup_host::scope::refusal`]: exit **3**, both hosts named, because the
+    ///   question was "would the token go?" and the answer is "no, and here are the two
+    ///   hosts that disagree";
+    /// * the same origin, or no token to protect — a configuration question, exit **6**:
+    ///   your `api-base` is not where the forge lives.
+    fn redirect_answer(&self, response: &Response, action: &str) -> HostError {
+        let plain = || {
+            HostError::invalid(
+                "github api-base",
+                format!(
+                    "{action}: the forge answered {} and was not followed",
+                    response.status
+                ),
+            )
+            .with_hint(
+                "a redirect is not followed because the Authorization header would go \
+                 with it; fix `api-base` to the address the forge points at",
+            )
+        };
+        let Some(location) = response.header("location") else {
+            return plain();
+        };
+        if !self.auth.has_token() {
+            // Nothing to leak, and saying "your credential would have gone there" about
+            // an anonymous call would be a story about a thing that cannot happen.
+            return plain();
+        }
+        let Ok(base) = Origin::parse(&self.repo.api_base) else {
+            return plain();
+        };
+        match Scope::for_origin(base).guard_redirect(location) {
+            // Same origin: the forge moved path, or wants a retry elsewhere on itself.
+            Ok(_) => plain(),
+            Err(refusal) => refusal,
+        }
+    }
+
     /// Turn an HTTP answer into the taxonomy every host speaks.
     fn error_for(&self, response: Response, action: &str) -> HostError {
         let message = response
@@ -823,17 +867,7 @@ impl Client {
             422 => HostError::invalid("github call", format!("{action}: {message}"))
                 .with_hint(document),
             451 => HostError::denied(format!("{action}: the forge refuses this content (451)")),
-            301 | 302 | 307 | 308 => HostError::invalid(
-                "github api-base",
-                format!(
-                    "{action}: the forge answered {} and was not followed",
-                    response.status
-                ),
-            )
-            .with_hint(
-                "a redirect is not followed because the Authorization header would go \
-                 with it; fix `api-base` to the address the forge points at",
-            ),
+            301 | 302 | 307 | 308 => self.redirect_answer(&response, action),
             status if (500..600).contains(&status) => unreachable(
                 format!("the forge answered {status} to {action}"),
                 None,

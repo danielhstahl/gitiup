@@ -60,7 +60,11 @@ impl GitHubHost {
     ) -> HostResult<GitHubHost> {
         let repo = RepoRef::from_remote(remote)?;
         accept_forge_host(remote, &repo)?;
-        let auth = Auth::resolve(remote, profile, &repo.api_host());
+        // The whole API base, not just its host: a forge at `http://127.0.0.1:9999/api/v3`
+        // and one at `https://api.github.com` are different origins, and a scope built from
+        // the bare host would default to https and then refuse (or worse, silently allow)
+        // the requests the operator actually configured.
+        let auth = Auth::resolve(remote, profile, &repo.api_base);
         let options = ClientOptions::from_remote(remote)?;
         let client = Client::new(repo.clone(), auth, transport, options);
         Ok(GitHubHost {

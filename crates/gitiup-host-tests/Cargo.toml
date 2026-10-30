@@ -33,7 +33,16 @@ s3 = ["gitiup-host/s3", "dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
 # The github adapter, so the suite covers the forge-backed host too. Off by
 # default: the adapter is the one crate allowed to talk to a forge, and this
 # crate must not smuggle one into a hermetic build by accident.
-github = ["dep:gitiup-host-github", "gitiup-host-github/testing"]
+# `curl` on purpose: the decoy body (giti-g5c.5) sends a real token over a real socket and
+# asks a second origin what arrived, and the mock forge cannot answer that question — the
+# double and the code under test are the same author's, so agreement between them is not
+# evidence. Without this feature the transport refuses to build and the body has nothing to
+# measure.
+github = [
+    "dep:gitiup-host-github",
+    "gitiup-host-github/testing",
+    "gitiup-host-github/curl",
+]
 
 [dependencies]
 gitiup-host = { path = "../gitiup-host" }

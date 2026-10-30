@@ -47,8 +47,11 @@ host.require(Capability::AtomicMultiWrite)?;   // UnsupportedCas if not
 that cannot CAS reports `cas = false` and every write that gates a merge fails
 early with `UnsupportedCas` and a hint, instead of losing a ref later. Suggested
 shapings: `fs` = all three (`auth: filesystem`), S3 = `cas + immutable` without
-multi-write (`auth: cloud-role`), git = `cas + immutable` via force-with-lease
-(`auth: ssh-key`).
+multi-write (`auth: cloud-role`, or `anonymous` for a bucket declared
+public-read), git over ssh = `cas + immutable` via force-with-lease
+(`auth: ssh-key`), git over http = the same guarantees with `auth: anonymous`
+because the credential that authorises a private repository there is git's, not
+gitiup's — see the scope note below.
 
 ## Ref namespaces (shared by every host)
 
@@ -224,6 +227,33 @@ schema versions are all hard errors with a hint about the fix;
 timeouts, credentials embedded in a URL). `Config::to_toml` writes the file back
 losslessly, `Config::to_json` renders it for `--json` output with secrets
 redacted. See `examples/` and `crates/gitiup-host/examples/gitiup.toml`.
+
+## Credential scope (`scope`)
+
+`Origin` is scheme + host + port, normalised (`https://h`, `https://h:443`, `H` and
+`h.` are one origin; `http` and `https` are not). `Scope` is the one origin a
+token may be sent to — the one its own remote names — and `Breach` names the three
+ways a client finds out it is about to talk to another: a **redirect** to a
+different host, a **URL rewrite** between the config and the socket (`insteadOf`,
+a pointer record that moved), and a host **introduced** by bytes that came out of
+the first store (a `gitiup.toml` that arrived with a mirror). All three raise
+`PermissionDenied` — exit **3** — with **both hosts named**, because "which two?"
+is the question an operator has to answer and a refusal that omits them is a
+mystery rather than a fix. `Config::credentials_for_target` and
+`credentials_for_introduced` are the two doors a call site goes through, and a
+host named by foreign bytes gets a credential only if *this* machine's own
+`gitiup.toml` independently names that origin.
+
+The transports decide this, not the call sites: `curl` runs `--no-location`, and
+`git` is never handed a token — which is why `GitHost::check_credentials` refuses
+`token-env` on a plain-git remote (exit 6: nothing ever left for it to be refused
+about) and why an `http(s)` git remote reports `auth: anonymous`. The mirror
+half of the property — a public store reads with no credential, and "empty" is an
+`Ok` with nothing in it rather than a refusal — is measured alongside its opposite
+in [`gitiup-host-tests`](../gitiup-host-tests/README.md):
+`a_public_store_reads_with_no_credential` and
+`a_credential_never_arrives_at_the_redirect_target`, which drives a real token at
+an endpoint that redirects to a second origin reporting what it was sent.
 
 ## Error taxonomy
 

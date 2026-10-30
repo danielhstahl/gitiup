@@ -104,6 +104,30 @@ impl CurlTransport {
     /// `curl` receives them), with the authorisation header replaced by a
     /// placeholder so the vector can be printed.
     pub fn argv(&self, request: &Request) -> Vec<String> {
+        self.build_argv(request, Argv::Printed)
+    }
+
+    /// The argv `curl` is actually given: the same vector, with the credential the caller
+    /// resolved in it.
+    ///
+    /// This used to be [`CurlTransport::argv`], and the request went out asking the server
+    /// to accept the literal text `$GITIUP_GITHUB_TOKEN`: a placeholder meant for a
+    /// printed command line, sent as if it were a secret. giti-g5c.5's decoy is what
+    /// caught it — a body that checks "the credential never reaches the other origin"
+    /// proves nothing while the credential reaches *no* origin, so the decoy was quietly
+    /// being asked to agree with a client that had never authenticated at all.
+    ///
+    /// The trade-off, said out loud rather than left to be discovered: a header on a
+    /// command line is visible in the process table to whoever can see processes on this
+    /// machine, for as long as the request takes. curl's only alternative is a config file
+    /// holding the same secret, which is on disk instead — and stays there if the process is
+    /// killed. What stays redacted is the printed form, so the value cannot end up in a
+    /// log, a run report or an issue attachment.
+    fn send_argv(&self, request: &Request) -> Vec<String> {
+        self.build_argv(request, Argv::Run)
+    }
+
+    fn build_argv(&self, request: &Request, purpose: Argv) -> Vec<String> {
         let host = crate::codec::url_host(&request.url);
         let mut argv = vec![
             self.program.display().to_string(),
@@ -141,11 +165,12 @@ impl CurlTransport {
             argv.push(proxy.clone());
         }
         for (name, value) in &request.headers {
-            let value = if name.eq_ignore_ascii_case("authorization") {
-                "Bearer $GITIUP_GITHUB_TOKEN".to_string()
-            } else {
-                value.clone()
-            };
+            let value =
+                if name.eq_ignore_ascii_case("authorization") && matches!(purpose, Argv::Printed) {
+                    "Bearer $GITIUP_GITHUB_TOKEN".to_string()
+                } else {
+                    value.clone()
+                };
             argv.push("--header".into());
             argv.push(format!("{name}: {value}"));
         }
@@ -165,9 +190,18 @@ impl Default for CurlTransport {
     }
 }
 
+/// Which caller wants the argv: one that prints it, one that runs it.
+#[derive(Clone, Copy)]
+enum Argv {
+    /// Redacted: safe to put in a message.
+    Printed,
+    /// Real: carries the credential, and is only ever handed to `Command`.
+    Run,
+}
+
 impl Transport for CurlTransport {
     fn send(&self, request: &Request) -> Result<Response, TransportError> {
-        let argv = self.argv(request);
+        let argv = self.send_argv(request);
         // `argv` is built with `--header Name: value` pairs, so a value with a
         // newline could inject another header. Refuse rather than send it.
         for (name, value) in &request.headers {
@@ -354,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn the_argv_writes_down_every_call_but_the_token() {
+    fn the_printed_argv_writes_down_every_call_but_the_token() {
         let transport = CurlTransport {
             program: PathBuf::from("curl"),
             connect_timeout: Duration::from_secs(5),
@@ -384,6 +418,50 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair[0] == "--header" && pair[1].starts_with("Authorization: Bearer $")),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_run_argv_carries_the_credential_the_printed_one_hides() {
+        let transport = CurlTransport {
+            program: PathBuf::from("curl"),
+            connect_timeout: Duration::from_secs(5),
+            ca_bundle: None,
+            proxy: None,
+        };
+        let request = Request::new(
+            crate::transport::Method::Get,
+            "https://api.github.com/repos/o/r",
+        )
+        .with_header("Authorization", "Bearer really-a-token");
+        // The printed form is the one that goes into a message: no secret.
+        let printed = transport.argv(&request);
+        assert!(
+            !printed.join(" ").contains("really-a-token"),
+            "the printed argv must not carry the token"
+        );
+        // The argv handed to `curl` is the one that has to authenticate: if it does not
+        // carry the token, every claim about where the token goes is a claim about a
+        // request that never happened.
+        let run = transport.send_argv(&request);
+        assert!(
+            run.windows(2)
+                .any(|pair| pair[0] == "--header"
+                    && pair[1] == "Authorization: Bearer really-a-token"),
+            "curl has to be given the credential: {}",
+            run.join(" ")
+        );
+        // And the two differ in that one argument and nothing else, so the audit trail
+        // still describes the call that was made.
+        assert_eq!(printed.len(), run.len());
+        assert_eq!(
+            printed
+                .iter()
+                .zip(run.iter())
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "only the credential differs"
         );
     }
 

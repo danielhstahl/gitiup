@@ -24,6 +24,10 @@ region = "eu-central-1"
 # force-path-style = true                   # ...which usually needs path-style addressing
 # profile = "ci-writer"                     # a shared-config profile, instead of the env
 # conditional-writes = "auto"               # probe once at connect (the default)
+# anonymous = true                          # public-read bucket: reads only, no credential sent,
+#                                           #   and refused outright by this build's AWS transport
+#                                           #   (an anonymous GET is an unsigned one, and the SDK
+#                                           #   signs everything) — see docs/federation.md
 # ref-cache-ttl = "2s"                      # ref advertisement TTL; "off" disables it
 # multipart-threshold-mib = 8               # packs at least this big go up as multipart
 
@@ -66,9 +70,14 @@ host-type = "git"          # fs | git | s3 | github — see docs/host-abstractio
 [credentials.owner]
 auth = "cloud-role"
 
-# A token, for a smart-HTTP git remote: the profile names the *variable*, and the
-# value is read from the environment when it is used. Never put the value here,
-# and never point this at an `s3://` remote — the bucket is the AWS chain's alone.
+# A token, for a forge remote (see `gitiup-host-github`): the profile names the
+# *variable*, and the value is read from the environment when it is used. Never
+# put the value here, and never point this at an `s3://` remote — the bucket is
+# the AWS chain's alone. A plain-git remote refuses it too: `git` authenticates
+# for itself (an ssh key, an agent, a credential helper), and gitiup will not
+# hand a token to a transport it cannot scope across a redirect — so over https
+# let git use its own helper, over ssh use the `ssh-key` profile below, and put
+# the store on a host gitiup authenticates to directly (a bucket, or a forge).
 # [credentials.mirror]
 # auth = "token"
 # token-env = "GITIUP_MIRROR_TOKEN"
