@@ -41,10 +41,23 @@ name = "colo"
 url = "ssh://git@build.example.net:2222/srv/git/my-repo.git"
 credentials-profile = "deploy"
 
-# A local directory — what the tests and air-gapped setups use.
+# A local directory store — what the tests, air-gapped setups and a scratch
+# bucket-on-disk use. `file://` is a *directory* store: a plain folder gitiup
+# fills in, not a git repository.
 [[remote]]
 name = "scratch"
+url = "file:///srv/gitiup/store"
+
+# A repository on the same filesystem. Same transport, different kind of store,
+# and the URL cannot tell them apart — so it is said. Without `host-type` a
+# `file://` remote at a repository is refused with this line in the hint.
+[[remote]]
+name = "local-repo"
 url = "file:///srv/git/my-repo.git"
+
+[remote.options]
+host-type = "git"          # fs | git | s3 | github — see docs/host-abstraction.md
+# work-dir = "~/.cache/gitiup/host"   # where the local mirror of it lives
 
 # The bucket is authenticated by the AWS chain — env (access keys or a web
 # identity/IRSA), a shared-config profile, or SSO — so this profile names no

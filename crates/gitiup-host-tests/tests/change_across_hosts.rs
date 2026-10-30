@@ -32,10 +32,14 @@ const TESTED_PAIRS: &[&str] = &["s3-memory->git-file"];
 const TESTED_LIVE_PAIRS: &[&str] = &["s3-minio->git-http"];
 
 fn tested_pairs() -> Vec<&'static str> {
-    let mut names = TESTED_PAIRS.to_vec();
     #[cfg(feature = "s3")]
-    names.extend(TESTED_LIVE_PAIRS);
-    names
+    {
+        let mut names = TESTED_PAIRS.to_vec();
+        names.extend(TESTED_LIVE_PAIRS);
+        names
+    }
+    #[cfg(not(feature = "s3"))]
+    TESTED_PAIRS.to_vec()
 }
 
 /// Look one pair up by name.

@@ -237,6 +237,21 @@ pub(crate) struct Opened {
 /// named, so a mistyped remote cannot turn into a roster published somewhere else.
 pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
     if let Some(dir) = args.get("--store") {
+        // `--store` names a directory store, and a git repository is not one: the two
+        // layouts cannot share a path (the fs host's `refs` is a file where git's is a
+        // directory), so saying so here is the difference between a hint and an errno.
+        let path = Path::new(dir);
+        if remotes::git_repository(path) {
+            return Err(CliError::refused(
+                format!("store '{dir}' is a git repository, not a gitiup directory store"),
+                format!(
+                    "a repository is served by the plain-git host: give it a [[remote]] with \
+                     url = \"file://{dir}\" and `host-type = \"git\"` in `[remote.options]`, \
+                     then use --remote <name> — or point --store at a plain directory \
+                     (see `gitiup doctor --remotes`)"
+                ),
+            ));
+        }
         let host =
             FsHost::open_or_create(dir).map_err(|e| CliError::io(format!("store '{dir}': {e}")))?;
         return Ok(Some(Opened {
@@ -274,9 +289,17 @@ pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
     // alternative is a write that "succeeds" against a remote whose records this binary
     // cannot read. The same answer `gitiup doctor --remotes` gives, at the same code.
     if let Err(why) = remotes::classify(remote) {
-        return Err(CliError::refused(
+        // The refusal knows its own code and its own fix: a missing adapter is a build
+        // problem (6, with the feature in the hint) and a `host-type` that says `fs`
+        // about a bucket is a typo (2), and neither is served well by a canned line.
+        let hint = why
+            .hint()
+            .unwrap_or("the message above names the feature to build with")
+            .to_string();
+        return Err(CliError::scored(
+            why.exit_code(),
             format!("remote '{}': {why}", remote.name),
-            "the message above names the feature to build with",
+            Some(hint),
         ));
     }
     let host = remotes::open(remote, config.credential_profile(remote))

@@ -1,9 +1,12 @@
 # Contributing without a forge — the change workflow
 
-*Ticket: `giti-b2z.3` (`gitiup change new|submit|list|show`), with `giti-b2z.5`
-(`gitiup change checkout`). Format decision:
-[ADR-0003](adr/0003-change-record-format-and-merge-semantics.md). Host contract:
-[host abstraction](host-abstraction.md). Proofs about a change:
+*Tickets: the `giti-b2z` epic — `giti-b2z.3` (`gitiup change new|submit|list|show`),
+`.4` (`change merge|reconcile`), `.5` (`change checkout`), `.6` (the change-workflow
+conformance suite), `.7` (GitHub parity) — and the epic's own sequence, run against a
+directory store and a bare repository in
+[`change_bare_repo_cli.rs`](../crates/gitiup/tests/change_bare_repo_cli.rs). Format
+decision: [ADR-0003](adr/0003-change-record-format-and-merge-semantics.md). Host
+contract: [host abstraction](host-abstraction.md). Proofs about a change:
 [verification](verification.md).*
 
 > A change is the object a stranger publishes when there is no forge. Not a pull request,
@@ -80,7 +83,9 @@ change  chg-8a4f0932daec33f2  ·  open
 
 Two things in that screen are load-bearing. `--store ../store` and `--remote origin` are
 the only ways a store is chosen — exactly as `gitiup attest push` chooses one, and the
-same three hosts answer all of them: a directory, a bare repository, a bucket. And
+same three hosts answer all of them: a directory, a bare repository, a bucket (a remote
+named neither falls back to `default-remote`, and the output says so in those words, so
+the store that was written to is never a mystery). And
 `show` printed the author as a fingerprint with a signature behind it, because that is
 the only form of "who proposed this" that a mirror can also confirm.
 
@@ -555,9 +560,9 @@ branch on the transport and does not branch on the verb either:
 | exit | when |
 |------|------|
 | 0 | published, listed, shown, merged, reconciled (including the idempotent `already: true`) |
-| 2 | usage: unknown verb or flag, missing `--base`, a handle shorter than 4 hex, a `--proof` or `--expected-oid` that cannot mean anything to the store |
+| 2 | usage: unknown verb or flag, missing `--base`, a handle shorter than 4 hex, a `--proof` or `--expected-oid` that cannot mean anything to the store, a `host-type` in `gitiup.toml` that is not a store gitiup knows or that its URL contradicts |
 | 3 | I/O, an unreachable store, git failing — and a refusal the **store** owns, passed through in the store's own taxonomy (a credential that may not write `refs/heads/**` stays `permission denied`, never retold as an I/O error or a generic 6) |
-| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, an ambiguous handle — and for a merge: not a fast-forward, an ancestry the tool cannot check, a branch that has already moved (reconcile instead), a change already merged or abandoned, a proof the store cannot return, `--proof-required` with no policy engine — and for a checkout: a dirty worktree (paths named), a bare repository, a store with no git objects, a local ref the change cannot fast-forward, no round for `--for`, a `--for` round drawn against another head |
+| 6 | refused: no store named, no key, stale base (both oids), the store has no such branch, an attempt that already exists with a different head, a conflict, a change id your key cannot sign for, nothing to propose, a handle that matches nothing in this store or matches two — and for a merge: not a fast-forward, an ancestry the tool cannot check, a branch that has already moved (reconcile instead), a change already merged or abandoned, a proof the store cannot return, `--proof-required` with no policy engine — and for a checkout: a dirty worktree (paths named), a bare repository, a store with no git objects, a local ref the change cannot fast-forward, no round for `--for`, a `--for` round drawn against another head — and for any of them, a store named that cannot hold this kind of store (a git repository given to `--store`, or a `file://` remote at one with nothing said about it: the hint names `host-type`) |
 | 7 | a signature that does not verify, or a `key_id` that is not the fingerprint of the key offered |
 | 8 | bytes that are not their own canonical form, a record that does not re-hash to the name it is filed under, a `change_id` that does not re-derive — and for a checkout, a proof ref that arrived without the bytes it names |
 
@@ -569,6 +574,14 @@ decides which host serves a remote, and a remote that needs a forge adapter this
 not compiled with is refused **by name**, with `hosts-github` in the hint, before anything
 is drafted. Accepting such a remote and then "helpfully" driving it with the plain-git host
 would let `submit` succeed against a remote whose change database the build cannot read.
+
+The URL says the transport, and `host-type` says the store: `fs`, `git`, `s3` or `github`
+([Choosing a host](host-abstraction.md#choosing-a-host)). The one case that bites is a
+repository on a local path — `file://` means *directory* to gitiup, and the two layouts
+cannot share a path — so a `file://` remote at a repository is refused with the fix in the
+hint (`host-type = "git"`), and so is `--store /srv/git/repo.git`. A declared host kind
+that is off the list, or that the URL contradicts, is exit 2 with the list: a declaration
+nobody recognises is exactly the moment a write could land in the wrong kind of store.
 
 An adapter — `gitiup change merge`, and GitHub's PR-backed parity (`giti-b2z.7`, written
 up above) — has the same verbs against a forge, and the same rules behind them. What a pull
@@ -596,20 +609,33 @@ backends ([`gitiup-host-tests`](../crates/gitiup-host-tests)):
 | `a_stale_base_merge_is_refused_the_same_way_everywhere` | refuse a merge whose base moved with `invalid`/exit 6, both oids named, nothing written — one kind on the fs host, the plain-git host over `file://` and over `git-http-backend`, the bucket host, a live bucket and the forge adapter |
 | `tests/change_across_hosts.rs` | publish on the bucket, read and merge through the plain-git host, and get the same `kv/change/<hex>` digest, the same `change_digest` and the same `change list` from both — hermetically, and again across a live MinIO and a real `git-http-backend` |
 
+The sequence, as opposed to the verbs, is measured in
+[`crates/gitiup/tests/change_bare_repo_cli.rs`](../crates/gitiup/tests/change_bare_repo_cli.rs):
+one script — propose, publish, re-attempt, merge, refuse the second merge, refuse the stale
+base — run against a directory store and against a bare repository reached over `file://`,
+with every exit code compared between the two, plus the reviewer's one fetch and the two
+refusals that tell someone they have named a repository where a directory store was meant.
+
 The CI job that runs them (`.github/workflows/host-conformance.yml`, or
 `./ci/host-conformance.sh --live` on your own machine) demands both services: a bucket
 or a served repository that failed to start fails the job instead of quietly narrowing
 what was measured.
 
-## Not this ticket
+## Not here
 
-Checking a change out (`giti-b2z.5`) is written up above, and the
-change-workflow conformance suite is written up just here (`giti-b2z.6`), and GitHub
-adapter parity for these verbs is written up above
-(`giti-b2z.7`). Remaining:
-`giti-zp1.2` and now happens (step 5 above). `gitiup verify change` (`giti-91m.4`) now gates a
-merge on all of it — the record's bytes, the refs, the attempt and the proof digests are
-exactly what it reads. What this ticket had to get right
-for all of them is the byte identity of the record, the ref names, the attempt rule and the
-refusal table — each of those is asserted in
-[`crates/gitiup/tests/change_cli.rs`](../crates/gitiup/tests/change_cli.rs).
+Whether a change *may* be merged is not this document. `change merge` is the mechanical
+compare-and-swap, and `--proof-required` stays refused on purpose: the answer to "is this
+merge allowed" belongs to the published policy (`giti-91m`,
+[ADR-0004](adr/0004-published-policy-format-signing-and-resolution.md)) and the quorum
+verdict (`giti-zp1`, [quorum](quorum.md)), and the command that gives it is
+[`gitiup verify change`](verification.md#the-merge-question-gitiup-verify-change) — exit
+0/6/7/8, reading exactly the bytes written here: the record, the refs, the attempt and the
+proof digests. A gate that lives beside the merge would be a gate the person being gated
+could write, which is why `change merge` takes `--proof` citations and no verdict. There
+is no UI and no review thread either: a change is a record and a ref, and anything a human
+reads is printed by the CLI.
+
+What the epic had to get right for all of those is the byte identity of the record, the ref
+names, the attempt rule and the refusal table — each of those is asserted in
+[`crates/gitiup/tests/change_cli.rs`](../crates/gitiup/tests/change_cli.rs), and the record
+bytes again against the [golden vectors](adr/fixtures/change-v1/).

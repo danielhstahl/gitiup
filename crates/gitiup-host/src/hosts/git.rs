@@ -120,6 +120,12 @@ pub use run::GitVersion;
 /// [`GitHost::open_or_init`] moves it from a git repository to a gitiup store.
 /// Over ssh the same thing needs a shell on the other end, which is the
 /// operator's job, not gitiup's.
+///
+/// From the command line a `file://` remote is a *directory* store unless the remote
+/// says otherwise — the fs host keeps `refs` as a file where git keeps it as a
+/// directory, and the two cannot share a path — so a `gitiup.toml` remote at a local
+/// repository declares `host-type = "git"` in `[remote.options]` (see `Declared` in
+/// `gitiup/src/remotes.rs`).
 pub fn init_bare(path: &Path) -> HostResult<PathBuf> {
     let program = git_program().ok_or_else(|| {
         HostError::unsupported(

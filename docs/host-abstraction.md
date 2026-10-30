@@ -511,7 +511,7 @@ what `gitiup` may ask of a forge is four methods on one struct
 | `api-base` | the API root, for GitHub Enterprise (`https://github.com/api/v3` off-host, `https://api.github.com` on github.com) |
 | `token-env` | which environment variable holds the token (before the profile's `token-env`, before `GITIUP_GITHUB_TOKEN`/`GITHUB_TOKEN`) |
 | `accept-host` | `true`: this host really is GitHub although the URL does not say so |
-| `host-type` | `github`: the explicit spelling of the same thing |
+| `host-type` | `github`: the explicit spelling of the same thing (its other values are the store kinds in [Choosing a host](#choosing-a-host)) |
 | `per-page`, `max-pages` | listing page size and the ceiling on pages (`100`, `200`) |
 | `rate-reserve`, `rate-wait` | requests to keep back, and the longest wait for a quota reset (`3`, `60s`) |
 | `ref-cache-ttl` | how long the ref advertisement is trusted (`2s`) |
@@ -572,6 +572,35 @@ taxonomy is a public contract.
 Schema-versioned (`schema-version = 1`), discovered by walking up from the
 working directory, overridable with `GITIUP_CONFIG`. Full reference:
 `crates/gitiup-host/examples/gitiup.toml`.
+
+### Choosing a host
+
+The URL says the transport; only the operator says the kind of store. Without a
+declaration the scheme decides: `s3://` is a bucket, `ssh://`/`https://` (and
+loopback `http://`) is a plain git remote, and `file://` is a **directory** store.
+
+A `file://` path is a repository as often as it is a directory, and the two layouts
+cannot share a path — gitiup's own `refs` is a *file* where git's is a *directory* —
+so a `file://` remote at a repository is refused rather than opened and failed inside
+a storage call. The fix is the declaration:
+
+```toml
+[[remote]]
+name = "origin"
+url = "file:///srv/git/repo.git"
+
+[remote.options]
+host-type = "git"     # a repository: bare or not, served by the plain-git host
+```
+
+`host-type` takes `fs` (a directory store, `file://` only), `git` (a repository, any
+transport but `s3://`), `s3` (a bucket) or `github` (the forge adapter, behind
+`hosts-github`). A value off that list, or one the URL contradicts, is refused with
+exit 2 and the list in the hint: a declaration nobody recognises is exactly the moment
+a write could land in the wrong kind of store. Declaring `git` on an ordinary
+`https://` remote is a real answer too — it says *this is a git server*, which is how
+a self-hosted one avoids the forge guess. `gitiup doctor --remotes` reports the kind
+it settled on, per remote.
 
 Versioning policy: a file with a `schema-version` above this build's maximum is
 refused with an instruction to upgrade gitiup; a lower-but-supported version is

@@ -235,9 +235,12 @@ The contributor's half of contributing without a forge: a **change** is one sign
 record in a content-addressed store, advertised by a ref, naming the commit it
 proposes, the branch it is proposed against and the oid that branch was at where the
 work forked. `who proposed this` is a signature and not a username, so a directory, a
-bucket and a bare repository all say the same thing about it. All three hosts answer
-`--store`/`--remote`, and the store has to be named: a typo cannot publish a change
-somewhere else.
+bucket and a bare repository all say the same thing about it. A directory answers
+`--store`, a repository or a bucket answers `--remote`, and an unnamed call falls back to
+the `default-remote` in `gitiup.toml` — a choice the operator made, and the output names
+the store it used in those words. A repository on a local path is a remote too: a
+`file:///srv/git/repo.git` entry with `host-type = "git"` in `[remote.options]`, because
+`file://` on its own means a directory store and the two layouts cannot share a path.
 
 ```console
 $ gitiup change new --base main --out change.json

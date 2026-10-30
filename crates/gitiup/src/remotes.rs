@@ -104,6 +104,155 @@ impl RemoteReport {
     }
 }
 
+/// What an operator said a remote *is*, in `[remote.options] host-type`.
+///
+/// The URL says the transport; only the operator says the kind of store. A
+/// `file://` path is a directory as far as gitiup knows, and a bare repository is a
+/// store too — which is the difference between the fs host and the plain-git one,
+/// and the difference a bucket of objects and a forge database do not let the URL
+/// settle either. Saying it is one value in `gitiup.toml`; not being able to say it
+/// is why a local bare repository used to be unreachable from the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Declared {
+    /// The forge adapter's (`hosts-github`).
+    Github,
+    /// A git repository — bare or not — reached over any transport.
+    Git,
+    /// A plain directory holding a gitiup store.
+    Fs,
+    /// A bucket.
+    S3,
+}
+
+impl Declared {
+    /// Every accepted spelling, in the order a refusal lists them.
+    pub const ALL: &'static [&'static str] = &["github", "gh", "git", "fs", "s3"];
+
+    /// The canonical kind name, the same spelling `classify` reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Declared::Github => "github",
+            Declared::Git => "git",
+            Declared::Fs => "fs",
+            Declared::S3 => "s3",
+        }
+    }
+
+    /// Read one spelling. `None` is not a refusal here: [`declared_host`] refuses,
+    /// and [`wants_forge`] has to keep answering a yes/no question either way.
+    fn parse(text: &str) -> Option<Declared> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "github" | "gh" => Some(Declared::Github),
+            "git" => Some(Declared::Git),
+            "fs" => Some(Declared::Fs),
+            "s3" => Some(Declared::S3),
+            _ => None,
+        }
+    }
+
+    /// One line the host offers to a human, in the words `classify` reports.
+    fn summary(self) -> &'static str {
+        match self {
+            Declared::Github => {
+                "the forge's own API, with gitiup's refs and records stored in the \
+                 repository itself"
+            }
+            Declared::Git => "a plain git remote: refs and packs, no change database",
+            Declared::Fs => "a local directory",
+            Declared::S3 => "one bucket as a complete remote",
+        }
+    }
+
+    /// Does this kind fit a URL whose scheme is `scheme`?
+    ///
+    /// `fs` needs a path the process can open, so only `file://` can carry it; `s3`
+    /// needs a bucket, so only `s3://` does. `git` is the one kind every transport
+    /// can serve, which is why declaring it on an `https://` remote is a real answer
+    /// and not a typo: it says "this is a git server, whatever its hostname says".
+    fn fits(self, scheme: RemoteScheme) -> bool {
+        match self {
+            Declared::Github => true,
+            // A repository is what git speaks over any of these transports; a bucket is
+            // not, and pretending otherwise would send an `s3://` URL to `git fetch`.
+            Declared::Git => !matches!(scheme, RemoteScheme::S3),
+            Declared::Fs => matches!(scheme, RemoteScheme::File),
+            Declared::S3 => matches!(scheme, RemoteScheme::S3),
+        }
+    }
+}
+
+/// The declared host kind for a remote, checked against its URL.
+///
+/// `host-type` is read once, here, so `classify` and `open` cannot drift about what
+/// a remote is. A value from the list is honoured; a value off it is refused by name
+/// with the list in the hint, because a declaration nobody recognises is exactly the
+/// moment a write could land in the wrong kind of store.
+pub fn declared_host(remote: &RemoteConfig) -> Result<Option<Declared>, HostError> {
+    let Some(text) = remote.option("host-type") else {
+        return Ok(None);
+    };
+    let Some(kind) = Declared::parse(text) else {
+        return Err(HostError::invalid(
+            "host-type",
+            format!("\"{text}\" is not a host gitiup knows"),
+        )
+        .with_exit_code(2)
+        .with_hint(format!(
+            "say one of {} — `fs` is a directory store, `git` a repository (bare or not), \
+             `s3` a bucket, `github` the forge adapter (`{FORGE_FEATURE}`)",
+            Declared::ALL.join(", ")
+        )));
+    };
+    if !kind.fits(remote.url.scheme) {
+        return Err(HostError::invalid(
+            "host-type",
+            format!(
+                "\"{}\" does not fit a {}:// URL",
+                kind.as_str(),
+                remote.url.scheme.as_str()
+            ),
+        )
+        .with_exit_code(2)
+        .with_hint(format!(
+            "a {} store is reached with a {}:// URL; drop the declaration to let the URL \
+             decide",
+            kind.as_str(),
+            kind.as_str()
+        )));
+    }
+    Ok(Some(kind))
+}
+
+/// Is this path a git repository (bare, or a working copy)?
+///
+/// A cheap filesystem question, not a `git rev-parse`: the answer decides which of
+/// two mutually incompatible store layouts gitiup is about to write into — the fs
+/// host keeps `refs` as a *file*, git keeps it as a *directory* — so a wrong guess
+/// is `Is a directory (os error 21)` from inside a storage call rather than a
+/// sentence about what to change.
+pub fn git_repository(path: &std::path::Path) -> bool {
+    let bare = path.join("HEAD").is_file() && path.join("objects").is_dir();
+    let worktree = path.join(".git").exists();
+    bare || worktree
+}
+
+/// The refusal for a `file://` path that is a repository, not a directory store.
+fn repository_not_directory(remote: &RemoteConfig) -> HostError {
+    let path = remote.url.file_path().display().to_string();
+    HostError::invalid(
+        "store-kind",
+        format!(
+            "{path} is a git repository, and a file:// remote names a gitiup directory \
+             store by default"
+        ),
+    )
+    .with_hint(
+        "say what it is: `host-type = \"git\"` in `[remote.options]` serves it with the \
+         plain-git host — a bare repository is a complete gitiup store, refs and CAS \
+         included — or point the remote at a plain directory instead",
+    )
+}
+
 /// Is this remote one that needs a forge adapter rather than a plain host?
 ///
 /// `host-type = "github"` in `[remote.options]` is the explicit spelling; the
@@ -112,10 +261,7 @@ impl RemoteReport {
 /// needs `api-base` or `host-type` — and saying so is this function's job.
 pub fn wants_forge(remote: &RemoteConfig) -> bool {
     if let Some(declared) = remote.option("host-type") {
-        return matches!(
-            declared.trim().to_ascii_lowercase().as_str(),
-            "github" | "gh"
-        );
+        return Declared::parse(declared) == Some(Declared::Github);
     }
     let host = remote.url.host.to_ascii_lowercase();
     FORGE_HOSTS
@@ -177,18 +323,36 @@ pub fn classify(remote: &RemoteConfig) -> Result<Served, HostError> {
         #[cfg(not(feature = "hosts-github"))]
         return Err(forge_without_adapter(remote));
     }
-    let (kind, summary) = match remote.url.scheme {
-        RemoteScheme::S3 => ("s3", "one bucket as a complete remote"),
-        RemoteScheme::File => ("fs", "a local directory"),
-        RemoteScheme::Https | RemoteScheme::Http | RemoteScheme::Ssh => (
-            "git",
-            "a plain git remote: refs and packs, no change database",
-        ),
-    };
+    let kind = kind_for(remote)?;
     Ok(Served {
-        kind: kind.to_string(),
+        kind: kind.as_str().to_string(),
         implemented_by: format!("gitiup-host {}", env!("CARGO_PKG_VERSION")),
-        summary: summary.to_string(),
+        summary: kind.summary().to_string(),
+    })
+}
+
+/// Which kind of host serves a remote: the declaration if there is one, the URL's
+/// scheme otherwise.
+///
+/// One function because `classify` and `open` must never disagree: a remote the doctor
+/// calls a directory and `submit` opens as a repository is the composition root failing
+/// at its one job.
+fn kind_for(remote: &RemoteConfig) -> Result<Declared, HostError> {
+    if let Some(declared) = declared_host(remote)? {
+        return Ok(declared);
+    }
+    Ok(match remote.url.scheme {
+        RemoteScheme::S3 => Declared::S3,
+        // A `file://` path is a directory store *by default*, not by nature: point one
+        // at a bare repository and the fs host would fail inside a storage call with an
+        // errno nobody can act on, so this is where that gets a sentence instead.
+        RemoteScheme::File => {
+            if git_repository(&remote.url.file_path()) {
+                return Err(repository_not_directory(remote));
+            }
+            Declared::Fs
+        }
+        RemoteScheme::Https | RemoteScheme::Http | RemoteScheme::Ssh => Declared::Git,
     })
 }
 
@@ -218,10 +382,15 @@ pub fn open(
             return Err(forge_without_adapter(remote));
         }
     }
-    match remote.scheme() {
-        RemoteScheme::File => Ok(Box::new(FsHost::open_or_create(remote.url.file_path())?)),
-        RemoteScheme::S3 => Ok(Box::new(gitiup_host::S3Host::open_or_init_remote(remote)?)),
-        RemoteScheme::Https | RemoteScheme::Http | RemoteScheme::Ssh => Ok(Box::new(
+    // `classify` has already refused what has no host, and has already checked the
+    // declaration against the scheme; this only has to agree with it.
+    match kind_for(remote)? {
+        Declared::Fs => Ok(Box::new(FsHost::open_or_create(remote.url.file_path())?)),
+        Declared::S3 => Ok(Box::new(gitiup_host::S3Host::open_or_init_remote(remote)?)),
+        // A `github` declaration is answered above, with the adapter or with the
+        // refusal; reaching here with one means the URL is a plain git one and the
+        // operator said so, which is what a declaration is for.
+        Declared::Git | Declared::Github => Ok(Box::new(
             gitiup_host::hosts::git::GitHost::open_or_init_remote(remote)?,
         )),
     }
@@ -705,7 +874,9 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
     if refused {
         return Err(CliError::refused(
             "a configured remote has no host in this build".to_string(),
-            format!("the message above names the feature to build with (`{FORGE_FEATURE}`)"),
+            "each refusal above carries its own fix: a missing forge adapter names the \
+             feature to build with (`{FORGE_FEATURE}`), a store-kind mismatch names the \
+             `host-type` to declare",
         ));
     }
     Ok(())
@@ -801,6 +972,115 @@ mod tests {
         let served = classify(&remote("https://github.com/gitiup/gitiup")).expect("github");
         assert_eq!(served.kind, "github");
         assert!(served.implemented_by.contains("gitiup-host-github"));
+    }
+
+    #[test]
+    fn a_declared_host_kind_overrides_what_the_url_would_say() {
+        let dir = tempfile::tempdir().expect("a plain directory");
+        let url = format!("file://{}", dir.path().display());
+        assert_eq!(
+            classify(&remote(&url))
+                .expect("a plain directory is a store")
+                .kind,
+            "fs"
+        );
+        // The declaration is the whole of what a bare repository needs to be reachable
+        // from the command line: same URL, different kind of store.
+        assert_eq!(
+            classify(&remote(&url).with_option("host-type", "git"))
+                .expect("the operator said it is a repository")
+                .kind,
+            "git"
+        );
+        assert_eq!(
+            classify(&remote(&url).with_option("host-type", "fs"))
+                .expect("and can say it is a directory")
+                .kind,
+            "fs"
+        );
+        // `git` on an https URL is an answer and not a typo: it is how a self-hosted
+        // server that is *not* a forge says so without gitiup guessing from a hostname.
+        let plain = remote("https://git.example.com/gitiup/gitiup").with_option("host-type", "git");
+        assert_eq!(classify(&plain).expect("plain git").kind, "git");
+        assert!(!wants_forge(&plain));
+    }
+
+    #[test]
+    fn a_host_type_off_the_list_is_refused_with_the_list() {
+        let error = declared_host(
+            &remote("https://git.example.com/gitiup/gitiup").with_option("host-type", "gitea"),
+        )
+        .expect_err("not a host gitiup knows");
+        assert_eq!(
+            error.exit_code(),
+            2,
+            "a config typo is usage, not a store failure"
+        );
+        let text = error.to_string();
+        assert!(text.contains("gitea"), "{text}");
+        let hint = error.hint().expect("and the fix");
+        for kind in Declared::ALL {
+            assert!(hint.contains(kind), "the hint lists {kind}: {hint}");
+        }
+        assert!(
+            classify(&remote("s3://bucket/x").with_option("host-type", "gitea")).is_err(),
+            "and the refusal is reached through the same door every command opens"
+        );
+    }
+
+    #[test]
+    fn a_host_type_that_does_not_fit_the_url_is_refused() {
+        // Each of these is a declaration the URL contradicts: a directory store needs a
+        // path, a bucket is not reachable over https, and a bucket is not a repository.
+        let wrong = [
+            ("https://git.example.com/gitiup/gitiup", "fs"),
+            ("s3://gitiup-forge/repo", "fs"),
+            ("s3://gitiup-forge/repo", "git"),
+            ("https://git.example.com/gitiup/gitiup", "s3"),
+        ];
+        for (url, kind) in wrong {
+            let error = declared_host(&remote(url).with_option("host-type", kind))
+                .expect_err("{url} cannot be a {kind} store");
+            assert_eq!(error.exit_code(), 2, "{url} + {kind}: {error}");
+        }
+        // And the declarations that do fit are honoured, not merely tolerated.
+        assert_eq!(
+            classify(&remote("s3://gitiup-forge/repo").with_option("host-type", "s3"))
+                .expect("a bucket declared as a bucket")
+                .kind,
+            "s3"
+        );
+    }
+
+    #[test]
+    fn a_file_remote_at_a_repository_names_the_declaration_instead_of_an_errno() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let repo = scratch.path().join("repo.git");
+        if gitiup_host::hosts::git::git_program().is_none() {
+            eprintln!("skipped: no git to make a repository with");
+            return;
+        }
+        gitiup_host::hosts::git::init_bare(&repo).expect("a bare repository");
+        let url = format!("file://{}", repo.display());
+        assert!(git_repository(&repo), "and the check sees it");
+        assert!(
+            !git_repository(&scratch.path().join("plain")),
+            "a directory that is not one is not one"
+        );
+
+        let error = classify(&remote(&url)).expect_err("the fs host cannot share a repository");
+        assert_eq!(error.exit_code(), 6, "a refusal, not an errno: {error}");
+        let text = format!("{error} {}", error.hint().unwrap_or_default());
+        assert!(text.contains("git repository"), "{text}");
+        assert!(text.contains("host-type"), "and names the fix: {text}");
+
+        // Declaring it is the whole fix: the same URL now classifies as git.
+        assert_eq!(
+            classify(&remote(&url).with_option("host-type", "git"))
+                .expect("a bare repository is a gitiup store")
+                .kind,
+            "git"
+        );
     }
 
     #[test]

@@ -136,10 +136,15 @@ WHERE IT GOES (submit, list, show, checkout):
     --store <dir>            a directory as the store (the fs host)
     --remote <name>          a remote from gitiup.toml
                              `list` and `show` may read the configured default remote;
-                             `submit` has to name its store, so a typo cannot publish a
-                             change somewhere else. A remote that needs a forge adapter
-                             this build was built without is refused by name, with the
-                             feature to enable in the hint.
+                             `submit` publishes to the store you name — or to that same
+                             default remote, which the output then says out loud — so a
+                             typo cannot publish a change somewhere unmentioned. A remote
+                             that needs a forge adapter this build was built without is
+                             refused by name, with the feature to enable in the hint.
+                             A bare repository is a store as well: give it a `file://`,
+                             `ssh://` or `https://` remote declaring `host-type = git` in
+                             [remote.options]. `--store` names a directory store, and a
+                             repository named that way is refused with that hint.
 
 WHERE IT COMES FROM (new, submit):
     -C, --repository <path>  the repository to read (default: this one)
