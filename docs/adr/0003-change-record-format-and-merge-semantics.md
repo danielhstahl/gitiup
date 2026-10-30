@@ -704,7 +704,7 @@ that can say things the store cannot.
 
 **Decision.** Validation runs in a fixed order, because the first thing wrong decides
 the verdict and the exit code a script branches on (the codes
-[`gitiup_attest::ErrorKind::exit_code`](../../crates/gitiup-attest/src/error.rs)
+[`gitiup_canon::ErrorKind::exit_code`](../../crates/gitiup-canon/src/error.rs)
 already defines, shared by `gitiup verify`, `run` and now `change`):
 
 ```text

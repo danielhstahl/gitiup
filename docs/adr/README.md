@@ -10,21 +10,33 @@ wire formats, ref namespaces, error taxonomies, trust models, dependency policy.
 
 ## Index
 
-| id | title | status | decided by |
-|----|-------|--------|------------|
-| [0001](0001-attestation-encoding-hash-and-signature.md) | Attestation encoding, hash and signature format | accepted | `giti-1rs.1` |
-| [0002](0002-roster-verifier-selection-and-sybil-resistance.md) | Roster, verifiable selection and sybil resistance | accepted | `giti-msi.1` |
-| [0003](0003-change-record-format-and-merge-semantics.md) | The change record: bytes, identity, states and what a merge is | accepted | `giti-b2z.1` |
-| [0004](0004-published-policy-format-signing-and-resolution.md) | The published policy: where it lives, who signs it, and which one was in force | accepted | `giti-91m.1` |
-| — | Host abstraction: CAS ref updates, `kv/` namespaces, store layout | *written up as [design notes](../host-abstraction.md), predates this directory* | `giti-xdw.1/.2` |
+| id | title | status | decided by | implemented by |
+|----|-------|--------|------------|----------------|
+| [0001](0001-attestation-encoding-hash-and-signature.md) | Attestation encoding, hash and signature format | accepted | `giti-1rs.1` | [`gitiup-attest`](../../crates/gitiup-attest/README.md) |
+| [0002](0002-roster-verifier-selection-and-sybil-resistance.md) | Roster, verifiable selection and sybil resistance | accepted | `giti-msi.1` | [`gitiup-quorum`](../../crates/gitiup-quorum/README.md) and `gitiup participant` / `select` / `work` / `quorum verdict\|dispute\|retry` — **D6 and the reputation half of D5 are not built**, and the rate limits it defers were never written |
+| [0003](0003-change-record-format-and-merge-semantics.md) | The change record: bytes, identity, states and what a merge is | accepted | `giti-b2z.1` | `ChangeRecord` in [`gitiup-host`](../../crates/gitiup-host/README.md), `gitiup change new\|submit\|list\|show\|merge\|reconcile\|checkout`, and the forge adapter's PR parity |
+| [0004](0004-published-policy-format-signing-and-resolution.md) | The published policy: where it lives, who signs it, and which one was in force | accepted | `giti-91m.1` | [`gitiup_quorum::policy`](../../crates/gitiup-quorum/src/policy.rs) behind `gitiup policy publish\|show\|check\|explain`, `gitiup verify change` and `gitiup hook install pre-receive` |
+| — | Host abstraction: CAS ref updates, `kv/` namespaces, store layout | *written up as [design notes](../host-abstraction.md), predates this directory* | `giti-xdw.1/.2` | [`gitiup-host`](../../crates/gitiup-host/README.md) |
 
 When you write one of the placeholders above, add a row here in the same commit.
+
+**Status and implementation are different columns on purpose.** *Status* is about the
+decision — is it the one to code against, or has it been superseded. *Implemented by* is
+about the build, and it rots: an ADR can be accepted, code against, and still have
+half of it unwritten (ADR-0002 has). A ticket that lands the code an ADR decided names
+the crate here and, where a decision is only part-built, says so in the ADR itself —
+not silently, and not by editing the decision.
 
 ## Conventions
 
 * **One file per decision**, `NNNN-short-slug.md`, numbered in the order they were
   accepted — numbers are never reused, even for rejected proposals.
 * **Status** is one of `proposed`, `accepted`, `superseded by NNNN`, `deprecated`.
+* **Implementation is stated, not implied.** A header carries an `Implemented by` bullet
+  naming the crate, the commands and — where the code stopped short — the decisions that
+  are still only paper, and the index row says the same in one line. "Accepted" means the
+  decision is the one to code against; it does not mean anything exists yet, and a reader
+  should not have to find out by grepping.
 * Structure: *Context* (the forces, ideally as a constraint table), *Decision at a
   glance* (a table, with the rejected option named in the same row), one section per
   decision with **why not the alternative**, then *Consequences*.

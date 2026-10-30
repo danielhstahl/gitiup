@@ -1,17 +1,17 @@
 # The quorum verification network
 
-Status: **the mechanism exists, the roster and selection commands exist, and a submitted
-change opens its own rounds** —
-`gitiup participant register|withdraw|list|verify-roster` (plus the owner's `approve` and
-`revoke`) and `gitiup select`, which opens a round or re-derives a published one; and
-`gitiup change submit`, which does that for every job of a change whose published policy
-asks for a quorum ([`quorum`](../crates/gitiup/src/quorum.rs)). The
-store side of jobs and leases exists too — an advertised round, a paged listing of open
-rounds, and TTL leases on seats ([`store`](../crates/gitiup-quorum/src/store.rs),
-[`job`](../crates/gitiup-quorum/src/job.rs)) — and so do both ends of the loop: `gitiup
-work` serves a seat end to end, `gitiup quorum dispute` reads a tallied round's evidence
-out loud, `gitiup quorum retry` escalates it under an attempt cap the policy signs, and
-`gitiup quorum verdict` tallies one, publishes it and exits on it.
+Status: **the loop runs end to end.** A volunteer puts a machine up
+(`gitiup participant register`), an owner decides whether it is on the roster
+(`approve`, `revoke`), a submitted change opens its own rounds and advertises the ones
+that filled their seats (`gitiup change submit`), a stranger's box serves a seat
+(`gitiup work`), the owner tallies it, files the verdict and emits the `tier: quorum`
+attestation it earns (`gitiup quorum verdict --publish --attest store`), the gate reads
+that answer (`gitiup verify change`) and the change merges (`gitiup change merge`). When
+it does not come out clean there are two more commands: `gitiup quorum dispute` reads the
+evidence behind the state and `gitiup quorum retry` opens a wider attempt under a cap the
+policy signed — exit 9 when the attempts have run out.
+What is *not* here is in [Still open](#still-open-with-the-reason) — quarantine and
+reputation, endorsement records, rate limits — and none of it is on the path above.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -44,20 +44,153 @@ decision, and neither changes what a plain local run produces.
 | [`roster`](../crates/gitiup-quorum/src/roster.rs) | the trust list: epochs, key-ownership proofs, sign-ups, withdrawals, revocations, one-identity-one-vote. |
 | [`capability`](../crates/gitiup-quorum/src/capability.rs) | the eligibility filters and their order — the order is a published decision, because it decides which reason a refusal names. |
 | [`select`](../crates/gitiup-quorum/src/select.rs) | the selection proper: score ordering, the greedy pass over tier and identity caps, reserves, promotion, the proposer-family rule (`proposer_family`, `RoundInputs::excluding`, `ProposerExclusion`), and `explain()`, the audit trail. |
-| [`round`](../crates/gitiup-quorum/src/round.rs) | the signed record that pins a round to a roster epoch and digest and publishes the seats and the seed. |
+| [`round`](../crates/gitiup-quorum/src/round.rs) | the signed record that pins a round to a roster epoch and digest and publishes the seats and the seed — and the `Escalation` that names the attempt a later one replaces. |
 | [`job`](../crates/gitiup-quorum/src/job.rs) | what an advertisement and a lease *are*: the seat list copied out of a round, a TTL that dies, a steal that is recorded. |
+| [`commit`](../crates/gitiup-quorum/src/commit.rs) | phase 1 of a sealed round: what the promise hashes over, and the check that a reveal opens it. |
 | [`store`](../crates/gitiup-quorum/src/store.rs) | the ref names and CAS writes. The store is the broker: compare-and-swap does the locking, so there is no coordinator to bribe. |
 | [`gate`](../crates/gitiup-quorum/src/gate.rs) | admission at submission time: is *this key* approved, for *this epoch*, in *this round*, and is *this document* its own? Every refusal has its own code. |
 | [`participate`](../crates/gitiup-quorum/src/participate.rs) | the volunteer's fail-closed checklist (ADR-0002 D11). |
 | [`verdict`](../crates/gitiup-quorum/src/verdict.rs) | the tally: `verified` / `failed` / `insufficient`, every rejection with its reason, and the divergent results. |
+| [`attestation`](../crates/gitiup-quorum/src/attestation.rs) | the `tier: quorum` attestation: built only from a `verified` verdict, believed only by re-deriving it. |
+| [`escalate`](../crates/gitiup-quorum/src/escalate.rs) | the attempt cap: what counts as an attempt, where the cap comes from, and the terminal `attempt_cap_exhausted` refusal at exit 9. |
+| [`policy`](../crates/gitiup-quorum/src/policy.rs) | the published policy (ADR-0004): the document, its trust and coherence checks, the resolution ladder, and the `quorum` block every round's numbers come from. |
+| [`record`](../crates/gitiup-quorum/src/record.rs) | the signed-record framing every record here shares with ADR-0001 and ADR-0003: canonical body bytes, the digest a signature covers, the signature list kept out of it. |
 | [`ledger`](../crates/gitiup-quorum/src/ledger.rs) | the volunteer's memory of the highest epoch a store has offered — the rollback guard. |
+| [`error`](../crates/gitiup-quorum/src/error.rs) | the refusal taxonomy and its exit codes — the same numbers the command line exits with, so a script branches on one table. |
+
+## The operator's tour: register → approve → open → work → verdict → merge
+
+One store (`./store`), one keystore, three kinds of key in it — `owner`, `author`, and one
+per volunteer. Every line below is a real command line; `--json` is on all of them, and
+`gitiup participant help`, `gitiup work help` and `gitiup quorum help` print the flags of
+each group. The rest of this document is about *why* each step refuses what it refuses.
+
+```sh
+# 0 · owner, once per repository: publish the rules a merge gate applies (ADR-0004).
+#     The policy's `quorum` block is where a round's seat count, threshold, capability
+#     floor and reveal mode come from — there is no `--n` flag anywhere downstream.
+gitiup policy publish ./policy.json --store ./store --key owner
+
+# 1 · volunteer, once per box: claim what the machine can honestly do, signed by the key
+#     being registered. This writes a file and publishes nothing.
+gitiup participant register --ram-mb 32768 --disk-mb 262144 \
+    --sandbox docker --sandbox-level 2 --arch x86_64 --out signup.json
+
+# 2 · owner, once per batch: carry the sign-up into a new epoch, vouch for it, publish —
+#     then verify the epoch you just signed before you tell anyone to trust it.
+gitiup participant approve --from signup.json --tier endorsed --store ./store --publish
+gitiup participant verify-roster --store ./store
+
+# 3 · author: publish the change, open one round per job per matrix arm from the policy and
+#     the workflow's own job set, and advertise the rounds that filled their seats.
+gitiup change submit --repository . --base main --store ./store
+
+# 4 · volunteer: the loop. Finds the rounds addressed to this key, believes the invitation,
+#     leases the seat, runs the job in a sandbox that may serve a stranger, digests, signs,
+#     publishes (commit then reveal on a sealed round) and releases the lease.
+gitiup work --store ./store --key volunteer --once
+
+# 5 · owner: the tally with its reasons; file the signed verdict beside the evidence; emit
+#     the `tier: quorum` attestation that only a `verified` verdict can produce.
+gitiup quorum verdict chg-6a6a --store ./store --publish --attest store --key owner
+
+# 6 · the gate: every attestation the store advertises for the change's head, plus the
+#     verdict, judged by the policy that was in force when each run happened. Exit 0 = may
+#     merge; stderr stays empty, because the exit code is the answer.
+gitiup verify change chg-6a6a --store ./store
+
+# 7 · owner: the merge — compare-and-swap the branch, then the signed record of it. `--proof`
+#     cites and pins the attestation this merge believed; deciding *whether* to merge is
+#     step 6's job, which is why `change merge --proof-required` is refused on purpose.
+gitiup change merge chg-6a6a --store ./store --key owner --proof "sha256:…"
+```
+
+Three things the order is meant to make obvious:
+
+* **nobody is a coordinator.** Steps 1–2 are a signature, 3 writes refs, 4 polls refs, 5 is
+  an opinion about bytes already in the store. There is no daemon between them, which is
+  why any of them can be run by a different machine, by a different person, at any hour —
+  and why a store outage pauses the loop instead of corrupting it.
+* **the numbers are never typed by the person they constrain.** The volunteer gets no flag
+  for seat count, architecture or tier; the owner gets no flag for them at `submit` or
+  `verdict` either. They are `quorum.default` / `quorum.by_job` in a document the owner
+  signed at step 0 ([ADR-0004 D5](adr/0004-published-policy-format-signing-and-resolution.md)).
+* **every step can be audited by someone who is not a party to it.** Step 3's rounds are
+  re-derived by `gitiup select --change chg-6a6a --store ./store` with no key at all; step
+  5's verdict is re-derived by `gitiup verify attestation --tier quorum`; a sealed seat's
+  commitment is one `sha256sum` away from being checked. A tour that had to be believed is
+  a workflow, not a verification network.
+
+## The failure tour: nobody turned up, and they disagree
+
+`gitiup quorum verdict` exits 6 for both `insufficient` and `failed`, and neither merges.
+That single number is right for a gate and useless for a human: the two are different
+news, with different fixes and different clocks. The state says which, and the `reason`
+field — printed in the report and machine-readable in `--json` — says which kind, including
+which of the three kinds of shortage an `insufficient` is.
+
+```sh
+gitiup quorum verdict chg-6a6a --store ./store --json \
+  | jq '{state, reason, detail, seats, required_agree, agreeing, missing, rejected}'
+```
+
+**`insufficient` — the vote did not happen.** `reason` is one of `seats_not_filled` (the
+round could not fill its `n` seats when it was opened, so the bar was never set: it is
+published with `sufficient: false` and **never advertised**, which is why `gitiup work`
+never mentions it), `no_usable_attestations` (the seats are full and every seat is silent)
+or `not_enough_agreement` (they agree, but not enough of them did). The operational
+question is *why is the pool empty*, and the answer is in the round's own filters:
+
+```sh
+gitiup select --change chg-6a6a --store ./store --explain      # who was eligible, and which
+                                                               # filter rejected everyone else
+gitiup participant list --store ./store --json                  # who is on the epoch at all
+gitiup work --store ./store --key volunteer --dry-run --json    # and why *this* box is not in it
+```
+
+The fix is a bigger roster, a lower capability floor in `quorum.requirements`, or waiting:
+nobody turned up is not a broken change, and `n` is never lowered to make the verdict go
+away. A round that is short of seats is also a slower thing than a wrong one — the seats
+can still fill before the deadline, so `insufficient` is often worth re-asking about in an
+hour rather than opening anything.
+
+**`failed` — the vote happened and the machines disagree.** `reason` is
+`irreconcilable_digests`: several `ResultDigest`s, none reaching `required_agree`, and the
+losing digests are published as evidence rather than swallowed. This is a fact about the
+change or about the fleet, and the two are told apart by reading, not by re-running:
+
+```sh
+# the evidence: the digests and their counts, each seat with the sandbox rung it ran at and
+# the environment it reported, and — with logs handed over — the raw and normalised diffs
+# side by side, hunk by hunk
+gitiup quorum dispute chg-6a6a --store ./store --logs ./logs
+
+# once you know it was the fleet and not the change: attempt + 1, wider (n + 2 seats,
+# threshold + 1), citing the attempt it replaces and leaving that evidence where it is
+gitiup quorum retry chg-6a6a --store ./store --key owner --reason "aarch64 arm flaked twice"
+```
+
+If every hunk in the dispute disappears under normalisation, the disagreement is a
+normalisation bug and not a broken change, and saying so is cheaper than another attempt.
+If it survives, it is a fact about the build — and a fact that survived
+`quorum.max_attempts` attempts (default 3, and `retry` may tighten that number and never
+loosen it) is terminal: exit 9, `attempt_cap_exhausted`, and the right answer is a fix and
+a new change attempt, not a fourth attempt at the same head.
+
+The two tours meet in one place: a `verified` verdict may still carry `divergent` votes and
+`missing` seats, so `gitiup quorum dispute` is worth running on a change that merged — and
+`gitiup quorum retry` does not sort the two out for you. It escalates anything that did not
+come out clean, an `insufficient` included, but widening a shortage (`n + 2` seats against a
+pool that could not fill `n`) is asking the same empty room for more hands: where the state
+is `insufficient`, fix the roster or the requirement floor first, or reach for
+`--same-policy`; where it is `failed`, the wider jury is the whole point.
 
 ## The four risks and the mechanism that closes each
 
 | risk | how it is closed |
 |------|------------------|
 | targeted verifier / selection bias | the seed is `HMAC-SHA256(secret, round_id_fields)` and is **published** with the round, so anyone can re-derive the scores and check the published seats are the derived ones. `Round::verify` re-runs the selection and refuses a record whose seats were edited. Anyone holding the secret can pick the pool in advance, which is why the secret is the deployment's own and rotates with its key. |
-| copycat verifiers | each seat has a slot (`key_slot(key_id)`, store-assigned and unguessable) and each attestation must carry `challenge = HMAC(seed ‖ 0x00 ‖ key_id)`, so an answer cannot be replayed into another round. A `sealed` round splits that same slot into a commitment and a reveal ([giti-p1.6](../README.md)), so a seat cannot read the running answer before it fixes its own — [committing before revealing](#committing-before-revealing-a-sealed-round) says what that buys and what it does not. |
+| copycat verifiers | each seat has a slot (`key_slot(key_id)`, store-assigned and unguessable) and each attestation must carry `challenge = HMAC(seed ‖ 0x00 ‖ key_id)`, so an answer cannot be replayed into another round. A `sealed` round splits that same slot into a commitment and a reveal (giti-zp1.6), so a seat cannot read the running answer before it fixes its own — [committing before revealing](#committing-before-revealing-a-sealed-round) says what that buys and what it does not. |
 | sybils and ballot stuffing | membership costs an owner signature and a key-ownership proof, one *identity* casts one vote whatever it controls, the proposer's family is excluded, and the caps limit each tier. The cost model is in ADR-0002 D4–D7; `max_per_identity` is enforced in the tally as well as in selection, so a roster cannot smuggle two boxes into two votes. |
 | stale or replayed attestations | the round pins the head oid, the attestation binds the round's challenge, freshness is evaluated at verdict time, and revocation is evaluated there too — a `compromised` key voids what it signed *earlier*, which is the only useful reading of a stolen key. |
 
@@ -90,7 +223,8 @@ capability post-check. Everything else is a sentence about why not:
 
 With the defaults (5 seats, 4 agreements) a single honest outlier — a flaky test, a
 different CPU, a slow mirror — does not sink a change; the dissent is recorded in
-`divergent` for the escalation path (giti-msi.8). An owner who wants unanimity raises
+`divergent` for the escalation path
+([`gitiup quorum dispute`](#reading-a-disagreement-gitiup-quorum-dispute)). An owner who wants unanimity raises
 `required_agree` to 5 in the round's policy and gets `failed` on the same evidence.
 Silence is never reported as failure: "nobody turned up" is `insufficient`, and that is a
 different operational signal from "the machines disagree".
@@ -406,7 +540,7 @@ needs most.
   commitment then counts as `missing` and its seat is wasted; X has traded a vote for a
   look. That is a real option, and the answer to it is not cryptography: a `missing` is a
   miss, misses are what reputation and quarantine
-  ([giti-p1.9](../README.md)) count, and the protocol's job was never to make cheating
+  ([giti-zp1.8](#still-open-with-the-reason)) count, and the protocol's job was never to make cheating
   impossible but to make it cost the cheater the thing it came for. Sealing removes the
   free copy; it does not install good faith.
 * **A commitment binds bytes, not truths.** The preimage is the canonical attestation, and
@@ -418,7 +552,7 @@ needs most.
   A and reveals into round B is describing neither.
 
 The mode is chosen by the **owner's policy**, `quorum.reveal_mode`, in the signed
-policy document ([giti-p1.6](../README.md)) — not by a volunteer's flag, and not by a
+policy document ([ADR-0004 D5](adr/0004-published-policy-format-signing-and-resolution.md)) — not by a volunteer's flag, and not by a
 client default, for the same reason `n` and `required_agree` are policy: the person
 submitting a change must not get to decide how independent its verification is, and a
 fork must not be able to un-seal an upstream's rounds.
@@ -514,7 +648,7 @@ prose:
   not be auditing the published selection, they would be proposing a different one.
 * **insufficient is an answer.** If the filters and caps fill fewer than `n` seats the
   command reports `sufficient: false` and exits 0 — deciding what that *means* is
-  giti-msi.7's verdict engine, and silently lowering `n` is the failure mode ADR-0002 names
+  [`gitiup quorum verdict`](#tallying-it-gitiup-quorum-verdict)'s job, and silently lowering `n` is the failure mode ADR-0002 names
   as the dangerous one.
 
 The `--explain` table is the audit trail ADR-0002 D3 specifies: the round id, the seed, the
@@ -712,9 +846,10 @@ the evidence behind that state, and decides nothing ([`crates/gitiup/tests/quoru
 * **the sandbox rung each used**: what confined the run (`provenance.sandbox`) next to what
   that promise is worth (the `x-sandbox-guarantees` annotation the runner filed), and the
   rung the box is registered at against the rung the round demanded;
-* **each machine's environment fingerprint**, the [`EnvironmentFingerprint`](capability.md)
-  the run reported — two boxes disagreeing while reporting one fingerprint is a different
-  report from two boxes disagreeing while reporting two.
+* **each machine's environment fingerprint**, the derived digest of the `environment` block
+  the run reported ([`Environment`](../crates/gitiup-attest/src/manifest.rs),
+  [the environment fingerprint](environment.md)) — two boxes disagreeing while reporting one
+  fingerprint is a different report from two boxes disagreeing while reporting two.
 
 ### The two diffs, printed together
 
@@ -784,24 +919,58 @@ worth waiting for, and the refusal says what to do instead of a fourth attempt: 
 that survived three verifications is a bug to fix and re-submit as a new change attempt,
 which is a different head and starts its own count.
 
-## Deferred, with the reason
+## Every command, in one place
 
-The epic is the mechanism. These are its child tickets, and each has a place to plug in
-that already exists:
+Nothing here is a sketch of a command; each line is what you type, and `gitiup help`,
+`gitiup quorum help` and `gitiup work help` print them from the binary. The usage text in
+[`main.rs`](../crates/gitiup/src/main.rs) is checked against the dispatcher by a test, so
+a verb that exists but is not documented is a build failure.
 
-* **policy engine and status reporting** ([giti-msi.7](../README.md)) — `VerdictRecord`
-  is the input; `SelectionPolicy` is the knob.
-* **disagreement handling** ([giti-msi.8](../README.md)) — built as giti-zp1.7:
-  [`gitiup quorum dispute`](#reading-a-disagreement-gitiup-quorum-dispute) is `divergent`,
-  `rejected` and `missing` read out loud, with the logs, and
-  [`gitiup quorum retry`](#escalating-it-the-attempt-cap) is the escalation — `attempt + 1`,
-  a fresh seed, a cap the policy signed.
-* **the rest of the CLIs** ([giti-msi.3](../README.md), [giti-msi.5](../README.md)) —
-  every command in ADR-0002's "storage" sketch is a function in this crate already, and
-  `store` is the layer they call; `gitiup participant` (giti-msi.2) is the first of them,
-  and is how that layer is driven today.
-* **quarantine and reputation decay** ([giti-msi.9](../README.md)) — the exclusions are
-  inputs to selection, so quarantine is a policy that writes them.
+| the question | the command line | where it is decided |
+|---|---|---|
+| may this box verify? | `gitiup participant register --ram-mb 32768 --disk-mb 262144 --sandbox docker --sandbox-level 2 --arch x86_64 --out signup.json`, then the owner's `gitiup participant approve --from signup.json --tier endorsed --store ./store --publish` | [`roster`](../crates/gitiup-quorum/src/roster.rs) |
+| who is on the epoch, and what does each entry qualify for? | `gitiup participant list --store ./store --require-arch x86_64 --require-ram-mb 16384`, `gitiup participant verify-roster --store ./store` | `roster`, [`capability`](../crates/gitiup-quorum/src/capability.rs) |
+| a key is dead, and what does that void? | `gitiup participant revoke <key-id> --reason compromised --store ./store --publish` | `roster`, [`gate`](../crates/gitiup-quorum/src/gate.rs) |
+| who verifies this job, and why them? | `gitiup select --change chg-1 --job build/matrix/linux-x86_64 --head "sha1:$(git rev-parse HEAD)" --proposer ada --require-arch x86_64 --store ./store --explain --publish`; and with no key at all, `gitiup select --change chg-1 --store ./store --explain` | [`select`](../crates/gitiup-quorum/src/select.rs), [`round`](../crates/gitiup-quorum/src/round.rs) |
+| a change opens the rounds its policy asked for | `gitiup change submit --repository . --base main --store ./store` (`--no-quorum` opts out of it out loud, `--explain` prints the audit table) | [`gitiup/src/quorum.rs`](../crates/gitiup/src/quorum.rs) |
+| what wants doing? | polled, not typed: `store::open_rounds` and `store::open_rounds_for(key)` over `refs/gitiup/job/**`, one bounded page at a time | [`job`](../crates/gitiup-quorum/src/job.rs), [`store`](../crates/gitiup-quorum/src/store.rs) |
+| serve the seat | `gitiup work --store ./store --key volunteer --once` (or `--watch 30s --max-jobs 1`; `--dry-run --json` rehearses it and writes nothing) | [`gitiup/src/work.rs`](../crates/gitiup/src/work.rs), [`participate`](../crates/gitiup-quorum/src/participate.rs) |
+| what did the quorum decide? | `gitiup quorum verdict chg-6a6a --store ./store`, and `--publish --attest store --key owner` to file the verdict and the attestation it earns | [`verdict`](../crates/gitiup-quorum/src/verdict.rs), [`attestation`](../crates/gitiup-quorum/src/attestation.rs) |
+| why do they disagree? | `gitiup quorum dispute chg-6a6a --store ./store --logs ./logs` | [`gitiup/src/dispute.rs`](../crates/gitiup/src/dispute.rs) + `gitiup-normalise` |
+| one more chance, with a last one | `gitiup quorum retry chg-6a6a --store ./store --key owner --reason "…"` — exit 9 when the cap is gone | [`escalate`](../crates/gitiup-quorum/src/escalate.rs) |
+| may it merge? | `gitiup verify change chg-6a6a --store ./store` | [verification](verification.md) |
+| then merge it | `gitiup change merge chg-6a6a --store ./store --key owner --proof "sha256:…"` | [changes](changes.md) |
+| what are the rules, and which one was in force? | `gitiup policy show --store ./store --gate`, `gitiup policy check --commit "$rev" --store ./store --ref refs/heads/main`, `gitiup policy explain change chg-6a6a --store ./store` | [ADR-0004](adr/0004-published-policy-format-signing-and-resolution.md), [`policy`](../crates/gitiup-quorum/src/policy.rs) |
+
+## Still open, with the reason
+
+The loop above is what shipped. What did not, and where it plugs in:
+
+* **quarantine and reputation as selection inputs** (giti-zp1.8). The exclusions are
+  already an input to selection (`RoundInputs::excluding`, carried forward by
+  `gitiup quorum retry`), and a verdict already names every `missing` and `rejected` seat
+  with a code — so quarantine is a policy that *writes* exclusions from that evidence, and
+  the two ends exist with the middle missing. What does not exist is anybody remembering
+  that a key was late twice: every verdict recomputes from the store's own records, which
+  is the right rule for an auditor and no way to have a memory.
+* **endorsement records** ([ADR-0002 D6](adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+  The `ENDORSEMENT` namespace is declared and unused: a tier can be *set* to `endorsed` by
+  an owner's `approve --tier endorsed`, but the signed endorsement document that would be
+  *evidence* for that decision (`kv/endorsement/<hex>`, `refs/gitiup/endorsement/<slot>`)
+  is not implemented. "Endorsed" therefore means "the owner said so", which is honest — and
+  is not the same sentence as the one D6 wrote.
+* **rate limits, and what opening a thousand rounds should cost**
+  ([ADR-0002's threat table](adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+  What exists is bounded by construction rather than metered: a paged advertisement listing
+  with a page cap, one commitment and one reveal per seat, a roster entry cap, and ADR-0001
+  D7's document limits. What is missing is a *price* for flooding the store with rounds, and
+  the threat-model document that enumerates it has not been written.
+* **handle-keyed slots and sealed grants**
+  ([ADR-0002 D11](adr/0002-roster-verifier-selection-and-sybil-resistance.md)): specified,
+  and deliberately not built. `reveal_mode = "sealed"` buys independence — a seat fixing
+  its own answer before reading anyone else's — and buys no secrecy at all; handles would
+  buy a few minutes of untargetability for a new key derivation and a new AEAD in the trust
+  path, which is the trade D11 made in the negative and still stands.
 
 ## Trying it
 
@@ -809,8 +978,14 @@ that already exists:
 cargo test -p gitiup-quorum            # vectors, properties, store, end-to-end
 cargo test -p gitiup-quorum --test quorum_end_to_end -- --nocapture
 cargo test -p gitiup-quorum --test job_leases -- --nocapture
+cargo test -p gitiup-quorum --test commit_reveal -- --nocapture
 cargo test -p gitiup-quorum --test verdict_filing -- --nocapture
+cargo test -p gitiup-quorum --test quorum_attestation -- --nocapture
+cargo test -p gitiup --test change_quorum_cli -- --nocapture
+cargo test -p gitiup --test work_cli -- --nocapture
 cargo test -p gitiup --test quorum_verdict_cli -- --nocapture
+cargo test -p gitiup --test quorum_attest_cli -- --nocapture
+cargo test -p gitiup --test quorum_attest_change_cli -- --nocapture
 cargo test -p gitiup --test quorum_dispute_cli -- --nocapture
 cargo test -p gitiup --test quorum_retry_cli -- --nocapture
 ```
@@ -832,6 +1007,16 @@ the seat, and named `commitment_mismatch` at exit 8; a commitment with no reveal
 spending the seat; and a reader who trusts nobody recomputing a reveal's hash from the two
 refs.
 
+`work_cli` is the volunteer's loop run as a binary, against a real store, a real keystore
+and the real sandbox ladder: a dry run that signs a `simulated` result and leases and
+publishes nothing; a pass that leases, runs, digests, signs and publishes into the seat the
+round derived; a *failing* build signed and published rather than skipped; a sealed round
+whose pass writes the commitment before the reveal into the same slot; a `reveal_mode`
+this build cannot honour refused instead of downgraded; a live lease held by somebody else
+refused with the holder and the TTL left; and a roster epoch below the ledger named for
+what it is. The loop is also where the codes a supervisor watches come from: 0 served or
+nothing to do, 6 refused, 7 and 8 the evidence's own failures.
+
 The verdict has two. The library rule — a verdict is superseded and never edited — is
 [`crates/gitiup-quorum/tests/verdict_filing.rs`](../crates/gitiup-quorum/tests/verdict_filing.rs):
 a first filing, a retry that moves nothing, a different answer at the same attempt
@@ -843,6 +1028,16 @@ run as the built binary against a real store and a real keystore: `verified`, `f
 submission bound to another commit at 8 *over* a tally that still carried the threshold; a
 revocation that voids a vote already cast; a capability lie named in the report and not
 counted; every run asserting an empty stderr, because that is the contract a hook reads.
+
+The top tier has two as well. [`tests/quorum_attestation.rs`](../crates/gitiup-quorum/tests/quorum_attestation.rs)
+is the library rule — only a `verified` verdict produces a document, a document that only
+*labels* itself quorum is refused at exit 6, a seat revoked afterwards undoes it, and a
+failed verdict produces no bytes at all — and
+[`crates/gitiup/tests/quorum_attest_cli.rs`](../crates/gitiup/tests/quorum_attest_cli.rs) plus
+[`quorum_attest_change_cli.rs`](../crates/gitiup/tests/quorum_attest_change_cli.rs) are the
+commands: `gitiup quorum verdict --attest` writing a file or filing in the store, and
+`gitiup verify change` carrying a change whose policy demands the quorum tier only when
+the quorum actually happened.
 
 The command line has its own acceptance test, run as the built binary against a real
 keystore, a real store and a real signed policy —

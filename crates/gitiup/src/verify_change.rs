@@ -180,7 +180,10 @@ pub(crate) const CHANGE_CHECKS: &[&str] = &[
 /// `gitiup verify change …`
 pub fn change(args: &[String]) -> Result<(), CliError> {
     let args = Args::parse_with(args, VALUED, SWITCHES)?;
-    if let Some(()) = args.help(VERIFY_CHANGE_HELP) {
+    // `help` in the place the change id would go, which is how every verb here that takes a
+    // positional spells it — and `gitiup verify help` promises this one lists its flags.
+    if args.wants_help() || args.positional.first().is_some_and(|first| first == "help") {
+        print!("{VERIFY_CHANGE_HELP}");
         return Ok(());
     }
     let handle = match args

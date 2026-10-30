@@ -3,10 +3,11 @@
 * **Status**: accepted
 * **Decides**: how a verifier pool is defined and maintained, how the N verifiers for one job are chosen so that anyone can audit the choice afterwards, what makes an identity mean something, and what happens when a key is rotated or revoked
 * **Ticket**: `giti-msi.1` (parent epic `giti-msi`, *Optional quorum verification network*)
-* **Blocks**: `giti-msi.2` (roster + registration), `giti-msi.3` (selection), `giti-msi.4` (jobs/leases — reserve order and exclusion input), `giti-msi.6` (commit-reveal slots and handles), `giti-msi.7` (policy defaults, one-vote-per-identity), `giti-msi.8` (escalation rounds), `giti-msi.9` (threat model, rate limits); `giti-kd4.5` (merge gate re-checks revocation)
+* **Blocks**: `giti-msi.2` (roster + registration), `giti-msi.3` (selection), `giti-msi.4` (jobs/leases — reserve order and exclusion input), `giti-msi.6` (commit-reveal slots and handles), `giti-msi.7` (policy defaults, one-vote-per-identity), `giti-msi.8` (escalation rounds), `giti-msi.9` (threat model, rate limits); `giti-kd4.5` (merge gate re-checks revocation); and, added when the epic was re-numbered, `giti-zp1.1`–`giti-zp1.7` (jobs and leases, the volunteer's loop, the verdict, `tier: quorum`, sealed submission, dispute and escalation) and `giti-91m.2` (the published policy a round's numbers come from)
 * **Depends on**: [ADR-0001](0001-attestation-encoding-hash-and-signature.md) — canonical JSON (D1), `sha256:` digest strings (D2), Ed25519 + SSH key ids (D3), freshness-as-policy (D6), limits and fail-closed reading (D7)
 * **Reference vectors**: [`fixtures/selection-v1/`](fixtures/selection-v1/) — `generate.py` is a stdlib-only implementation of the algorithm in D3, and `roster.json` / `round.json` / `selection.json` are the golden vectors `gitiup select` must reproduce byte-for-byte
-* **Not implemented yet**: this is a decision document. The code lands in `giti-msi.2`/.`3`; the vectors exist so those tickets can be *wrong loudly* rather than differ quietly.
+* **Implemented by**: [`crates/gitiup-quorum`](../../crates/gitiup-quorum/README.md), driven by `gitiup participant`, `gitiup select`, `gitiup work` and `gitiup quorum verdict|dispute|retry`; the operational document is [docs/quorum.md](../quorum.md). The crate's first commit put D1–D5, D7–D10's *mechanism* in Rust; `giti-msi.2` and `.3` put the roster and the selection behind a command line; `giti-zp1.1` the D10 jobs and leases, `giti-zp1.3` the D11 checklist as a loop, `giti-zp1.4` the tally, `giti-zp1.5` the tier D5 reserves, `giti-zp1.6` D11's `sealed` mode, `giti-zp1.7` D5's escalation and its cap. **Two decisions here are not implemented: D6 (endorsement records) and the reputation half of D5** (giti-zp1.8) — and the rate limits this document hands to `giti-msi.9` were never written, so D10's listing is bounded by construction and not metered. The vectors still earn their keep: they are what let an auditor be *wrong loudly* about a selection rather than differ quietly.
+* **Decision-by-decision status**: D1 sortition ✓ (`select.rs`, `roster.rs`) · D2 the seed ✓ (`derive.rs`, `round.rs`) · D3 the algorithm and its vectors ✓ (`tests/selection_vectors.rs`) · D4 one identity one vote and the exclusion family ✓ (`roster.rs`, `select.rs`, re-checked at submit) · D5 tiers and caps ✓, reputation ✗ · D6 endorsements ✗ · D7 capabilities, claimed and post-checked ✓ (`capability.rs`, `gate.rs`, measured live by `gitiup work`) · D8 epochs and the rollback guard ✓ (`roster.rs`, `ledger.rs`) · D9 revocation at verdict time ✓ (`verdict.rs`, `gate.rs`) · D10 records, namespaces, hex slots ✓ with three divergences named there · D11 what is secret until when ✓, handles ✗ by design
 
 > The epic asks five volunteer machines to independently re-run one change. Everything
 > else in the epic — jobs, leases, commit-reveal, verdicts — is downstream of three
@@ -387,6 +388,16 @@ the owner's three boxes plus a stranger's laptop is a quorum); self-declared tie
 (tier is the owner's answer to "do I vouch", so letting a candidate set it is
 meaningless); reputation-weighted selection and reputation-weighted voting (above).
 
+> **Implemented — the tiers, not the memory.** `RosterTier` (trusted / endorsed /
+> anonymous), the `tier_floor` filter and `tier_caps` are code, and `max_per_identity` is
+> enforced in the greedy pass *and* re-checked by the tally, so a roster cannot smuggle two
+> boxes into two votes. The reputation half is not: `exclusions` is an input every caller
+> can fill — `gitiup quorum retry` carries the previous attempt's forward — and nothing
+> accumulates a key's history to write it, because every verdict recomputes from the
+> store's own records and no verdict has a memory. That is the honest state of "reputation
+> may only exclude": the door it would walk through is built (giti-zp1.8 is the policy that
+> opens it), and nothing walks through it yet.
+
 ## D6 — Endorsements: advice with a signature on it
 
 **Decision.** An endorsement is a signed record — `kind: endorsement`, by an endorser
@@ -395,6 +406,14 @@ kernels"), and `issued_at_us` — stored at `kv/endorsement/<hex>` and pointed a
 `refs/gitiup/endorsement/<slot>`. The owner uses endorsements as **evidence for a tier
 decision**. They are never an input to `select`, and the number of endorsements a key
 has does not change its score.
+
+> **Not implemented.** There is no endorsement record type, no write and no reader: the
+> `ENDORSEMENT` namespace is declared in
+> [`store.rs`](../../crates/gitiup-quorum/src/store.rs) and never used. So `endorsed` today
+> is what an owner says at `gitiup participant approve --tier endorsed` — which is exactly
+> what D5 says a tier is, but is not this decision: the *document* that would make "vouched"
+> a checkable third-party claim, rather than an owner's one-word answer, is not in the
+> build. Read this decision as still proposed.
 
 **Why not the alternative (trust the graph at selection time).** Because of C2, and
 because transitively-computed trust is a policy expressed as a traversal: `depth ≤ 2`,
@@ -689,6 +708,32 @@ kv/signup/<hex>       kv/reveal/<hex>     kv/revocation/<hex> kv/endorsement/<he
   able to fetch the roster a round pinned (C9). Old attestations are `.5`'s business;
   rosters are this epic's, and are small.
 
+> **Implemented (`giti-msi.2`/`.3`, `giti-zp1.1`, `giti-zp1.6`), with three divergences
+> named rather than smoothed over.** The hex-slot rule is exactly as decided — every
+> human-facing listing prints slot and fingerprint side by side — and the `kv/` namespaces
+> are one per record class, with verdicts filed under `policy` as this decision said they
+> would be. What differs:
+>
+> * **the lease has its own ref, per seat.** The sketch above carries one "job/lease record"
+>   at `refs/gitiup/job/<change>/<job>`. Shipped is two kinds of record: the advertisement
+>   keeps that ref (one per `(change, job)`, an escalation moves it forward), and a lease
+>   lives at `refs/gitiup/lease/<change>/<job>/<slot>`, both blobs under `kv/job/<hex>`. A
+>   lease that is worth having is one two volunteers can race for without touching each
+>   other, and one ref per job would make every heartbeat on every seat contend for one CAS
+>   write ([`job.rs`](../../crates/gitiup-quorum/src/job.rs),
+>   [docs/quorum.md](../quorum.md#finding-work-the-advertisement-and-the-lease-on-a-seat));
+> * **the two sealed phases are `commit/` then `reveal/`, not `reveal/` then `revealed/`.**
+>   The sketch named `refs/gitiup/reveal/…` the phase-1 commitment and `revealed/…` the
+>   phase-2 reveal; the shipped layout is `refs/gitiup/commit/<change>/<job>/<slot>` for the
+>   hash and `refs/gitiup/reveal/<change>/<job>/<slot>` for the bytes, and there is no
+>   `revealed/` ref. Nothing about the property moved — one CAS slot per seat per phase,
+>   keyed by the same hex slot — but a reader who types the sketch's ref names finds
+>   nothing, so they are named here;
+> * **a withdrawal got a ref** (`refs/gitiup/withdrawal/<slot>`, `kv/withdrawal/<hex>`).
+>   The sketch has `signup/` and `revocation/` and nothing between them, and a volunteer
+>   leaving of its own accord is neither: it is the key's own signature, it applies to the
+>   next epoch, and it has to be discoverable by an owner who did not author it.
+
 ## D11 — What is secret, until when, and what is not
 
 **Decision.** Two different secrets get conflated in one sentence, so split them:
@@ -748,7 +793,7 @@ digest before anyone else reveals theirs.
 > (`missing`). Handle-keyed slots and sealed grants stay unimplemented, as decided above.
 > The mode is set by `quorum.reveal_mode` in the published policy
 > ([ADR-0004 D5](0004-published-policy-format-signing-and-resolution.md)), not by a flag.
-> See [docs/quorum.md](../docs/quorum.md).
+> See [docs/quorum.md](../quorum.md).
 
 **What a verifier checks before running a stranger's job** (fail-closed; all of it is
 local plus two fetches):
@@ -853,6 +898,19 @@ computation and caching (`giti-msi.7`), disagreement and disputes (`giti-msi.8`)
 rate limits and decay specifics (`giti-msi.9`), what the sandbox may reach
 (`giti-bgy.*`), attestation storage and GC (`giti-1rs.5`), key storage and ssh-agent
 plumbing (`giti-1rs.6`), and how a merge gate consumes a verdict (`giti-kd4.5`).
+
+**What has since landed from that list, and what did not.** The epic was re-numbered as
+`giti-zp1`, and most of the paragraph above is now code: commit-reveal is `giti-zp1.6`
+(D11's note), the lease and its TTL are `giti-zp1.1`, verdict computation is `giti-zp1.4`,
+disagreement handling is `giti-zp1.7` (dispute, then a bounded `retry`), the volunteer's
+fail-closed checklist is a loop a person runs (`giti-zp1.3`, `gitiup work`), the top tier
+D5 reserves is producible at last (`giti-zp1.5`), and how a merge gate consumes a verdict
+is `giti-91m.4`'s `gitiup verify change`. What did not land, in the same words: **caching**
+(a verdict is recomputed from the store's records every time, which is slower and is the
+point), **fan-out caps and back-pressure** (a change opens one round per job per arm and
+the only ceiling is the size of the workflow that asked for them), and **rate limits and
+reputation decay** (`giti-msi.9`, whose remaining half is giti-zp1.8). The threat table
+above is therefore still an enumeration without its document.
 
 **How we change our minds.** The domain strings (`gitiup-round-1` — which is also the
 first field of the seed message — plus its `/score`, `/handle` and `/secret` labels, and

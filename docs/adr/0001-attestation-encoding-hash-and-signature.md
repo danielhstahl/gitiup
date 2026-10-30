@@ -357,7 +357,7 @@ was checked, and the last of them disagreed too. Folding it into `6` would make 
 means "ask again" also mean "asking again is what is out of budget", which is exactly the
 confusion a bounded escalation exists to remove. Nothing about a digest is wrong either, so
 it is not an `8`; the token beside it (`attempt_cap_exhausted`) is the machine-readable form.
-See [docs/quorum.md](../docs/quorum.md) and
+See [docs/quorum.md](../quorum.md) and
 [`gitiup_quorum::escalate`](../../crates/gitiup-quorum/src/escalate.rs).
 
 Limits are part of the format, because a volunteer parses strangers' claims (C7):

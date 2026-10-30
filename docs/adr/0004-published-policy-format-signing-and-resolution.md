@@ -6,7 +6,7 @@
 * **Blocks**: `giti-91m.2` (read, verify and resolve a published policy; `gitiup policy publish`), `giti-91m.3` (`gitiup policy show|check|explain`), `giti-91m.4` (`gitiup verify change`), `giti-91m.5` (`gitiup hook install pre-receive`), `giti-91m.6` (policy docs, executed in CI), `giti-zp1.2` (a round's quorum numbers come from the policy, not from a flag)
 * **Depends on**: [ADR-0001](0001-attestation-encoding-hash-and-signature.md) — canonical JSON (D1), `sha256:` digests (D2), Ed25519 + SSH key ids + PAE (D3), claimed microseconds and freshness-as-policy (D6), the verification order, limits and the exit-code taxonomy (D7), versioning discipline (D8); [ADR-0002](0002-roster-verifier-selection-and-sybil-resistance.md) — signed-record framing (`record::body_bytes`), the roster tiers and `SelectionPolicy` this document re-uses verbatim (D5, D7), `kv/` namespaces and hex storage slots (D10), owner trust roots as `--owner` plus the local keystore (D4); [ADR-0003](0003-change-record-format-and-merge-semantics.md) — two digests with different jobs (D4), bytes-then-refs write order under CAS (D5), `ChangeRecord::policy_digest` reserved for exactly this (D2), one canonicaliser (D11)
 * **Reference vectors**: [`fixtures/policy-v1/`](fixtures/policy-v1/) — `generate.py` is a stdlib-only second implementation of D2, D3, D5, D6 and D9; `policies/*.json` are the signed bytes, `cases.json` is the index, the refusal table, the history walk and the normalisation table
-* **Not implemented yet**: this is a decision document. The code lands in `giti-91m.2/.3/.4/.5`; the vectors exist so those four tickets cannot each invent a slightly different "the policy the owner signed".
+* **Implemented by**: [`crates/gitiup-quorum/src/policy.rs`](../../crates/gitiup-quorum/src/policy.rs) and the command line over it — `giti-91m.2` (publish, read and resolve a policy: `gitiup policy publish|show`), `.3` (`gitiup policy check|explain`), `.4` (`gitiup verify change`) and `.5` (`gitiup hook install pre-receive`), plus `giti-zp1.2`, which is where a quorum round starts asking this document for its numbers instead of a flag. The vectors still earn their keep: they are what stops five callers inventing five "the policy the owner signed".
 
 > Four tickets are about to read a repository's policy, and none of them owns the
 > question of what it *is*. Without an answer each invents one: a file in the tree one
@@ -503,7 +503,7 @@ It belongs to the owner and not to a flag for the same reason `n` and `required_
 whoever submits a change must not choose how independent its verification is, and a fork
 must not be able to un-seal an upstream's rounds. What the mode means, and the list of
 things it does not buy, is [ADR-0002 D11](0002-roster-verifier-selection-and-sybil-resistance.md)
-and [docs/quorum.md](../docs/quorum.md).
+and [docs/quorum.md](../quorum.md).
 
 **Amendment (giti-zp1.7, the attempt cap).** `quorum.max_attempts` is the second addition to
 the `quorum` block, and it is the same shape of field for the same reasons: additive and
@@ -522,7 +522,7 @@ given, and may not spend more. Attempts are counted from the store's own refs (`
 highest attempt number that exists for that `(change, job)`), so the cap is a fact about the
 record and not about anybody's local log. Running out is terminal and has its own exit code;
 see [ADR-0001 D7](0001-attestation-encoding-hash-and-signature.md) and
-[docs/quorum.md](../docs/quorum.md).
+[docs/quorum.md](../quorum.md).
 | **scope** | `protects` (globs inside `refs/heads/**`) | `.5`, `.4` |
 
 That is the set the ticket asked for — required tier, trust anchors, `required_agree`/`n`

@@ -474,6 +474,61 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
 mod tests {
     use super::*;
 
+    /// The command words `dispatch` matches on, read out of this file's own source.
+    ///
+    /// A test that hard-codes "the commands" can only ever agree with itself, so this
+    /// parses the match arms instead: the dispatcher *is* the list.
+    fn dispatched_commands() -> Vec<String> {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("this file, read back in");
+        let start = source
+            .find("fn dispatch(")
+            .expect("the dispatcher is in this file");
+        let mut out = Vec::new();
+        for line in source[start..].lines().skip(1) {
+            let line = line.trim();
+            // The fall-through arm ends the match; whatever follows is not a command.
+            if line.starts_with("other") {
+                break;
+            }
+            // An arm opens with a quoted word: `"run" => run::run(&args[1..]),`.
+            let Some(name) = line
+                .strip_prefix('"')
+                .and_then(|rest| rest.split('"').next())
+            else {
+                continue;
+            };
+            if line.contains("=>") {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// The first word of every line in the `COMMANDS:` block of the usage text.
+    ///
+    /// An entry starts at column four; a wrapped entry's second line is indented to the
+    /// description column, and is not a command.
+    fn documented_commands() -> Vec<String> {
+        let start = USAGE
+            .find("COMMANDS:\n")
+            .expect("the usage text has a COMMANDS block");
+        let block = &USAGE[start + "COMMANDS:\n".len()..];
+        let block = &block[..block.find("\n\n").expect("the COMMANDS block ends")];
+        block
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line[4..].starts_with(' ') && !line[4..].is_empty()
+            })
+            .filter_map(|line| {
+                line.trim_start()
+                    .split([' ', '\t'])
+                    .next()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     #[test]
     fn the_usage_text_documents_the_exit_codes_it_uses() {
         // The table in this module's docs and the text users see must not drift.
@@ -492,6 +547,77 @@ mod tests {
             USAGE.contains("verify attestation"),
             "the verdict command must be in the usage text"
         );
+        // Exit 9 is not decoration: exactly one command produces it, and the usage text
+        // has to say which, or a caller branches on a number nothing exits with.
+        assert!(
+            USAGE.contains("9 attempts exhausted") && USAGE.contains("attempt cap is exhausted"),
+            "exit 9 must be tied to `quorum retry` in the usage text, not just listed"
+        );
+    }
+
+    #[test]
+    fn every_command_the_dispatcher_accepts_is_in_the_usage_text() {
+        // Bidirectional, because both directions are a real bug: a command the dispatcher
+        // takes and `gitiup help` does not mention is a command nobody finds, and one the
+        // help advertises and the dispatcher falls through on is a lie told by the binary.
+        let dispatched: std::collections::BTreeSet<String> = dispatched_commands()
+            .into_iter()
+            .filter(|name| name != "help" && name != "version")
+            .collect();
+        let documented: std::collections::BTreeSet<String> = documented_commands()
+            .into_iter()
+            .filter(|name| name != "help" && name != "version")
+            .collect();
+        for name in &dispatched {
+            assert!(
+                documented.contains(name),
+                "`gitiup {name}` is dispatched but `gitiup help` does not list it"
+            );
+        }
+        for name in &documented {
+            assert!(
+                dispatched.contains(name),
+                "`gitiup help` advertises `{name}`, which the dispatcher does not accept"
+            );
+        }
+        // The operational epic's verbs are the reason this test exists: a help block that
+        // says "quorum" and lists one subcommand sends a reader past the other two.
+        for name in ["participant", "select", "quorum", "work"] {
+            assert!(
+                dispatched.contains(name) && documented.contains(name),
+                "`{name}` is part of the command line and of the documentation of it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_quorum_surface_is_all_of_it_and_named_in_full() {
+        // The quorum verbs are the ones that grew during the operational epic, and a block
+        // that says "quorum" while listing only `verdict` would send a reader past the rest.
+        for verb in [
+            "participant [COMMAND] [OPTS]",
+            "select [OPTIONS]",
+            "quorum verdict <ID> [OPTIONS]",
+            "quorum dispute <ID> [OPTIONS]",
+            "quorum retry <ID> [OPTIONS]",
+            "work [OPTIONS]",
+            "change submit [OPTIONS]",
+            "verify change <ID> [OPTIONS]",
+            "policy publish [POLICY]",
+            "policy explain <SUBJECT>",
+        ] {
+            assert!(
+                USAGE.contains(verb),
+                "the usage text must name `{verb}` in the form the command accepts"
+            );
+        }
+        // …and `gitiup quorum` itself has no fourth subcommand waiting in the dark.
+        for verb in ["verdict", "dispute", "retry"] {
+            assert!(
+                crate::quorum::QUORUM_HELP.contains(&format!("{verb} <CHANGE>")),
+                "`gitiup quorum help` must list `{verb}`"
+            );
+        }
     }
 
     #[test]

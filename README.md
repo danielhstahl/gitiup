@@ -25,7 +25,7 @@ Two goals, one tool:
 | `gitiup-keys` | signing keys and identities: an age-encrypted keystore, ssh-agent and gpg-agent backends, and the signed identity claim that says "this key is mine" — every one of them a `gitiup_attest::Signer`, so a key's origin never changes the signature it produces |
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
-| `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, per-seat attestation storage — open, or committed-then-revealed when the policy seals the round — and the verdict (`verified` / `failed` / `insufficient`), plus the published policy a gate applies — its format, its trust and coherence checks, the resolution ladder and the provenance every answer carries: ADR-0002 and ADR-0004 as code, and nothing else |
+| `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, the advertisement and the TTL lease that let a stranger find a seat and lean on it, per-seat attestation storage — open, or committed-then-revealed when the policy seals the round — the verdict (`verified` / `failed` / `insufficient`), the `tier: quorum` attestation only a verified verdict can produce, the bounded escalation and its attempt cap, plus the published policy a gate applies — its format, its trust and coherence checks, the resolution ladder and the provenance every answer carries: ADR-0002 and ADR-0004 as code, and nothing else |
 
 The workspace globs `crates/*`, so a new crate is just `members`-free.
 
@@ -55,8 +55,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy file may insist on.
 * [The quorum verification network](docs/quorum.md) — how the five are picked and
-  audited, what the store holds, what a verdict means, and which parts are still open
-  tickets. Implementation: [`gitiup-quorum`](crates/gitiup-quorum/README.md).
+  audited, what the store holds, the operator's tour (register → approve → open a round →
+  work → verdict → merge) and the two ways it fails (nobody turned up, and they disagree),
+  what a verdict means, and what is still open. Implementation:
+  [`gitiup-quorum`](crates/gitiup-quorum/README.md).
 * [The run report](docs/run-report.md) — the JSON a runner writes, and the recipe
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
 * [Verification](docs/verification.md) — what `gitiup verify attestation` checks and in

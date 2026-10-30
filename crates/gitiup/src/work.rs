@@ -139,6 +139,7 @@ gitiup work — volunteer for the rounds this store has addressed to this key
 
 USAGE:
     gitiup work [OPTIONS]
+    gitiup work help
 
     --store <dir> | --remote <name>   where to look for work (required)
         --key <selector>              which key volunteers (default: the current identity)
@@ -152,6 +153,7 @@ USAGE:
                                       and no sandbox is needed
         --change <id> --job <id>      only rounds for this change / this job id
         --json                        the pass as one machine-readable line
+        --help, help                  this text
 
 FINDING THE WORK
         --page <n>                    advertisement window (default: 32, max: 256)
@@ -175,6 +177,15 @@ REMEMBERING THE ROSTER
 MEASURING THIS BOX
         --ram-mb <n> --disk-mb <n>    override what this command measured before it checks
                                       your roster claim against the round's requirements
+
+SIGNING
+        --passphrase <text>           the passphrase for the volunteering key, when it is
+                                      not already in the environment — visible in `ps` to
+                                      every user on the box, which is why the file form is
+                                      the one a long-running loop should use
+        --passphrase-file <path|->    the same, from a file, or `-` to read a pipe;
+                                      GITIUP_KEY_PASSPHRASE works too, and `gitiup key help`
+                                      is the full rule this command inherits
 
 Exit codes: 0 served, or nothing to do (a *failed build* is served: the attestation says
 so) · 2 usage · 3 I/O, store unreachable · 6 refused (no sandbox for a stranger's job, a
@@ -217,7 +228,11 @@ const VALUED: &[&str] = &[
 /// `gitiup work …`
 pub fn work(args: &[String]) -> Result<(), CliError> {
     let args = Args::parse_with(args, VALUED, SWITCHES)?;
-    if args.help(WORK_HELP).is_some() {
+    // `help` as a bare word, the way `gitiup select help` and `gitiup quorum verdict help`
+    // spell it. Someone typing it is asking to be told, not asking for a store, and the
+    // alternative is a usage-free refusal that names a flag they have not met yet.
+    if args.wants_help() || args.positional.first().is_some_and(|first| first == "help") {
+        print!("{WORK_HELP}");
         return Ok(());
     }
     let interval = watch_interval(&args)?;
@@ -1905,5 +1920,44 @@ impl Pass {
             let _ = writeln!(out, "exit {} — {refusal}", self.exit);
         }
         out
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The help is documentation, and documentation is what drifts.
+    ///
+    /// Two directions of drift, both checked: a flag the parser takes and the text does
+    /// not name is a flag nobody finds (and `--dry-run` would not have been it), and an
+    /// exit code the loop can return and the text does not name is a number a supervisor
+    /// cannot branch on. `docs/quorum.md` tells a volunteer to read this text; it should
+    /// be the whole surface.
+    #[test]
+    fn the_help_lists_every_flag_the_parser_accepts_and_the_codes_it_exits_with() {
+        for flag in VALUED.iter().chain(SWITCHES.iter()) {
+            assert!(
+                WORK_HELP.contains(flag),
+                "{flag} is accepted by `gitiup work` and undocumented in its help"
+            );
+        }
+        assert!(
+            WORK_HELP.contains("--json"),
+            "--json is parsed, so it is documented"
+        );
+        for code in ["0", "2", "3", "6", "7", "8"] {
+            assert!(
+                WORK_HELP.contains(code),
+                "exit {code} is missing from `gitiup work help`"
+            );
+        }
+        assert!(
+            !WORK_HELP.contains("exit 9") && !WORK_HELP.contains("· 9 "),
+            "`gitiup work` has no ninth code; exit 9 belongs to `gitiup quorum retry`"
+        );
+        assert!(
+            WORK_HELP.contains("gitiup work help"),
+            "the text is printed by `gitiup work help`, and should say so"
+        );
     }
 }

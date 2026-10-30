@@ -1035,3 +1035,53 @@ fn a_bad_interval_is_a_usage_error_and_not_a_silent_once() {
     let output = scene.work("v1", &["--watch", "soon"]);
     assert_eq!(code(&output), 2);
 }
+
+#[test]
+fn help_is_an_answer_and_not_a_missing_store() {
+    // `gitiup work help` is documentation, and docs/quorum.md points a volunteer at it.
+    // Someone typing it is asking to be told, not asking for a store — so the old answer
+    // (exit 6, "no store was named") was a refusal of a question nobody had asked. Same
+    // for `gitiup verify change help`, which `gitiup verify help` promises by name.
+    let harness = Harness::new();
+    for spelling in [
+        vec!["work", "help"],
+        vec!["work", "--help"],
+        vec!["verify", "change", "help"],
+    ] {
+        let output = harness.run(&spelling, None);
+        assert_eq!(
+            code(&output),
+            0,
+            "`gitiup {}` should print help, not refuse: {}",
+            spelling.join(" "),
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "help goes to stdout and leaves stderr for faults"
+        );
+    }
+    let text = stdout(&harness.run(&["work", "help"], None));
+    for flag in [
+        "--once",
+        "--watch",
+        "--dry-run",
+        "--lease-ttl",
+        "--ledger",
+        "--source-date-epoch",
+    ] {
+        assert!(
+            text.contains(flag),
+            "`gitiup work help` must document {flag}"
+        );
+    }
+    assert!(
+        text.contains("Exit codes") && text.contains("--help"),
+        "`gitiup work help` must carry its exit codes and say how to print it"
+    );
+    let gate = stdout(&harness.run(&["verify", "change", "help"], None));
+    assert!(
+        gate.contains("--tier") && gate.contains("quorum"),
+        "`gitiup verify change help` is where the quorum flags are written down"
+    );
+}
