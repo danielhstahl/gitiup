@@ -86,6 +86,7 @@ mod fetch;
 mod hook;
 mod import;
 mod keys;
+mod migrate;
 mod normalise;
 mod participant;
 mod policy;
@@ -142,6 +143,13 @@ COMMANDS:
                                    nothing that marks them trusted (ADR-0005)
     push [OPTIONS]                 the same copy the other way round, from this store out
                                    to a mirror; a mirror never pushes back
+    migrate repo --from <forge> --to <store>
+                                   leave a forge for a store, with history and proofs:
+                                   branches and tags as ordinary refs, every open and merged
+                                   PR's head as a change carrying `origin: pull`, check-run
+                                   evidence where an attestation can honestly be rebuilt, and
+                                   a re-hash of every commit that arrived with one — resumed
+                                   from wherever the last run stopped
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·
@@ -295,6 +303,7 @@ Try:
     gitiup change show chg-6a6a8eab778ba4d0 --store ./store --json
     gitiup fetch --remote upstream --store ./mirror --proofs-only --json   # evidence, no code
     gitiup push  --remote mirror   --store ./store --change chg-6a6a8eab778ba4d0
+    gitiup migrate repo --from github:o/r --to s3://bucket/repo --with-proofs   # leave a forge
     gitiup verify attestation proof.json --policy gitiup-policy.json     # the verdict
     gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
     gitiup verify change chg-6a6a8eab778ba4d0 --store ./store --json     # the merge gate
@@ -472,6 +481,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "change" => change::change(&args[1..]),
         "fetch" => fetch::fetch(&args[1..]),
         "push" => fetch::push(&args[1..]),
+        "migrate" => migrate::migrate(&args[1..]),
         "verify" => verify::verify(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),

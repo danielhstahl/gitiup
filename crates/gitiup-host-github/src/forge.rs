@@ -777,7 +777,7 @@ fn summary_for(encoded: &str, digest: &Oid) -> (String, bool) {
 /// Returns the decoded bytes and whether the copy was truncated (which the caller
 /// then reports rather than hiding). A truncated copy almost never decodes at all,
 /// and saying "no copy" is truer than returning garbage.
-fn extract_copy(summary: Option<&str>) -> Option<(Vec<u8>, bool)> {
+pub(crate) fn extract_copy(summary: Option<&str>) -> Option<(Vec<u8>, bool)> {
     let text = summary?;
     let inside = text.split("```").nth(1)?;
     let encoded: String = inside

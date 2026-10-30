@@ -254,11 +254,79 @@ roster or reveals are not offered is a rumour, and an import is what turns it in
 There is no flag here that makes an imported proof count as one you witnessed, and there
 never will be: `"trust": "none"` is a constant in this verb too.
 
+## Leaving a forge: `gitiup migrate repo`
+
+Everything above moves between two stores gitiup is already talking to. A forge is not one
+of those: its refs are an API answer, its pull requests are not refs, and its history is a
+`git` endpoint with a rate limit in front of it. `gitiup migrate repo` is the one command
+that crosses that boundary, once, idempotently, and leaves an account of itself behind:
+
+```console
+$ gitiup migrate repo --from github:o/r --to s3://bucket/repo --with-proofs
+migrate        github:o/r → s3://bucket/repo
+refs           12 written, 3 already, 0 diverged (9 branch(es), 6 tag(s))
+changes        41 published, 0 already · 28 merge record(s)
+history        41883 bytes, as gitiup records, 41883 object(s) — this store has no git
+               object database: `gitiup` can return any of them and `git fetch` cannot
+proofs         6 carried, 0 already, 3 dropped
+verify         6 re-hashed from the destination, 6 matched · basis claimed_at_us
+refusals       2× check_run_copy_truncated, 1× pull_closed_unmerged
+forge          84 call(s) · 4902/5000 left on core, resets at unix 1793379710
+journal        .gitiup/migrate/github-o-r-s3-bucket-repo-05fe6da6.json
+account        refs/gitiup/migrate/github-o-r-s3-bucket-repo-05fe6da6 → 0ee8ed012fe1
+code           0
+```
+
+**What travels.** Branches and tags become ordinary refs. Every open and merged pull request
+becomes a change record with `origin: pull <n>`, its head under `refs/changes/…`, and a
+merged one also gets a merge record with `via: forge` — the forge's merge commit is the
+fact, and gitiup records it rather than pretending it did the merge. The history is fetched
+from the forge's own git endpoint into a bare mirror under `.gitiup/migrate/` and handed to
+the destination: as a packfile to a git store, as `git-object` records to a store with no
+git object database, which the report says out loud because it changes what `git fetch` of
+that destination will do later.
+
+**What does not.** A check run is an advertisement. Its output becomes an attestation only
+when the copy in it re-hashes to the digest the run claims, which makes it the signed
+document itself and not a reconstruction of one; anything else — truncated output, a run
+that never finished, somebody's build log — is a line in `dropped` with a token, and there
+is no flag that says *carry it anyway* (D3). A pull closed without merging is dropped: no
+branch will ever take that head, so advertising it would be a ref that lies. The forge's
+title, body, author and labels come across as `x_gitiup_pull_*` annotations, because nobody
+at the forge signed them and a field of a gitiup record is a claim somebody signed.
+
+**Nothing confers trust.** The transcribed changes are signed by *this* machine's key — the
+one `--key` names — because no signature at the forge covered them, and the report's `trust`
+field is `none` whatever you pass.
+
+**It is resumable because it is create-only.** Every step is journaled in
+`.gitiup/migrate/<slug>.json` before the next one starts, so a run that dies 30 GB into a
+clone picks up where it stopped, and a run of a finished migration moves nothing and says
+`already`. The forge's rate budget is checked before each listing and the run stops, with
+exit 6 and a token, rather than being cut off mid-step by the API. A journal written by a
+newer gitiup is refused rather than half-read: skipping a step it does not understand would
+mean reporting a migration as complete that is not.
+
+**And it checks itself at the end.** For every commit that arrived with a proof, the bytes
+are read back out of the *destination* — not out of the mirror that carried them, which
+would prove nothing — and re-hashed. `verify` prints how many matched; `basis` names the
+clock a proof's age is told from. A commit that hashes to something other than the name its
+proof gives is exit 8, and that is the one outcome this command refuses to describe as a
+success. A ref the destination cannot produce the bytes for is refused
+(`ref_without_history`) instead of being written into nowhere, and a ref standing at a
+different commit than the forge has is `diverged`, exit 6, and never an overwrite: two
+histories claiming one name is a decision for a person.
+
+The account of the run is filed in the store it built, at
+`refs/gitiup/migrate/<slug>`, in the same class of provenance as the `kv/import/<digest>`
+records `gitiup fetch` writes: *how did this get here*, answerable from inside the store,
+granting nothing.
+
 ## Exit codes
 
 `0` ok · `2` usage · `3` I/O or an unreachable store · `6` refused (a read-only
-destination, a budget busted, a pointer that had diverged, or any refusal at all under
-`--strict`) · `8` bytes that are not the bytes their name promises.
+destination, a budget busted, a pointer that had diverged, an unfinished migration, or any
+refusal at all under `--strict`) · `8` bytes that are not the bytes their name promises.
 
 A per-record refusal does **not** fail the run: one unimportable proof must not end a
 fetch of two hundred, so it is reported and counted and the rest arrives. An integrity
@@ -274,5 +342,4 @@ something was skipped.
 * **mirror eviction** — a store can now tell it is a mirror, because it has arrival
   records, so `mirror_may_not_prune_by_age` and capacity eviction (`eviction_needs_source`)
   are now buildable (D8 rule 2).
-* **`gitiup migrate repo`** (`.4`), which is one fat push, and **anonymous read scoping**
-  (`.5`), which is a credential question and has no code here.
+* **anonymous read scoping** (`.5`), which is a credential question and has no code here.

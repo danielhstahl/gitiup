@@ -63,6 +63,7 @@ pub mod curl;
 pub mod forge;
 pub mod host;
 pub mod layout;
+pub mod migrate;
 pub mod store;
 pub mod transport;
 
@@ -78,6 +79,11 @@ pub use forge::{
     ChangeState, ForgeMerge, MAX_PULL_BODY_CHARS, TRUNCATED_NOTICE, pull_body,
 };
 pub use host::GitHubHost;
+pub use migrate::{
+    CLOSED_UNMERGED, COPY_MISMATCH, COPY_TRUNCATED, Dropped, Evidence, ForgeRef, Inventory,
+    MERGE_COMMIT_UNKNOWN, NO_BASE, NO_COPY, NO_DIGEST, NO_HEAD, NOT_COMPLETED, NOT_GITIUP, Pull,
+    RATE_TOKEN, REF_OUT_OF_SCOPE, Want, check_budget, clone_url, inventory, is_rate_stop,
+};
 pub use transport::{Method, Request, Response, Transport, TransportError};
 
 /// The feature a caller checks for, and the string a refusal must name.

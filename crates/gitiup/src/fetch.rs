@@ -380,6 +380,43 @@ pub(crate) fn open_side(
     open_remote(remote, host_config).map(|host| Side { host, what })
 }
 
+/// Open a destination spelled as a URL (`s3://bucket/prefix`, `file:///srv/repo.git`).
+///
+/// `open_side` takes a directory or the name of a configured remote, which covers the two
+/// ways a *near* store is spelled. A destination written as a URL has no name to look up and
+/// may not be a directory at all — a bucket is the common case in exactly this shape — so it
+/// becomes an anonymous remote here, and the classification still decides which host serves
+/// it. Nothing about that is a second opinion on scope: the same `remotes::classify` answers
+/// for a named remote, so `--to s3://x/y` and a `[[remote]]` pointing at the same bucket
+/// cannot mean different things.
+pub(crate) fn open_destination(
+    value: &str,
+    config: &Option<(PathBuf, HostConfig)>,
+) -> Result<Side, CliError> {
+    let text = value.trim();
+    if !text.contains("://") {
+        return open_side(text, config);
+    }
+    let remote = RemoteConfig::new("destination", text)
+        .map_err(|e| CliError::usage(format!("--to '{text}' is not a store: {e}")))?;
+    let served = remotes::classify(&remote).map_err(|e| {
+        CliError::scored(
+            e.exit_code(),
+            format!("--to '{text}': {e}"),
+            e.hint().map(str::to_string),
+        )
+    })?;
+    let profile = config
+        .as_ref()
+        .and_then(|(_path, config)| config.credential_profile(&remote));
+    let host =
+        remotes::open(&remote, profile).map_err(|e| CliError::io(format!("--to '{text}': {e}")))?;
+    Ok(Side {
+        host,
+        what: format!("{} {text}", served.kind),
+    })
+}
+
 /// Open a configured remote, refusing a forge this build cannot serve by name.
 fn open_remote(remote: &RemoteConfig, config: &HostConfig) -> Result<Box<dyn Host>, CliError> {
     if let Err(why) = remotes::classify(remote) {

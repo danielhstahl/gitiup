@@ -528,6 +528,14 @@ pub struct PullRequest {
     /// `merged_at` when merged.
     #[serde(default)]
     pub merged_at: Option<String>,
+    /// The commit the forge put on the base branch when it merged, when it said.
+    ///
+    /// Only ever present on a merged pull. A migration writes a merge record from it and
+    /// refuses to guess it: `base.to` in a merge record is the ref move as it happened,
+    /// and "probably the head, it was probably a fast-forward" is a record of a merge
+    /// that may not have happened that way.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
     /// Web address, for a human.
     #[serde(default)]
     pub html_url: Option<String>,
@@ -855,6 +863,13 @@ pub struct Repository {
     /// only ever reads true when we are allowed to look.
     #[serde(default)]
     pub private: bool,
+    /// The forge's own clone URL (`https://github.com/o/r.git`), when it named one.
+    ///
+    /// The API root and the git endpoint are two different URLs and only the forge knows
+    /// both: an enterprise server may serve git anywhere its API is not. A caller that
+    /// needs to fetch history asks this first and derives a fallback second.
+    #[serde(default)]
+    pub clone_url: Option<String>,
     /// What the credential may do here, when the API chose to include it.
     #[serde(default)]
     pub permissions: Option<Permissions>,
