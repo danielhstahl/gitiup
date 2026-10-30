@@ -73,6 +73,9 @@ gitiup policy — the policy that decides, published to the store and signed
 USAGE:
     gitiup policy publish [POLICY] --store <store> [OPTIONS]
     gitiup policy show             [OPTIONS]      (alias: resolve)
+    gitiup policy check   --commit <oid>  [OPTIONS]
+    gitiup policy explain attestation <DOC|-> [OPTIONS]
+    gitiup policy explain change <ID>     [OPTIONS]
 
 A policy is the rule a merge gate applies, and it lives in the store, not in a
 checkout: `refs/gitiup/policy/current` and its history (ADR-0004 D7). Editing
@@ -125,11 +128,41 @@ Resolution order (D4): --policy · $GITIUP_POLICY · the store · the tree file 
 build's default. The answer always says which one won, and a merge may rest only on the
 first three.
 
+CHECK AND EXPLAIN (does a thing satisfy it, and why):
+    --commit <oid>             check: the commit to judge. With a document, the commit it
+                               has to be about instead.
+    --store <dir> / --remote   where the proofs and the published policy live. For
+      <name>                   `explain attestation <file>` the store is only where the
+                               policy comes from — the file is the subject.
+    --ref <ref>                the ref a push or a merge would land on. `protects` is
+                               only answerable when one is named: a commit is not a ref,
+                               and a gate that guessed would be applying rules nobody
+                               signed.
+    --change <ID> --attempt <n> --expect-result <digest>
+                               `explain change`, exactly as `verify change` takes them
+    --gate / --advisory        which ladder to walk. Default: the gate's.
+    --now <time> / --at <time> the reader's clock, and the revision's moment (D6)
+    --json                     the rule document: one entry per rule with `rule`,
+                               `outcome`, `evidence.policy`, `evidence.claim` and — where
+                               it failed — `detail`, `hint`, `exit`; plus `checks` (the
+                               compact projection), `attestations`, `accepts`, `reasons`
+    --quiet                    one word: `satisfied`, or the code that refused
+
+`check` is the hook's question in one command: do the attestations this store holds about
+a commit satisfy the policy in force? `explain` is the same verdict with the asking
+printed: every rule, passed, refused or not asked, in ADR-0001 D7's order, so the first
+failure *is* the exit code and a CI job can post the list without re-deriving anything.
+`explain change` prints `gitiup verify change`'s own assessment — not a second opinion
+beside it, which is why the two cannot disagree and exit the same.
+
 Examples:
     gitiup policy publish --store ./store --allow-tier local --trust ada --json
     gitiup policy publish policy.json --store ./store --dry-run
     gitiup policy show --store ./store
     gitiup policy show --store ./store --at 2026-10-01T00:00:00Z --json
+    gitiup policy check --commit \"$newrev\" --store ./store --ref refs/heads/main --json
+    gitiup policy explain attestation proof.json --store ./store
+    gitiup policy explain change chg-6a6a8eab778ba4d0 --store ./store --json
 
 Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable · 6 refused (unsigned, untrusted
 signer, a policy that contradicts itself, a broken chain, none published, expired) ·
@@ -184,8 +217,13 @@ pub fn policy(args: &[String]) -> Result<(), CliError> {
         }
         "publish" => publish(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "show" | "resolve" => show(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        // The asking half of this surface. `show` says what the rules are; these say
+        // whether one thing satisfies them, and print the asking.
+        "check" => crate::policy_ask::check(&args[1..]),
+        "explain" => crate::policy_ask::explain(&args[1..]),
         other => Err(CliError::usage(format!(
-            "unknown `gitiup policy` command '{other}'; `gitiup policy help` lists publish and show"
+            "unknown `gitiup policy` command '{other}'; `gitiup policy help` lists publish, \
+             show, check and explain"
         ))),
     }
 }

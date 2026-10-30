@@ -69,8 +69,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use gitiup_attest::{
-    AttestationDoc, CheckOutcome, Digest, Error as AttestError, ErrorKind, Reason, ResultDigest,
-    Tier, TimeUs, Trust, VerdictReport,
+    AttestationDoc, CheckOutcome, Digest, Error as AttestError, ErrorKind, GitOid, Reason,
+    ResultDigest, Tier, TimeUs, Trust, VerdictReport,
 };
 use gitiup_host::attest;
 use gitiup_host::change as change_host;
@@ -165,7 +165,9 @@ const SWITCHES: &[&str] = &["-q", "--quiet"];
 /// These are not the attestation ladder's codes — the per-attestation ladder runs
 /// underneath, unchanged, one section per proof — and they are appended after it in the
 /// `checks` array so a script that knows the old codes still finds them in the old order.
-const CHANGE_CHECKS: &[&str] = &[
+/// `pub(crate)` because `gitiup policy explain change` prints *these* as its subject-level
+/// rules: one promised order, not two that happen to agree today.
+pub(crate) const CHANGE_CHECKS: &[&str] = &[
     "change",
     "policy",
     "protects",
@@ -248,21 +250,25 @@ pub fn change(args: &[String]) -> Result<(), CliError> {
 /// `doc` is `None` when the store could not produce the bytes, or produced bytes that
 /// are not a document: both are verdicts (8 and 6) rather than panics, and both still
 /// get a section, because "which of the five proofs was broken" is the question.
-struct Section {
+///
+/// `pub(crate)` because `gitiup policy check` asks the same question about a commit
+/// instead of a change: one reading of "what does the store say about this commit", two
+/// renderings of it.
+pub(crate) struct Section {
     /// The store's content address for the bytes (`sha256:…`).
-    digest: Oid,
+    pub(crate) digest: Oid,
     /// The ref that advertised it.
-    reference: String,
+    pub(crate) reference: String,
     /// `doc`, when the bytes were a document this build speaks.
-    doc: Option<AttestationDoc>,
+    pub(crate) doc: Option<AttestationDoc>,
     /// What the document says, when there was a document to ask.
-    facts: Option<Facts>,
+    pub(crate) facts: Option<Facts>,
     /// The attestation's own report — the `verify attestation` shape, unchanged.
-    report: VerdictReport,
+    pub(crate) report: VerdictReport,
     /// The policy this proof was judged by, with the revision it applied.
-    policy: Option<ResolvedPolicy>,
+    pub(crate) policy: Option<ResolvedPolicy>,
     /// Why no policy could be found for this proof's timestamp, when that happened.
-    policy_error: Option<PolicyError>,
+    pub(crate) policy_error: Option<PolicyError>,
 }
 
 impl Section {
@@ -278,8 +284,36 @@ impl Section {
         }
     }
 
+    /// This proof's own failures, said *about* this proof: the attestation ladder's
+    /// reasons, prefixed with which attestation they belong to, because "the signature
+    /// does not verify" across four proofs names nothing.
+    ///
+    /// `pub(crate)` because `gitiup policy check` asks the same questions about a bare
+    /// commit and has to report a proof's failure in the words a merge gate uses — a
+    /// second paraphrase would be a second thing to keep true.
+    pub(crate) fn lifted_reasons(&self) -> Vec<Reason> {
+        let what = format!("attestation {}", short(&self.digest.hex()));
+        self.report
+            .reasons
+            .iter()
+            .map(|one| {
+                let mut copy = one.clone();
+                let mut error = AttestError::new(
+                    one.error.kind(),
+                    one.error.context(),
+                    format!("{what}: {}", one_line(one.error.detail())),
+                );
+                if let Some(hint) = one.error.hint() {
+                    error = error.with_hint(hint.to_string());
+                }
+                copy.error = error;
+                copy
+            })
+            .collect()
+    }
+
     /// The key ids on this proof that the policy applied to it would trust.
-    fn signers(&self) -> Vec<String> {
+    pub(crate) fn signers(&self) -> Vec<String> {
         let Some(doc) = &self.doc else {
             return Vec::new();
         };
@@ -301,17 +335,17 @@ impl Section {
         }
     }
 
-    fn accepted(&self) -> bool {
+    pub(crate) fn accepted(&self) -> bool {
         self.report.accepted()
     }
 
-    fn result_digest(&self) -> Option<String> {
+    pub(crate) fn result_digest(&self) -> Option<String> {
         self.facts
             .as_ref()
             .and_then(|facts| facts.result_digest().map(str::to_string))
     }
 
-    fn job(&self) -> Option<&str> {
+    pub(crate) fn job(&self) -> Option<&str> {
         self.facts.as_ref().and_then(|facts| facts.job())
     }
 
@@ -395,7 +429,7 @@ impl Section {
 }
 
 /// A quorum verdict the store advertised, or the reason it could not be read.
-struct VerdictEntry {
+pub(crate) struct VerdictEntry {
     /// The ref that carried it.
     reference: String,
     /// The record, when it was readable, canonical, and signed by a trusted owner.
@@ -469,19 +503,24 @@ impl VerdictEntry {
 }
 
 /// The combination the gate accepted, and why it is *that* one.
-struct Accepted {
+///
+/// `pub(crate)`, and `Clone`, for the same reason [`Section`] is: `gitiup policy check`
+/// answers the signature question about a commit and has to name the combination it
+/// counted in the same words a merge gate uses.
+#[derive(Clone)]
+pub(crate) struct Accepted {
     /// `attestations` or `quorum verdict`.
-    via: &'static str,
+    pub(crate) via: &'static str,
     /// The one result the combination certifies.
-    result_digest: Option<String>,
+    pub(crate) result_digest: Option<String>,
     /// The distinct trusted signers counted.
-    signers: Vec<String>,
+    pub(crate) signers: Vec<String>,
     /// What was counted: attestation digests, or the verdict's ref.
-    counted: Vec<String>,
+    pub(crate) counted: Vec<String>,
     /// What the policy demanded.
-    required: usize,
+    pub(crate) required: usize,
     /// The verdict's ref, when the combination was a verdict.
-    reference: Option<String>,
+    pub(crate) reference: Option<String>,
 }
 
 impl Accepted {
@@ -502,40 +541,44 @@ impl Accepted {
 // ---------------------------------------------------------------------------
 
 /// Everything one `verify change` run established.
-struct Report {
+///
+/// The fields are `pub(crate)` so that `gitiup policy explain change` can render *this*
+/// verdict rule by rule: one assessment, two renderings, and no chance for the merge
+/// gate and the explainer to disagree about what the same evidence meant.
+pub(crate) struct Report {
     /// The store that was read.
-    store: String,
+    pub(crate) store: String,
     /// The handle the caller used.
-    handle: String,
+    pub(crate) handle: String,
     /// The change id it resolved to, when it resolved.
-    change: Option<String>,
+    pub(crate) change: Option<String>,
     /// `open` · `merged` · `abandoned`.
-    state: Option<String>,
+    pub(crate) state: Option<String>,
     /// The head commit the proofs are about.
-    head: Option<String>,
+    pub(crate) head: Option<String>,
     /// The ref this change would merge into.
-    target: Option<String>,
+    pub(crate) target: Option<String>,
     /// Which attempt was verified.
-    attempt: Option<u32>,
+    pub(crate) attempt: Option<u32>,
     /// The change's title, because a gate log that says `chg-9f2c…` is not a log.
-    title: Option<String>,
+    pub(crate) title: Option<String>,
     /// The change-level checks, in [`CHANGE_CHECKS`] order.
-    checks: Vec<(&'static str, CheckOutcome)>,
+    pub(crate) checks: Vec<(&'static str, CheckOutcome)>,
     /// Every failure: the change-level ones and, prefixed with what they are about,
     /// every attestation's own. First decides the exit code after [`Self::finish`].
-    reasons: Vec<Reason>,
+    pub(crate) reasons: Vec<Reason>,
     /// The policy the *merge* was judged by, with its provenance (D4).
-    policy: Option<ResolvedPolicy>,
+    pub(crate) policy: Option<ResolvedPolicy>,
     /// One section per attestation the store advertised.
-    sections: Vec<Section>,
+    pub(crate) sections: Vec<Section>,
     /// The quorum verdicts found for this change.
-    verdicts: Vec<VerdictEntry>,
+    pub(crate) verdicts: Vec<VerdictEntry>,
     /// The combination accepted, when there was one.
-    accepted: Option<Accepted>,
+    pub(crate) accepted: Option<Accepted>,
     /// The clock the run used.
-    now: gitiup_attest::TimeUs,
+    pub(crate) now: gitiup_attest::TimeUs,
     /// Anything worth saying that is neither a check nor a failure.
-    notes: Vec<String>,
+    pub(crate) notes: Vec<String>,
 }
 
 impl Report {
@@ -615,7 +658,7 @@ impl Report {
     }
 
     /// How one change-level check ended, for a caller that must not overwrite a decision.
-    fn outcome_of(&self, code: &str) -> CheckOutcome {
+    pub(crate) fn outcome_of(&self, code: &str) -> CheckOutcome {
         self.checks
             .iter()
             .find(|(one, _)| *one == code)
@@ -638,7 +681,7 @@ impl Report {
     /// Copy every attestation's failures up, then order them the way the attestation
     /// ladder orders its own: integrity first, then authority, then policy. The first
     /// is what the exit code reports, and everything is still printed.
-    fn finish(mut self) -> Report {
+    pub(crate) fn finish(mut self) -> Report {
         let mut lifted: Vec<Reason> = Vec::new();
         for section in &self.sections {
             // A proof that was never judged because this command has no policy at all is
@@ -648,19 +691,8 @@ impl Report {
             if self.policy.is_none() && section.policy_error.is_some() {
                 continue;
             }
-            let what = format!("attestation {}", short(&section.digest.hex()));
-            for one in &section.report.reasons {
-                let mut copy = one.clone();
-                let mut error = AttestError::new(
-                    one.error.kind(),
-                    one.error.context(),
-                    format!("{what}: {}", one_line(one.error.detail())),
-                );
-                if let Some(hint) = one.error.hint() {
-                    error = error.with_hint(hint.to_string());
-                }
-                copy.error = error;
-                lifted.push(copy);
+            for one in section.lifted_reasons() {
+                lifted.push(one);
             }
         }
         self.reasons.extend(lifted);
@@ -691,18 +723,18 @@ impl Report {
             .collect()
     }
 
-    fn exit_code(&self) -> u8 {
+    pub(crate) fn exit_code(&self) -> u8 {
         if self.accepted.is_some() {
             return 0;
         }
         self.reasons.first().map_or(6, |reason| reason.exit_code())
     }
 
-    fn accepted_now(&self) -> bool {
+    pub(crate) fn accepted_now(&self) -> bool {
         self.accepted.is_some()
     }
 
-    fn verdict_word(&self) -> &'static str {
+    pub(crate) fn verdict_word(&self) -> &'static str {
         if self.accepted_now() {
             return "pass";
         }
@@ -711,7 +743,7 @@ impl Report {
             .map_or("policy", |reason| reason.class().as_str())
     }
 
-    fn primary_code(&self) -> &'static str {
+    pub(crate) fn primary_code(&self) -> &'static str {
         if self.accepted_now() {
             return "ok";
         }
@@ -951,7 +983,7 @@ impl Report {
 /// 8 before 7 before 6: the attestation ladder checks integrity before it asks
 /// authority anything, so the failure that decides the exit code is the one that has to
 /// be fixed before the others even mean something.
-fn rank(kind: ErrorKind) -> u8 {
+pub(crate) fn rank(kind: ErrorKind) -> u8 {
     match kind {
         ErrorKind::DigestMismatch => 0,
         ErrorKind::Signature => 1,
@@ -960,7 +992,7 @@ fn rank(kind: ErrorKind) -> u8 {
 }
 
 /// One change-level failure.
-fn reason(
+pub(crate) fn reason(
     code: &'static str,
     kind: ErrorKind,
     detail: impl Into<String>,
@@ -978,7 +1010,7 @@ fn reason(
 
 /// A published-policy refusal keeps ADR-0004 D9's token in the sentence: the token is
 /// the interface, and the exit code is already the library's.
-fn policy_reason(error: &PolicyError) -> Reason {
+pub(crate) fn policy_reason(error: &PolicyError) -> Reason {
     let kind = match error.exit_code() {
         7 => ErrorKind::Signature,
         8 => ErrorKind::DigestMismatch,
@@ -992,7 +1024,7 @@ fn policy_reason(error: &PolicyError) -> Reason {
 ///
 /// A verdict is only interpretable next to the question it answered, so both halves are
 /// printed: which revision, from where, cited by which digest, and what it demands.
-fn policy_block(resolved: &ResolvedPolicy) -> Value {
+pub(crate) fn policy_block(resolved: &ResolvedPolicy) -> Value {
     json!({
         "provenance": resolved.provenance.json(),
         "rules": policy_cli::rules(resolved),
@@ -1001,7 +1033,7 @@ fn policy_block(resolved: &ResolvedPolicy) -> Value {
 
 /// The one line a report prints for a policy: source, revision, citation, and the
 /// numbers that decided the answer.
-fn policy_summary(resolved: &ResolvedPolicy) -> String {
+pub(crate) fn policy_summary(resolved: &ResolvedPolicy) -> String {
     let provenance = &resolved.provenance;
     let source = provenance
         .source
@@ -1118,26 +1150,77 @@ fn accepted_line(accepted: &Accepted) -> String {
 // ---------------------------------------------------------------------------
 
 /// Everything the flags decided, gathered so the phases below take no flags at all.
-struct Question<'a> {
-    store: &'a Opened,
-    roots: Trust,
+///
+/// `pub(crate)` because `gitiup policy check` asks the same question of a commit: the
+/// ladder, the two clocks and the trust roots are one decision and it is made once, here.
+pub(crate) struct Question<'a> {
+    /// The store to walk a published policy from, when the caller has one. `None` is a
+    /// real answer, not a placeholder: `gitiup policy explain attestation <file>` asks a
+    /// question about bytes in no store, and the ladder still runs — it just lands on the
+    /// local-only sources, which is itself the thing a gate needs to be told.
+    pub(crate) store: Option<&'a Opened>,
+    pub(crate) roots: Trust,
     /// The reader's clock: what freshness and expiry are measured against.
-    now: gitiup_attest::TimeUs,
+    pub(crate) now: gitiup_attest::TimeUs,
     /// An explicit walk timestamp, when `--at` pinned one.
-    at: Option<gitiup_attest::TimeUs>,
-    expect: Option<Digest>,
-    policy_file: Option<PathBuf>,
-    policy_env: Option<PathBuf>,
-    tree_file: Option<PathBuf>,
+    pub(crate) at: Option<gitiup_attest::TimeUs>,
+    pub(crate) expect: Option<Digest>,
+    pub(crate) policy_file: Option<PathBuf>,
+    pub(crate) policy_env: Option<PathBuf>,
+    pub(crate) tree_file: Option<PathBuf>,
+    /// Which ladder this walk belongs to. A merge gate asks the gate ladder; a command
+    /// answering a different question sets this field, which is how `policy explain
+    /// --advisory` walks the advisory ladder instead of describing the gate's.
+    pub(crate) purpose: Purpose,
 }
 
 impl Question<'_> {
+    /// Read the policy question out of the flags, the same way `verify change` does: the
+    /// same trust rule (whose policy will this machine apply), the same two clocks, and
+    /// the same "a tree file is there unless you say otherwise" default.
+    pub(crate) fn new<'a>(
+        store: Option<&'a Opened>,
+        args: &'a Args,
+        now: gitiup_attest::TimeUs,
+        at: Option<gitiup_attest::TimeUs>,
+        expect: Option<Digest>,
+    ) -> Result<Question<'a>, CliError> {
+        Ok(Question {
+            store,
+            roots: policy_cli::show_trust(args)?,
+            now,
+            at,
+            expect,
+            policy_file: args.get("--policy").map(PathBuf::from),
+            policy_env: std::env::var(gitiup_attest::POLICY_PATH_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from),
+            tree_file: match args.get("--tree-file") {
+                Some(text) => Some(PathBuf::from(text)),
+                None => {
+                    let default = std::path::Path::new("gitiup-policy.json");
+                    default.exists().then(|| default.to_path_buf())
+                }
+            },
+            // A merge gate's question by default. `gitiup policy explain --advisory`
+            // is the caller that says otherwise, and it says so on the field.
+            purpose: Purpose::Gate,
+        })
+    }
+
+    /// Ask the advisory ladder instead of the gate's: the same walk, the second set of
+    /// trust roots, and a revision that is not eligible to carry a merge.
+    pub(crate) fn ask_advisory(&mut self) {
+        self.purpose = Purpose::Advisory;
+    }
+
     /// Resolve the policy for one timestamp through the whole D4 ladder, in gate mode.
     ///
     /// This is `.2`'s entry point and nothing else: the ladder, the chain walk, the
     /// trust check and the refusal tokens all come from the library, so `policy show`,
     /// `verify change` and the hook cannot disagree about which revision applies.
-    fn resolve(
+    pub(crate) fn resolve(
         &self,
         at: gitiup_attest::TimeUs,
         from: &'static str,
@@ -1146,8 +1229,17 @@ impl Question<'_> {
             "run-claim" => policy::At::run_claim(at),
             _ => policy::At::now_at(at),
         };
-        let mut request = policy::Request::store(self.store.host.as_ref(), &self.roots, moment);
-        request.purpose = Purpose::Gate;
+        let mut request = policy::Request {
+            host: self.store.map(|opened| opened.host.as_ref()),
+            trust: &self.roots,
+            at: Some(moment),
+            now: Some(self.now),
+            policy_file: None,
+            policy_env: None,
+            tree_file: None,
+            purpose: Purpose::Gate,
+        };
+        request.purpose = self.purpose;
         request.now = Some(self.now);
         request.policy_file = self.policy_file.clone();
         request.policy_env = self.policy_env.clone();
@@ -1157,7 +1249,7 @@ impl Question<'_> {
 }
 
 /// Read the change, judge every proof the store advertises for its head, and decide.
-fn assess(
+pub(crate) fn assess(
     store: &Opened,
     handle: &str,
     args: &Args,
@@ -1166,25 +1258,7 @@ fn assess(
     now: gitiup_attest::TimeUs,
     at: Option<gitiup_attest::TimeUs>,
 ) -> Result<Report, CliError> {
-    let question = Question {
-        store,
-        roots: policy_cli::show_trust(args)?,
-        now,
-        at,
-        expect: expect.cloned(),
-        policy_file: args.get("--policy").map(PathBuf::from),
-        policy_env: std::env::var(gitiup_attest::POLICY_PATH_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from),
-        tree_file: match args.get("--tree-file") {
-            Some(text) => Some(PathBuf::from(text)),
-            None => {
-                let default = std::path::Path::new("gitiup-policy.json");
-                default.exists().then(|| default.to_path_buf())
-            }
-        },
-    };
+    let question = Question::new(Some(store), args, now, at, expect.cloned())?;
 
     // 1. the change. Unresolvable is a refusal, not a fault: a hook handed a change that
     //    is gone still asked a question, and the answer is "no, and here is why".
@@ -1323,195 +1397,18 @@ fn assess(
         None => report.set("protects", CheckOutcome::NotRun),
     }
 
-    // 4. every attestation the store advertises for this head. Read and parsed first,
-    //    because which policy applies to one is a fact about the attestation.
-    let catalog = attest::list_for(&*store.host, &subject)
-        .map_err(|e| change_cli::host_error("list attestations", e))?;
-    for unexpected in &catalog.unexpected {
-        report.fail(
-            "attestations",
-            reason(
-                "attestations",
-                ErrorKind::Policy,
-                format!(
-                    "{} is filed under this head in a shape gitiup does not write, so it is \
-                     not evidence",
-                    unexpected
-                ),
-                Some("a ref that is neither layout is reported rather than skipped: `gitiup attest list` shows what the store really holds".to_string()),
-            ),
-        );
+    // 4 and 5. every attestation the store advertises for this head, each judged by the
+    // revision in force when its run happened (D6).
+    let proofs = read_proofs(&*store.host, &subject, &head, &record.head, &question)?;
+    for failure in proofs.failures {
+        report.fail("attestations", failure);
     }
-
-    let mut sections: Vec<Section> = Vec::new();
-    let mut read_failures: Vec<Section> = Vec::new();
-    for entry in &catalog.entries {
-        let reference = entry.reference.as_str().to_string();
-        let bytes = match attest::fetch(&*store.host, &entry.digest) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                read_failures.push(Section::unread(
-                    entry.digest,
-                    reference,
-                    "stored",
-                    AttestError::new(
-                        ErrorKind::DigestMismatch,
-                        "store",
-                        format!(
-                            "{} is advertised for {} but the store cannot return its bytes",
-                            short(&entry.digest.hex()),
-                            record.head
-                        ),
-                    )
-                    .with_hint(
-                        "a ref naming a missing object is a broken store, not a missing proof",
-                    ),
-                ));
-                continue;
-            }
-            Err(error) if verify::corrupt(&error) => {
-                read_failures.push(Section::unread(
-                    entry.digest,
-                    reference,
-                    "stored",
-                    AttestError::new(
-                        ErrorKind::DigestMismatch,
-                        "store",
-                        format!(
-                            "{} would not hand over what is filed under it: {error}",
-                            short(&entry.digest.hex())
-                        ),
-                    )
-                    .with_hint(
-                        "the bytes filed under a digest must hash to it; anything built on \
-                         this proof is built on nothing",
-                    ),
-                ));
-                continue;
-            }
-            Err(error) => {
-                return Err(change_cli::host_error(
-                    &format!("fetch {}", entry.digest.hex()),
-                    error,
-                ));
-            }
-        };
-        if Oid::hash_bytes(&bytes) != entry.digest {
-            let hashed = Oid::hash_bytes(&bytes);
-            sections.push(Section::unread(
-                entry.digest,
-                reference,
-                "stored",
-                AttestError::new(
-                    ErrorKind::DigestMismatch,
-                    "store",
-                    format!(
-                        "the bytes returned for {} hash to {}, not to the name they are filed under",
-                        short(&entry.digest.hex()),
-                        short(&hashed.hex())
-                    ),
-                )
-                .with_hint("this host is not storing blobs verbatim"),
-            ));
-            continue;
-        }
-        match AttestationDoc::from_canonical_bytes(&bytes) {
-            Ok(doc) => sections.push(Section {
-                digest: entry.digest,
-                reference,
-                facts: Some(Facts::of(&doc)),
-                doc: Some(doc),
-                // Filled in below, once the policy for this proof's timestamp is known.
-                report: VerdictReport::default(),
-                policy: None,
-                policy_error: None,
-            }),
-            Err(error) => {
-                sections.push(Section::unread(entry.digest, reference, "structure", error))
-            }
-        }
-    }
-
-    if catalog.entries.is_empty() {
-        // Nothing to run the ladder on — which is not yet a refusal. Whether "no
-        // attestation" *refuses* is decided after the verdicts have been read, because a
-        // change can be carried by a quorum verdict with no individual attestation at
-        // all, and answering before every piece of evidence is on the table is how a
-        // gate ends up wrong.
+    report.notes.extend(proofs.notes);
+    if proofs.advertised == 0 {
         report.set("attestations", CheckOutcome::NotRun);
         report.set("min_signatures", CheckOutcome::NotRun);
     }
-
-    // 5. each proof is judged by the revision in force when its run happened (D6), with
-    //    the change head as the commit binding and the reader's clock for freshness.
-    let mut resolved_cache: BTreeMap<i64, Result<ResolvedPolicy, PolicyError>> = BTreeMap::new();
-    for section in sections.iter_mut() {
-        let Some(doc) = section.doc.clone() else {
-            continue;
-        };
-        let claimed = doc.manifest.claims.claimed_at_us;
-        let at = question.at.unwrap_or(gitiup_attest::TimeUs(claimed));
-        let entry = resolved_cache
-            .entry(at.0)
-            .or_insert_with(|| question.resolve(at, "run-claim"));
-        match entry {
-            Ok(resolved) => {
-                let mut judged = resolved.clone();
-                judged.policy.now = Some(question.now);
-                judged.policy.expected_commit = Some(head.clone());
-                if let Some(digest) = &question.expect {
-                    judged.policy.expected_result_digest = Some(ResultDigest(digest.clone()));
-                }
-                // The policy's `min_signatures` is a question about the *set* of proofs
-                // for a change — how many distinct trusted keys certify this result — and
-                // [`combine`] below is where it is answered. Running the same number
-                // against one document first would make `min_signatures: 2` satisfiable
-                // only by co-signature, and two independently signed attestations from two
-                // trusted keys would never add up, which is the case it exists for. So the
-                // ladder checks this document's own signatures and no more, and the report
-                // says where the count was applied.
-                let mut ladder = judged.policy.clone();
-                let demanded = ladder.min_signatures;
-                if demanded > 1 {
-                    ladder.min_signatures = 1;
-                }
-                section.report = doc.verify_report(&ladder);
-                if demanded > 1 {
-                    if let Some(check) = section
-                        .report
-                        .checks
-                        .iter_mut()
-                        .find(|check| check.code == "min_signatures")
-                    {
-                        check.outcome = CheckOutcome::NotAsked;
-                    }
-                    report.notes.push(format!(
-                        "{}: the policy requires {demanded} distinct signatures; that count is \
-                         about the attestations for this change together, so this one was \
-                         checked for its own signatures only",
-                        short(&section.digest.hex())
-                    ));
-                }
-                section.policy = Some(judged);
-            }
-            Err(error) => {
-                section.policy_error = Some(error.clone());
-                section.report = VerdictReport::refusing(
-                    "structure",
-                    AttestError::new(
-                        ErrorKind::Policy,
-                        "policy",
-                        format!("{}: {}", error.token(), error.detail),
-                    ),
-                );
-            }
-        }
-    }
-    sections.extend(read_failures);
-    // The store's order is `(subject, digest)`; a section list in that order is what a
-    // reader can match against `gitiup attest list`.
-    sections.sort_by_key(|section| section.digest.hex().to_string());
-    report.sections = sections;
+    report.sections = proofs.sections;
     if !report.sections.is_empty()
         && !report
             .reasons
@@ -1520,8 +1417,6 @@ fn assess(
     {
         report.set("attestations", CheckOutcome::Passed);
     }
-    // An empty list is left `not_run` for now: whether the absence of any proof is the
-    // refusal is decided in step 8, once the verdicts have been read too.
 
     // 6. the quorum verdict — listed, not guessed, and believed only as far as the
     //    owner's signature on it.
@@ -1622,6 +1517,224 @@ fn assess(
         }
     }
     Ok(report)
+}
+
+/// What the store says about one commit: every proof it advertises, each judged by the
+/// policy revision that was in force when that run happened (D6).
+///
+/// A function rather than a stretch of [`assess`], because `gitiup policy check` asks the
+/// same question of a bare commit — no change record, no target ref, no round — and the
+/// answer has to be the *same* reading of the store rather than a second implementation
+/// of it (ADR-0004 T15: four tickets, one policy).
+pub(crate) fn read_proofs(
+    host: &dyn gitiup_host::Host,
+    subject: &Oid,
+    head: &GitOid,
+    about: &str,
+    question: &Question<'_>,
+) -> Result<Proofs, CliError> {
+    // Every attestation the store advertises for this commit. Read and parsed first,
+    // because which policy applies to one is a fact about the attestation.
+    let catalog = attest::list_for(host, subject)
+        .map_err(|e| change_cli::host_error("list attestations", e))?;
+    let mut failures: Vec<Reason> = Vec::new();
+    // Anything the ladder decided that is advice rather than a refusal.
+    let mut notes: Vec<String> = Vec::new();
+    for unexpected in &catalog.unexpected {
+        failures.push(
+            reason(
+                "attestations",
+                ErrorKind::Policy,
+                format!(
+                    "{} is filed under this head in a shape gitiup does not write, so it is \
+                     not evidence",
+                    unexpected
+                ),
+                Some("a ref that is neither layout is reported rather than skipped: `gitiup attest list` shows what the store really holds".to_string()),
+            ),
+        );
+    }
+
+    let mut sections: Vec<Section> = Vec::new();
+    let mut read_failures: Vec<Section> = Vec::new();
+    for entry in &catalog.entries {
+        let reference = entry.reference.as_str().to_string();
+        let bytes = match attest::fetch(host, &entry.digest) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                read_failures.push(Section::unread(
+                    entry.digest,
+                    reference,
+                    "stored",
+                    AttestError::new(
+                        ErrorKind::DigestMismatch,
+                        "store",
+                        format!(
+                            "{} is advertised for {} but the store cannot return its bytes",
+                            short(&entry.digest.hex()),
+                            about
+                        ),
+                    )
+                    .with_hint(
+                        "a ref naming a missing object is a broken store, not a missing proof",
+                    ),
+                ));
+                continue;
+            }
+            Err(error) if verify::corrupt(&error) => {
+                read_failures.push(Section::unread(
+                    entry.digest,
+                    reference,
+                    "stored",
+                    AttestError::new(
+                        ErrorKind::DigestMismatch,
+                        "store",
+                        format!(
+                            "{} would not hand over what is filed under it: {error}",
+                            short(&entry.digest.hex())
+                        ),
+                    )
+                    .with_hint(
+                        "the bytes filed under a digest must hash to it; anything built on \
+                         this proof is built on nothing",
+                    ),
+                ));
+                continue;
+            }
+            Err(error) => {
+                return Err(change_cli::host_error(
+                    &format!("fetch {}", entry.digest.hex()),
+                    error,
+                ));
+            }
+        };
+        if Oid::hash_bytes(&bytes) != entry.digest {
+            let hashed = Oid::hash_bytes(&bytes);
+            sections.push(Section::unread(
+                entry.digest,
+                reference,
+                "stored",
+                AttestError::new(
+                    ErrorKind::DigestMismatch,
+                    "store",
+                    format!(
+                        "the bytes returned for {} hash to {}, not to the name they are filed under",
+                        short(&entry.digest.hex()),
+                        short(&hashed.hex())
+                    ),
+                )
+                .with_hint("this host is not storing blobs verbatim"),
+            ));
+            continue;
+        }
+        match AttestationDoc::from_canonical_bytes(&bytes) {
+            Ok(doc) => sections.push(Section {
+                digest: entry.digest,
+                reference,
+                facts: Some(Facts::of(&doc)),
+                doc: Some(doc),
+                // Filled in below, once the policy for this proof's timestamp is known.
+                report: VerdictReport::default(),
+                policy: None,
+                policy_error: None,
+            }),
+            Err(error) => {
+                sections.push(Section::unread(entry.digest, reference, "structure", error))
+            }
+        }
+    }
+
+    // 5. each proof is judged by the revision in force when its run happened (D6), with
+    //    the change head as the commit binding and the reader's clock for freshness.
+    let mut resolved_cache: BTreeMap<i64, Result<ResolvedPolicy, PolicyError>> = BTreeMap::new();
+    for section in sections.iter_mut() {
+        let Some(doc) = section.doc.clone() else {
+            continue;
+        };
+        let claimed = doc.manifest.claims.claimed_at_us;
+        let at = question.at.unwrap_or(gitiup_attest::TimeUs(claimed));
+        let entry = resolved_cache
+            .entry(at.0)
+            .or_insert_with(|| question.resolve(at, "run-claim"));
+        match entry {
+            Ok(resolved) => {
+                let mut judged = resolved.clone();
+                judged.policy.now = Some(question.now);
+                judged.policy.expected_commit = Some(head.clone());
+                if let Some(digest) = &question.expect {
+                    judged.policy.expected_result_digest = Some(ResultDigest(digest.clone()));
+                }
+                // The policy's `min_signatures` is a question about the *set* of proofs
+                // for a change — how many distinct trusted keys certify this result — and
+                // [`combine`] below is where it is answered. Running the same number
+                // against one document first would make `min_signatures: 2` satisfiable
+                // only by co-signature, and two independently signed attestations from two
+                // trusted keys would never add up, which is the case it exists for. So the
+                // ladder checks this document's own signatures and no more, and the report
+                // says where the count was applied.
+                let mut ladder = judged.policy.clone();
+                let demanded = ladder.min_signatures;
+                if demanded > 1 {
+                    ladder.min_signatures = 1;
+                }
+                section.report = doc.verify_report(&ladder);
+                if demanded > 1 {
+                    if let Some(check) = section
+                        .report
+                        .checks
+                        .iter_mut()
+                        .find(|check| check.code == "min_signatures")
+                    {
+                        check.outcome = CheckOutcome::NotAsked;
+                    }
+                    notes.push(format!(
+                        "{}: the policy requires {demanded} distinct signatures; that count is \
+                         about the attestations for this change together, so this one was \
+                         checked for its own signatures only",
+                        short(&section.digest.hex())
+                    ));
+                }
+                section.policy = Some(judged);
+            }
+            Err(error) => {
+                section.policy_error = Some(error.clone());
+                section.report = VerdictReport::refusing(
+                    "structure",
+                    AttestError::new(
+                        ErrorKind::Policy,
+                        "policy",
+                        format!("{}: {}", error.token(), error.detail),
+                    ),
+                );
+            }
+        }
+    }
+    sections.extend(read_failures);
+    // The store's order is `(subject, digest)`; a section list in that order is what a
+    // reader can match against `gitiup attest list`.
+    sections.sort_by_key(|section| section.digest.hex().to_string());
+    Ok(Proofs {
+        sections,
+        advertised: catalog.entries.len(),
+        failures,
+        notes,
+    })
+}
+
+/// The set of proofs one commit has, as [`read_proofs`] gathered it.
+pub(crate) struct Proofs {
+    /// One section per advertised attestation, in the store's own order.
+    pub(crate) sections: Vec<Section>,
+    /// How many attestations the store advertised. `0` is itself an answer, and what it
+    /// *means* is the caller's: a change can be carried by a quorum verdict with no
+    /// individual attestation at all, so refusing is decided after every piece of
+    /// evidence is on the table.
+    pub(crate) advertised: usize,
+    /// Refusals about the set as a whole — a ref filed in a shape gitiup does not write,
+    /// which is not evidence and is not silently skipped either.
+    pub(crate) failures: Vec<Reason>,
+    /// Anything worth printing that is advice rather than a refusal.
+    pub(crate) notes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,10 +2037,10 @@ fn judge_quorum(
 // ---------------------------------------------------------------------------
 
 /// The combination of attestations that met the policy, or why none did.
-struct Combination {
-    accepted: Option<Accepted>,
-    reasons: Vec<Reason>,
-    notes: Vec<String>,
+pub(crate) struct Combination {
+    pub(crate) accepted: Option<Accepted>,
+    pub(crate) reasons: Vec<Reason>,
+    pub(crate) notes: Vec<String>,
 }
 
 /// Group the accepted attestations by the result they certify, and take the widest.
@@ -1938,7 +2051,7 @@ struct Combination {
 /// `required_agree` rule expressed as the one field a repository writes for "how many
 /// proofs make a set", and it is why the answer names the combination rather than the
 /// count.
-fn combine(sections: &[Section], required: usize) -> Combination {
+pub(crate) fn combine(sections: &[Section], required: usize) -> Combination {
     if sections.is_empty() {
         return Combination {
             accepted: None,

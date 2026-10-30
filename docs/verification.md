@@ -293,6 +293,54 @@ $ gitiup verify change chg-6a6a --store ./store --quiet
 min_signatures
 ```
 
+## The policy question: `gitiup policy check` and `explain`
+
+`verify attestation` asks about one proof and `verify change` asks about a merge. Two
+more questions get asked in front of those, and neither is answerable from either one
+alone:
+
+```console
+$ gitiup policy check --commit "$newrev" --store ./store --ref refs/heads/main
+SATISFIED  attestations: sha256:9f2c…  ·  2 distinct trusted signer(s) of 2  ·  result sha256:77aa…
+```
+
+**does this commit satisfy the policy** — what the store holds about one commit, judged by
+the revision in force now, answered in one exit code for a `pre-receive` hook that has a
+commit and a ref and no change record. It is not `verify change` with the change left
+out: `attestations` and `min_signatures` are asked the same way a merge gate asks them
+(the same `combine` counts the signatures), and `protects` is answered only when `--ref`
+is named, because a commit is not a ref and a gate that guessed which branch was meant
+would be applying rules nobody signed.
+
+```console
+$ gitiup policy explain attestation proof.json --store ./store
+```
+
+**why, rule by rule** — every rule of the effective policy printed with both halves of
+the evidence: what the policy demands, and what this subject claims. Passing rules are
+printed, and rules that could not run are printed as *not run* rather than left out, so
+an absent line is never a silent answer. For a change it is one more word:
+
+```console
+$ gitiup policy explain change chg-6a6a8eab778ba4d0 --store ./store
+```
+
+The order is the contract. Rules are printed in ADR-0001 D7's order — integrity, then
+authority, then policy — so the **first failure is the reason and the exit code**, and a
+CI job can post the list without re-deriving anything from it. `explain change` is
+[`gitiup verify change`](#the-merge-question-gitiup-verify-change)'s own assessment with
+more of it printed, not a second gate beside it: one assessment, so the two commands
+cannot disagree, and the same **0 · 6 · 7 · 8** come out (`--json` for the document,
+`--quiet` for one word: `satisfied`, or the code that refused).
+
+`--json` is a stable rule document, and it is the reason the two commands share one
+renderer: `rules[]` (every rule with `rule`, `outcome`, `evidence.policy`,
+`evidence.claim`, and — where it failed — `detail`, `hint`, `exit`), `checks[]` as the
+compact projection, `attestations[]` one entry per proof with its own ladder, then
+`accepts`, `reasons`, `policy` provenance and the clock. Nothing in it is a paraphrase of
+a check: the outcomes come from the report the verifier produced, and the demand and claim
+strings name the values that check read.
+
 ## What it deliberately does not do
 
 * **No network, no fetch, no key discovery.** Keys are supplied by the caller (a
@@ -324,6 +372,7 @@ min_signatures
 | what a policy may demand | [`policy`](../crates/gitiup-attest/src/policy.rs) |
 | argv, the keystore, the store, the two renderings | [`gitiup/src/verify.rs`](../crates/gitiup/src/verify.rs) |
 | the merge gate over a change: the change-level checks, the combination rule, the verdicts | [`gitiup/src/verify_change.rs`](../crates/gitiup/src/verify_change.rs) |
+| "does this commit satisfy the policy", and every rule printed in D7 order | [`gitiup/src/policy_ask.rs`](../crates/gitiup/src/policy_ask.rs) |
 
 `verify` (the `Result`-returning one a library caller uses) is `verify_report` with
 the tail dropped — one set of checks, one order, two question shapes. A printed

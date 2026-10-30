@@ -36,6 +36,8 @@
 //!                                      its exit code; --publish files the signed verdict
 //! gitiup policy publish|show            the policy a merge gate applies: publish it to
 //!                                      the store signed, and ask which one is in force
+//! gitiup policy check|explain           apply it: does this commit satisfy it, and every
+//!                                      rule that says so, in the order that decides
 //! gitiup work [--once|--watch 30s]      the volunteer's loop: invitation check, lease,
 //!                                      sandboxed run, digest, signature, publish
 //! gitiup help                           this text
@@ -68,6 +70,7 @@ mod keys;
 mod normalise;
 mod participant;
 mod policy;
+mod policy_ask;
 mod quorum;
 mod remotes;
 mod run;
@@ -129,6 +132,13 @@ COMMANDS:
                                    cannot stand behind (ADR-0004)
     policy show [OPTIONS]          which policy is in force, from where, and whether a
                                    merge may rest on it (`--gate`)
+    policy check --commit <OID>    do the attestations this store holds about one commit
+                                   satisfy that policy? 0 · 6 · 7 · 8, and `--quiet` for
+                                   one word
+    policy explain <SUBJECT>       the same verdict with the asking printed: every rule,
+                                   its outcome and its evidence, in the order that makes
+                                   the first failure the reason (`attestation <DOC|->`,
+                                   `change <ID>`)
     work [OPTIONS]                 the volunteer's loop: find the rounds this store has
                                    addressed to this key, check the invitation, take a
                                    lease, run the job in a sandbox that may serve a
@@ -242,6 +252,8 @@ Try:
     gitiup policy publish --store ./store --allow-tier local --trust ada --json
     gitiup policy publish policy.json --store ./store --dry-run
     gitiup policy show --store ./store --gate
+    gitiup policy check --commit \"$newrev\" --store ./store --ref refs/heads/main --json
+    gitiup policy explain change chg-6a6a8eab778ba4d0 --store ./store
     gitiup work --store ./store --dry-run --json          # what I would run, publishing nothing
     gitiup work --store ./store --once                    # one pass, then exit
     gitiup work --store ./store --watch 30s --max-jobs 1  # the volunteer's daemon

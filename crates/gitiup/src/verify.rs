@@ -603,12 +603,12 @@ pub(crate) fn commit_id(text: &str) -> Result<GitOid, CliError> {
 /// `doc` and `failure` are alternatives: bytes that are not a document produce a
 /// reason (and so an exit code) rather than a panic, because "I cannot read this"
 /// is a verdict a script can branch on and a line on stderr is not.
-struct Input {
-    doc: Option<AttestationDoc>,
-    source: String,
+pub(crate) struct Input {
+    pub(crate) doc: Option<AttestationDoc>,
+    pub(crate) source: String,
     /// The store's name for the record, when it came from a store.
-    stored: Option<String>,
-    failure: Option<(&'static str, AttestError)>,
+    pub(crate) stored: Option<String>,
+    pub(crate) failure: Option<(&'static str, AttestError)>,
 }
 
 impl Input {
@@ -658,7 +658,7 @@ impl Input {
 ///
 /// Reading a file the caller named and then verifying something fetched from a remote
 /// instead is the kind of helpfulness that gates the wrong commit.
-fn read(args: &Args) -> Result<Input, CliError> {
+pub(crate) fn read(args: &Args) -> Result<Input, CliError> {
     let named_store = args.get("--store").is_some() || args.get("--remote").is_some();
     if !named_store && !args.positional.is_empty() {
         return from_file(args);
