@@ -1,20 +1,26 @@
 # Federation — moving proofs between stores
 
-*Tickets: `giti-g5c.2` and `giti-g5c.3` (epic `giti-g5c`, *federation — proofs and changes
-travel between repositories*). Decision:
+*Tickets: `giti-g5c.2` and `giti-g5c.3` for the two verbs, and `giti-g5c` itself for what a
+reader is told and who may delete (epic `giti-g5c`, *federation — proofs and changes travel
+between repositories*). Decision:
 [ADR-0005](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md) — D1 (the portable
-set), D2 (the register of what may not be copied), D5 (arrival records), D6 (direction),
-D7 (collision semantics), D8 rule 1 (advertisement ⊆ possession), D9 (the closure an import
-must carry), D10 (budgets and exit codes). Implementation:
+set), D2 (the register of what may not be copied), D5 (arrival records, and the provenance a
+reading owes its reader), D6 (direction), D7 (collision semantics), D8 rules 1–3
+(advertisement ⊆ possession, retention authority, retention records), D9 (the closure an
+import must carry), D10 (budgets and exit codes). Implementation:
 [`crates/gitiup/src/fetch.rs`](../crates/gitiup/src/fetch.rs) and
-[`crates/gitiup/src/import.rs`](../crates/gitiup/src/import.rs) for the verbs and
-[`gitiup-host::federation`](../crates/gitiup-host/src/federation.rs) for the rules; the
-proofs are [`gitiup-host/tests/federation.rs`](../crates/gitiup-host/tests/federation.rs),
+[`crates/gitiup/src/import.rs`](../crates/gitiup/src/import.rs) for the verbs,
+[`gitiup-host::federation`](../crates/gitiup-host/src/federation.rs) for the rules and
+[`federation/provenance.rs`](../crates/gitiup-host/src/federation/provenance.rs) for what a
+reading says about itself, with [`gitiup_host::attest`](../crates/gitiup-host/src/attest.rs)
+for retention authority; the proofs are
+[`gitiup-host/tests/federation.rs`](../crates/gitiup-host/tests/federation.rs),
 [`tests/federation_vectors.rs`](../crates/gitiup-host/tests/federation_vectors.rs),
 [`gitiup-host-github/tests/federation.rs`](../crates/gitiup-host-github/tests/federation.rs)
 (the forge as a destination and a source, over the mock forge),
-[`gitiup/tests/fetch_cli.rs`](../crates/gitiup/tests/fetch_cli.rs) and
-[`gitiup/tests/import_cli.rs`](../crates/gitiup/tests/import_cli.rs).*
+[`gitiup/tests/fetch_cli.rs`](../crates/gitiup/tests/fetch_cli.rs),
+[`gitiup/tests/import_cli.rs`](../crates/gitiup/tests/import_cli.rs) and
+[`gitiup/tests/mirror_reading_cli.rs`](../crates/gitiup/tests/mirror_reading_cli.rs).*
 
 > A mirror is the easiest feature in this product to build and the easiest to build wrong.
 > The bytes are signed, the names are content-derived, and git moves packs for a living —
@@ -372,9 +378,106 @@ reached the origin it *was* configured for either. That last assertion is what c
 real bug: the `curl` transport was handing `curl` the redacted command line it prints for
 humans, so the far end was being asked to accept the literal text of a variable name.
 
+## What a reader is told about a copy
+
+A mirror exists for the moment somebody *cannot* go to the origin, so "go to the origin"
+cannot be the whole design. The other half is two sentences, said out loud: what these
+bytes are, and what the owner is willing to merge on.
+
+**Every reading says where the bytes came from.** A report produced from a store carries a
+`provenance` block ([docs/verification.md](verification.md#the-machine-readable-verdict))
+built by [`federation::provenance`](../crates/gitiup-host/src/federation/provenance.rs)
+out of the store's own `kv/import/` records:
+
+| field | meaning |
+|---|---|
+| `store` | `origin` — nothing in this store says the digest arrived — or `copy` |
+| `store_url` | which store answered, spelled the way the reader spells it |
+| `read_at_us` | when this reading happened |
+| `arrived_from`, `arrived_at_us` | what the arrival record said, when there was one |
+| `origin_seen` | `true` when this store saw the proof at its origin, i.e. it made it |
+| `age_us`, `age_basis` | how old, and from which clock — always `claimed_at_us` |
+| `closure`, `verified_by`, `verify_exit` | what the importing store recorded about its own import |
+
+There is no `--trust-mirror` and no `trusted` bit anywhere, and `age_basis` is a constant:
+age is measured from the signed claim and never from arrival, an mtime, a pack timestamp
+or a bucket's `Last-Modified`. A mirror keeps a proof *available*; it cannot make it
+*fresher* — which is the reason a copy is safe to serve at all, and the reason the field is
+printed even when no policy asked for it (D5 clauses 1–2). `verified_by` and `verify_exit`
+are the importing store's account of the check it ran when the copy landed: worth reading,
+and not a signature — belief is still produced by `gitiup verify` with *this* machine's
+roots.
+
+**The owner decides what a copy may gate.** A published policy may carry a `provenance`
+member ([docs/policy.md](policy.md#what-a-repository-publishes)):
+
+```console
+$ gitiup policy publish --store ./store --allow-tier local --trust ada --require-origin-provenance
+```
+
+| member | the refusal it produces |
+|---|---|
+| `require_origin_seen: true` | `origin_provenance_required` — a proof that arrived by copy may not gate a merge here |
+| `mirrors: [url, …]` | `unlisted_mirror` — copies gate a merge only when they came from a store the owner named |
+
+Both are exit **6**, both are recorded against the attestation they refuse (so a change
+report names which proof was refused and why), and both judge the *reading*, not the
+bytes: the document is the same document, correctly signed, and a gate that must not act on
+a stale proof says so instead of pretending it is not stale. Absent the member — the shape
+of every policy signed before this existed — a copy gates a merge exactly as a native proof
+does, because ADR-0005 chose federation on by default. This is not a trust list (keys do
+that, and a mirror has no key) and not access control (a store's business); it states how
+far from where the bytes were made this repository will merge on them.
+
+## Who may delete: retention authority
+
+Retention looks like one knob — keep less — and it is two different authorities, because
+`--max-age` is a statement about which proofs still *matter* and `--max-bytes` is a
+statement about how much disk a cache has
+([`gitiup_host::attest`](../crates/gitiup-host/src/attest.rs)):
+
+| | the origin | a mirror |
+|---|---|---|
+| prune by **age** | yes — it gates its own merges on these proofs | **no**: `mirror_may_not_prune_by_age` |
+| evict for **capacity** | yes | yes, among digests it can name a re-fetch source for; otherwise `eviction_needs_source` |
+
+A mirror's copies carry the same `claimed_at_us` as the origin's, so an age limit fires at
+the same instant everywhere and buys a mirror nothing except an earlier deletion — and a
+mirror that prunes by age is a store quietly deciding its own policy matters less than the
+one it mirrors. Authority follows write authority, and there is no `mirror` flag to lie
+with: a store knows it is a mirror because it holds `kv/import/` records for what it holds,
+which is the same evidence the provenance block reads. Capacity is a mirror's own problem,
+so it may evict for capacity — retiring the advertisement before the bytes, like every
+retention run, and only for digests it can go and fetch back:
+
+```console
+$ gitiup attest gc --store ./mirror --max-bytes 200MiB   # a cache throwing space back
+$ gitiup attest gc --store ./origin --max-age 90d --apply
+```
+
+`--max-bytes` accepts `512MiB`, `2G`, a byte count, or `never`. A copy with no arrival
+record stays, however badly the limit is missed, and the run exits **6** with the blocked
+digests named: a store that cannot say where a thing came from has not earned the right to
+call it spare.
+
+And a retention *record* — the `kv/gc/<digest>` account a store writes about what it
+deleted — is evidence for a human and never an instruction for a machine (D8 rule 3). The
+most cautious mirror in a federation is one that deletes nothing on a stranger's say-so,
+because the day one store's policy is buggy and its owner is on holiday, an instruction
+becomes a cascade:
+
+```console
+$ gitiup attest gc --store ./mirror --evidence ./their-retention-record.json
+# exit 6: gc_record_not_instruction
+```
+
+It prints the record in full — what was retired, at what age, under what policy, with
+whose pin — because "the origin has been pruning for six weeks" is genuinely worth
+knowing, and then refuses to act on it.
+
 ## Exit codes
 
-`0` ok · `2` usage · `3` I/O, an unreachable store, or a credential that was about to
+* `0` ok · `2` usage · `3` I/O, an unreachable store, or a credential that was about to
 leave the origin it belongs to · `6` refused (a read-only
 destination, a budget busted, a pointer that had diverged, an unfinished migration, or any
 refusal at all under `--strict`) · `8` bytes that are not the bytes their name promises.
@@ -387,12 +490,9 @@ something was skipped.
 
 ## What is not here yet
 
-* **`provenance` in a verify report, and the `provenance` policy member** (`origin_provenance_required`,
-  `unlisted_mirror`) — D5's policy half, waiting on `giti-91m`'s policy readers. The
-  arrival records an import writes are the data that rule will read.
-* **mirror eviction** — a store can now tell it is a mirror, because it has arrival
-  records, so `mirror_may_not_prune_by_age` and capacity eviction (`eviction_needs_source`)
-  are now buildable (D8 rule 2).
+* **tightening a provenance demand locally** — [D5](#d5-authority-availability-and-how-a-stale-copy-is-marked)
+  allows an operator to demand *more* than the signed policy does (and never less), and
+  there is no such knob yet: the demand comes from the signed document and nowhere else.
 * **a bucket that serves anonymous reads through this build's S3 transport** — the
   `anonymous` option is understood, and refused by the AWS transport rather than answered
   by signing as the owner: an anonymous `GET` is an unsigned one, and a read that succeeded

@@ -117,6 +117,7 @@ pub fn document(
         quorum: None,
         effective_from_us,
         expires_at_us: None,
+        provenance: None,
         annotations: None,
         revision,
         previous_digest: previous_digest.to_string(),

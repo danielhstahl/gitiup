@@ -826,6 +826,16 @@ pub struct Retention {
     /// slot a fresh one needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_subject: Option<usize>,
+    /// Free at least this much space, by retiring copies ([ADR-0005 D8 rule 2](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+    ///
+    /// This is the *mirror's* limit, and the shape of it is the point: age and count are
+    /// statements about what a project still cares about, which only the store that
+    /// gates merges on its own proofs may make, while capacity is a statement about this
+    /// disk. So `max_bytes` evicts only among digests this store can name a re-fetch
+    /// source for — the ones a `kv/import/` record says it can go and get again — and
+    /// never touches anything else, however much room that leaves unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 impl Retention {
@@ -837,6 +847,7 @@ impl Retention {
     /// Parse `--max-age` / `--max-per-commit` into a policy.
     pub fn new(max_age: Option<&str>, max_per_subject: Option<usize>) -> HostResult<Retention> {
         Ok(Retention {
+            max_bytes: None,
             max_age_us: match max_age {
                 Some(text) => parse_age(text)?,
                 None => None,
@@ -845,9 +856,25 @@ impl Retention {
         })
     }
 
+    /// Parse a policy that only evicts for capacity: the mirror's half of D8 rule 2.
+    pub fn with_capacity(max_bytes: u64) -> Retention {
+        Retention {
+            max_age_us: None,
+            max_per_subject: None,
+            max_bytes: Some(max_bytes),
+        }
+    }
+
+    /// Whether this policy asks about age or count — the two limits that need
+    /// *authority* rather than a disk, and so the two a mirror may not ask for
+    /// ([`super::federation::provenance::prune_authority`]).
+    pub fn by_authority(&self) -> bool {
+        self.max_age_us.is_some() || self.max_per_subject.is_some()
+    }
+
     /// Whether this policy would prune anything at all.
     pub fn is_unbounded(&self) -> bool {
-        self.max_age_us.is_none() && self.max_per_subject.is_none()
+        self.max_age_us.is_none() && self.max_per_subject.is_none() && self.max_bytes.is_none()
     }
 
     /// The policy as one line, for a report or a log.
@@ -864,8 +891,26 @@ impl Retention {
             Some(max) => format!("keep {max} per subject"),
             None => "no per-subject cap".to_string(),
         });
+        parts.push(match self.max_bytes {
+            Some(bytes) => format!("evict to {} of copies", human_bytes(bytes)),
+            None => "no capacity limit".to_string(),
+        });
         parts.join(" · ")
     }
+}
+
+/// A byte count in the unit a capacity limit is written in: `4g`, `500m`, `1k`, bytes.
+pub fn human_bytes(bytes: u64) -> String {
+    for (unit, size) in [
+        ("g", 1024u64 * 1024 * 1024),
+        ("m", 1024 * 1024),
+        ("k", 1024),
+    ] {
+        if bytes >= size && bytes.is_multiple_of(size) {
+            return format!("{}{unit}", bytes / size);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 /// A day/week/hour rendering of a microsecond duration, for humans.
@@ -936,12 +981,32 @@ pub enum Verdict {
         /// The cap.
         max: usize,
     },
+    /// Pruned: this store is over its capacity limit and this is a copy it may drop
+    /// because it can name where to fetch it back ([ADR-0005 D8 rule 2](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)) —
+    /// a mirror is a cache, and a cache throws away what it can go and get again.
+    OverCapacity {
+        /// The capacity the eviction was working to.
+        max_bytes: u64,
+        /// Where this copy came from, which is where it can be fetched from again.
+        source: String,
+    },
+    /// Kept, and named: the store is over its capacity limit and this copy was a
+    /// candidate, but no `kv/import/` record says where to get it back. Forgetting it
+    /// would make this store the only copy, and a store that cannot say where a thing
+    /// came from has not earned the right to call it spare (`eviction_needs_source`).
+    NeedsSource {
+        /// The capacity it could not be brought under.
+        max_bytes: u64,
+    },
 }
 
 impl Verdict {
     /// Whether this verdict means "remove the advertisement".
     pub fn is_prune(&self) -> bool {
-        matches!(self, Verdict::Expired { .. } | Verdict::OverQuota { .. })
+        matches!(
+            self,
+            Verdict::Expired { .. } | Verdict::OverQuota { .. } | Verdict::OverCapacity { .. }
+        )
     }
 
     /// Stable name for `--json` consumers and for sorting.
@@ -951,6 +1016,8 @@ impl Verdict {
             Verdict::Pinned { .. } => "pinned",
             Verdict::Expired { .. } => "expired",
             Verdict::OverQuota { .. } => "over-quota",
+            Verdict::OverCapacity { .. } => "over-capacity",
+            Verdict::NeedsSource { .. } => "needs-source",
         }
     }
 
@@ -967,6 +1034,17 @@ impl Verdict {
             Verdict::OverQuota { position, max } => {
                 format!("rank {position} for its commit, over the cap of {max}")
             }
+            Verdict::OverCapacity { max_bytes, source } => format!(
+                "over this store's capacity of {}: a copy of {}, which it can fetch back",
+                human_bytes(*max_bytes),
+                source
+            ),
+            Verdict::NeedsSource { max_bytes } => format!(
+                "eviction_needs_source: over capacity ({}), but no kv/import/ record names a \
+                 place to fetch this copy back, so dropping it would make this store the only \
+                 copy",
+                human_bytes(*max_bytes)
+            ),
         }
     }
 }
@@ -1060,6 +1138,32 @@ pub fn plan(
     items: &[AttestationItem],
     pins: &BTreeMap<Oid, String>,
 ) -> Plan {
+    plan_with_sources(retention, now_us, items, pins, &BTreeMap::new())
+}
+
+/// [`plan`], with the extra evidence a **capacity** eviction needs: which digests this
+/// store can name a re-fetch source for, as `kv/import/<digest>` says (`source` is the
+/// store named there, and is printed in the verdict so a report says where the bytes can
+/// be had again).
+///
+/// Age and count are decided from the signed claim and need no such evidence, which is
+/// exactly why they are an *authority* decision and this is not: an age limit means
+/// "proofs older than this no longer matter", and only the store whose policy gates
+/// merges on its own proofs may say that. Capacity means "this disk is full", and a
+/// mirror may answer that — among the copies it can go and get again, and nowhere else.
+///
+/// Eviction order is oldest claim first (then digest), so a mirror sheds what an origin
+/// would shed at the same moment and the two stores' reports can be compared.
+/// Candidates that cannot be named are still walked and still reported
+/// ([`Verdict::NeedsSource`]) rather than skipped in silence: "I could not make room
+/// because I cannot say where these came from" is the sentence an operator needs.
+pub fn plan_with_sources(
+    retention: &Retention,
+    now_us: i64,
+    items: &[AttestationItem],
+    pins: &BTreeMap<Oid, String>,
+    sources: &BTreeMap<Oid, String>,
+) -> Plan {
     let mut ordered: Vec<&AttestationItem> = items.iter().collect();
     ordered.sort_by(|a, b| {
         a.subject
@@ -1102,8 +1206,68 @@ pub fn plan(
     Plan {
         now_us,
         retention: *retention,
-        items: out,
+        items: evict_for_capacity(retention, sources, out),
     }
+}
+
+/// The capacity pass of [`plan_with_sources`]: free bytes, oldest copy first, only among
+/// digests with a named re-fetch source, and report the candidates that had none.
+fn evict_for_capacity(
+    retention: &Retention,
+    sources: &BTreeMap<Oid, String>,
+    mut items: Vec<PlanItem>,
+) -> Vec<PlanItem> {
+    let Some(max_bytes) = retention.max_bytes else {
+        return items;
+    };
+    let mut held: u64 = items
+        .iter()
+        .filter(|item| !item.verdict.is_prune())
+        .map(|item| item.item.size)
+        .sum();
+    if held <= max_bytes {
+        return items;
+    }
+    let mut order: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            !item.verdict.is_prune() && !matches!(item.verdict, Verdict::Pinned { .. })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    order.sort_by(|a, b| {
+        items[*a]
+            .item
+            .claimed_at_us
+            .cmp(&items[*b].item.claimed_at_us)
+            .then(
+                items[*a]
+                    .item
+                    .digest
+                    .hex()
+                    .cmp(&items[*b].item.digest.hex()),
+            )
+    });
+    for index in order {
+        if held <= max_bytes {
+            break;
+        }
+        let size = items[index].item.size;
+        match sources.get(&items[index].item.digest) {
+            Some(source) => {
+                items[index].verdict = Verdict::OverCapacity {
+                    max_bytes,
+                    source: source.clone(),
+                };
+                held = held.saturating_sub(size);
+            }
+            None => {
+                items[index].verdict = Verdict::NeedsSource { max_bytes };
+            }
+        }
+    }
+    items
 }
 
 /// The per-subject cap, applied to the `position`-th freshest kept item.
@@ -1184,6 +1348,26 @@ pub struct PrunedItem {
     pub blob: BlobAction,
 }
 
+/// One attestation a capacity eviction was not allowed to retire.
+///
+/// This is a *reported* state, not a pruned one: the store is over its limit and knows
+/// it, and what stops it is that no `kv/import/` record names a place to fetch the bytes
+/// back. A mirror that forgot those anyway would be the only copy and would not know it
+/// ([ADR-0005 D8 rule 2](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedItem {
+    /// The proof that stays.
+    pub digest: Oid,
+    /// What it attests to.
+    pub subject: Oid,
+    /// The advertisement it keeps.
+    pub reference: String,
+    /// The bytes it occupies.
+    pub size: u64,
+    /// Always `eviction_needs_source`, spelled as the federation refusal table spells it.
+    pub token: String,
+}
+
 /// What a retention run did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
@@ -1205,6 +1389,14 @@ pub struct Report {
     pub pinned: usize,
     /// Bytes the retired items occupied.
     pub pruned_bytes: u64,
+    /// Copies a capacity eviction could not touch because this store cannot name where to
+    /// fetch them back. Reported, never pruned (`eviction_needs_source`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BlockedItem>,
+    /// Bytes that stay because of those blocked copies: what the capacity limit is
+    /// still over by, once everything evictable has been evicted.
+    #[serde(default)]
+    pub blocked_bytes: u64,
     /// The `kv/gc/…` record of this run, when one was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<Oid>,
@@ -1218,14 +1410,22 @@ impl Report {
         } else {
             "retired"
         };
-        format!(
+        let mut line = format!(
             "{verb} {} attestation(s) ({} bytes); kept {} of {} ({} pinned)",
             self.pruned.len(),
             self.pruned_bytes,
             self.kept,
             self.kept + self.pruned.len(),
             self.pinned
-        )
+        );
+        if !self.blocked.is_empty() {
+            line.push_str(&format!(
+                "; {} copy(ies) could not be evicted for capacity ({} bytes, no re-fetch source)",
+                self.blocked.len(),
+                self.blocked_bytes
+            ));
+        }
+        line
     }
 
     /// Why a run pruned nothing, in the sentence an operator can act on.
@@ -1245,6 +1445,15 @@ impl Report {
             return Some(format!(
                 "all {considered} are still referenced by a quorum, a merge or a keep, which no \
                  policy may prune"
+            ));
+        }
+        if !self.blocked.is_empty() {
+            return Some(format!(
+                "over capacity, and every copy that could have been evicted has no \
+                 kv/import/ record naming where to fetch it back ({} blocked, {} bytes); a \
+                 mirror may only forget what it can go and get again",
+                self.blocked.len(),
+                self.blocked_bytes
             ));
         }
         Some(format!(
@@ -1270,6 +1479,7 @@ pub fn apply(
     options: &GcOptions,
 ) -> HostResult<Report> {
     let mut pruned = Vec::new();
+    let mut blocked = Vec::new();
     let mut kept = 0usize;
     let mut pinned = 0usize;
     let actor = options.actor.clone();
@@ -1280,6 +1490,23 @@ pub fn apply(
         if pins.contains_key(&item.item.digest) {
             kept += 1;
             pinned += 1;
+            continue;
+        }
+        if let Verdict::NeedsSource { .. } = item.verdict {
+            // The plan said this copy was a capacity candidate and this store cannot
+            // name where to fetch it back. That is a sentence for the report, not a
+            // deletion: rule 1 of D8 says a store may only forget what it can get
+            // again, and a mirror with amnesia is not a cache.
+            kept += 1;
+            if let Some(reference) = &item.item.reference {
+                blocked.push(BlockedItem {
+                    digest: item.item.digest,
+                    subject: item.item.subject,
+                    reference: reference.clone(),
+                    size: item.item.size,
+                    token: "eviction_needs_source".to_string(),
+                });
+            }
             continue;
         }
         if !item.verdict.is_prune() {
@@ -1354,9 +1581,11 @@ pub fn apply(
         retention: plan.retention,
         dry_run: options.dry_run,
         pruned_bytes: pruned.iter().map(|item| item.size).sum(),
+        blocked_bytes: blocked.iter().map(|item| item.size).sum(),
         kept,
         pinned,
         pruned,
+        blocked,
         record: None,
     };
     if options.record && !options.dry_run && !report.pruned.is_empty() {
@@ -1378,8 +1607,41 @@ fn ref_gone(host: &dyn Host, name: &RefName) -> HostResult<bool> {
     }
 }
 
-/// Write the `kv/gc/…` record of a retention run.
+/// The token a store prints when somebody hands it another store's retention record:
+/// evidence to a human, never an instruction to a machine
+/// ([ADR-0005 D8 rule 3](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+pub const GC_EVIDENCE_NOT_INSTRUCTION: &str = "gc_record_not_instruction";
+
+/// Read a retention record somebody handed over.
 ///
+/// Tolerant of fields this build does not know, which is the opposite of the rule for a
+/// *policy*: a policy's unknown field is a demand this build might fail to honour, so it
+/// is refused, while a gc record's unknown field is somebody else's history, and reading
+/// the parts this build understands harms nothing because none of it is acted on.
+pub fn read_record(bytes: &[u8]) -> Result<Report, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("not a retention record: {e}"))
+}
+
+impl Report {
+    /// What a record written by another store says, in one line: the sentence a human
+    /// reads, and the whole of what a machine is allowed to take from it.
+    pub fn evidence_line(&self) -> String {
+        format!(
+            "{} at {} retired {} attestation(s) ({} bytes), kept {} of {}, {} pinned, under {}",
+            self.actor,
+            crate::time::Timestamp::from_unix((self.now_us / crate::attest::MICROS) as u64)
+                .to_rfc3339(),
+            self.pruned.len(),
+            self.pruned_bytes,
+            self.kept,
+            self.kept + self.pruned.len(),
+            self.pinned,
+            self.retention.describe(),
+        )
+    }
+}
+
+/// Write the `kv/gc/…` record of a retention run.
 /// Content addressed, immutable and cheap to list, because "what did the last
 /// retention run delete, and under which policy" is a question with an audit answer
 /// in every store, not one only the operator's terminal scrollback has.
@@ -1497,6 +1759,7 @@ mod tests {
             item("c1", "fresh", now - 2 * MICROS_PER_DAY),
         ];
         let retention = Retention {
+            max_bytes: None,
             max_age_us: Some(30 * MICROS_PER_DAY),
             max_per_subject: None,
         };
@@ -1522,6 +1785,7 @@ mod tests {
         ];
         items.sort_by_key(|item| item.digest.hex());
         let retention = Retention {
+            max_bytes: None,
             max_age_us: Some(30 * MICROS_PER_DAY),
             max_per_subject: Some(2),
         };
@@ -1542,6 +1806,7 @@ mod tests {
         // No age limit: now the cap is what drops one, at rank 3.
         let capped = super::plan(
             &Retention {
+                max_bytes: None,
                 max_age_us: None,
                 max_per_subject: Some(2),
             },
@@ -1577,6 +1842,7 @@ mod tests {
             "refs/gitiup/reveal/chg/build/ab12cd34",
         );
         let retention = Retention {
+            max_bytes: None,
             max_age_us: Some(MICROS),
             max_per_subject: Some(1),
         };
@@ -1695,6 +1961,7 @@ mod tests {
             },
         ];
         let retention = Retention {
+            max_bytes: None,
             max_age_us: Some(MICROS),
             max_per_subject: None,
         };
@@ -1745,6 +2012,7 @@ mod tests {
             reference: Some(published.reference.as_str().to_string()),
         }];
         let retention = Retention {
+            max_bytes: None,
             max_age_us: Some(1),
             max_per_subject: None,
         };
@@ -1791,6 +2059,7 @@ mod tests {
         }];
         let plan = plan(
             &Retention {
+                max_bytes: None,
                 max_age_us: Some(1),
                 max_per_subject: None,
             },
@@ -1832,6 +2101,7 @@ mod tests {
         }];
         let plan = plan(
             &Retention {
+                max_bytes: None,
                 max_age_us: Some(1),
                 max_per_subject: None,
             },

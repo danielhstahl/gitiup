@@ -263,8 +263,16 @@ impl VerdictReport {
     }
 
     /// Was the document accepted?
+    ///
+    /// A report carrying a reason is not accepted, even when the ladder reached a verdict.
+    /// The exit code has always been "the first reason's", so a report that said
+    /// `accepted: true` while holding a reason was answering its own question wrongly —
+    /// and a caller that branched on `accepted()` instead of `exit_code()` would have
+    /// merged what it had just refused. This matters as soon as a *caller* adds a reason
+    /// of its own ([`Self::add_reason`], and ADR-0005 D5: "I will not gate a merge on a
+    /// copy" is exactly such a reason).
     pub fn accepted(&self) -> bool {
-        self.verdict.is_some() || self.accepted_document
+        (self.verdict.is_some() || self.accepted_document) && self.reasons.is_empty()
     }
 
     /// The outcome of one check.

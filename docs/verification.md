@@ -162,6 +162,7 @@ one key that filed the summary.
   "accepted": false,
   "source": "file proof.json",
   "stored": null,                 // the store's content address, when read from a store
+  "provenance": null,             // where these bytes came from; a block, when there was a store
   "reasons": [                    // every problem found, first one decides `exit`
     {
       "code": "environment",
@@ -209,10 +210,25 @@ Two blocks earn their place there:
   to now, or `null` when nothing could re-derive it. A gate reading `--json` should look
   at `tier` first: the two documents are judged on different ladders and a check code
   means something different on each.
+* **`provenance`** — printed for every read, and `null` when the bytes came from a file or
+  a pipe because there was no store to ask. This is "did these bytes come from the origin,
+  or from a copy of it", said where they are read rather than only when a policy cares,
+  because a reader who is not told a proof arrived by copy cannot ask whether that
+  matters. `age_us` is measured from the signed `claimed_at_us` and never from an arrival
+  stamp, an mtime, a pack timestamp or a bucket's `Last-Modified`; `age_basis` is printed
+  so that rule is a field a test can assert instead of a sentence to trust
+  ([ADR-0005 D5](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)). So a
+  mirror cannot make a proof fresher, whatever its own clock says. `closure`,
+  `verified_by` and `verify_exit` are the importing store's account of what it checked
+  when the copy arrived: worth reading, and not a signature — belief is still produced by
+  `gitiup verify` with *this* machine's roots.
+
+```text
+provenance    store copy · age 304764s (claimed_at_us basis) · arrived from https://origin.example.org/repo.git · closure complete · checked here by --trust, 1 key(s) (exit 0)
+```
 
 `-q` is the one-word form for a shell that only tests the exit code: `ok`, or the code
 of the reason that decided the verdict (`freshness`, `trust`, `signature`, …).
-
 The same ladder in table form, for a human. This document fails two checks, and both
 are printed even though only the first one sets the exit code:
 

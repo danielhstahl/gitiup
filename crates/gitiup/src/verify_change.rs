@@ -282,6 +282,10 @@ pub(crate) struct Section {
     pub(crate) policy: Option<ResolvedPolicy>,
     /// Why no policy could be found for this proof's timestamp, when that happened.
     pub(crate) policy_error: Option<PolicyError>,
+    /// Where these bytes came from — origin or copy, how old, what the importing store
+    /// recorded — as the `provenance` block of ADR-0005 D5. `None` only when there was no
+    /// store to ask.
+    pub(crate) provenance: Option<Value>,
 }
 
 impl Section {
@@ -297,6 +301,7 @@ impl Section {
             report: VerdictReport::refusing(code, error),
             policy: None,
             policy_error: None,
+            provenance: None,
         }
     }
 
@@ -406,6 +411,10 @@ impl Section {
             "attestation".into(),
             self.facts.as_ref().map(Facts::json).unwrap_or(Value::Null),
         );
+        out.insert(
+            "provenance".into(),
+            self.provenance.clone().unwrap_or(Value::Null),
+        );
         if let Some(quorum) = &self.quorum_json {
             out.insert("quorum".into(), quorum.clone());
         }
@@ -450,6 +459,22 @@ impl Section {
                     .unwrap_or_default()
             )),
             None => out.push_str("      policy   none was resolved for this proof\n"),
+        }
+        if let Some(provenance) = &self.provenance {
+            let summary = provenance
+                .get("arrived_from")
+                .and_then(Value::as_str)
+                .map(|from| format!("copy · arrived from {from}"))
+                .unwrap_or_else(|| match provenance.get("store").and_then(Value::as_str) {
+                    Some("copy") => "copy".to_string(),
+                    Some("origin") => "origin — made here, not copied".to_string(),
+                    _ => "unknown".to_string(),
+                });
+            out.push_str(&format!(
+                "      {:<9}{}\n",
+                "provenance",
+                one_line(&summary)
+            ));
         }
         out.push_str("      checks\n");
         for line in verify::render_checks(&self.report).lines() {
@@ -1570,6 +1595,57 @@ pub(crate) fn assess(
 /// same question of a bare commit — no change record, no target ref, no round — and the
 /// answer has to be the *same* reading of the store rather than a second implementation
 /// of it (ADR-0004 T15: four tickets, one policy).
+/// Where these bytes came from, and what the policy will accept that for
+/// ([ADR-0005 D5](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+///
+/// The block is printed whatever the policy says, because a reader who is not told a proof
+/// arrived by copy cannot even ask whether that matters. The *refusal* is the owner's
+/// decision and nobody else's: absent the `provenance` member a copy gates a merge exactly
+/// as an origin does — federation is on by default — and a demand the owner signed cannot be
+/// waived by the machine doing the reading.
+///
+/// Age is measured from the document's own `claimed_at_us`, which is why a mirror cannot
+/// make a proof fresher and why `age_basis` is printed: the only reader that could be
+/// fooled by a stale copy is one that measures from arrival, and this is not one.
+fn stamp_provenance(
+    question: &Question<'_>,
+    section: &mut Section,
+    judged: &ResolvedPolicy,
+    claimed_at_us: i64,
+) {
+    use gitiup_host::federation::{Provenance, StoreIdentity, provenance};
+    let Some(opened) = question.store else {
+        return;
+    };
+    // The store's own spelling: a remote url from `gitiup.toml`, or the path a `--store`
+    // named — which is what an owner types into `provenance.mirrors`, because it is what
+    // they would type to read the thing.
+    let identity = StoreIdentity::new(opened.what.clone(), opened.url.clone());
+    let Ok(block) = Provenance::read(
+        &*opened.host,
+        &identity,
+        &section.digest,
+        claimed_at_us,
+        provenance::now_us(),
+    ) else {
+        return;
+    };
+    let demand = judged
+        .document
+        .as_ref()
+        .and_then(|document| document.provenance.as_ref())
+        .map(|provenance| provenance.demand())
+        .unwrap_or_default();
+    if let Some(refusal) = demand.refusal(&block, &identity.names()) {
+        section.report.add_reason(
+            refusal.token,
+            AttestError::new(ErrorKind::Policy, refusal.token, refusal.detail)
+                .with_hint(refusal.hint),
+        );
+    }
+    section.provenance = Some(block.json());
+}
+
 pub(crate) fn read_proofs(
     host: &dyn gitiup_host::Host,
     subject: &Oid,
@@ -1688,6 +1764,7 @@ pub(crate) fn read_proofs(
                     report: VerdictReport::default(),
                     policy: None,
                     policy_error: None,
+                    provenance: None,
                 }),
                 Err(error) => sections.push(Section::unread(
                     entry.digest,
@@ -1711,6 +1788,7 @@ pub(crate) fn read_proofs(
                 report: VerdictReport::default(),
                 policy: None,
                 policy_error: None,
+                provenance: None,
             }),
             Err(error) => {
                 sections.push(Section::unread(entry.digest, reference, "structure", error))
@@ -1794,6 +1872,7 @@ pub(crate) fn read_proofs(
         section.report = report;
         section.quorum_text = rows.iter().map(|row| row.render()).collect();
         section.quorum_json = Some(json);
+        stamp_provenance(question, section, &judged, quorum.claimed_at_us);
         section.policy = Some(judged);
         if demanded > 1 {
             if let Some(check) = section
@@ -1859,6 +1938,7 @@ pub(crate) fn read_proofs(
                         short(&section.digest.hex())
                     ));
                 }
+                stamp_provenance(question, section, &judged, claimed);
                 section.policy = Some(judged);
             }
             Err(error) => {
@@ -2498,6 +2578,7 @@ mod tests {
             report: gitiup_attest::VerdictReport::default(),
             policy: None,
             policy_error: None,
+            provenance: None,
         };
         assert_eq!(
             section.signers(),

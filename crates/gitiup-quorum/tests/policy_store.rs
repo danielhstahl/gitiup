@@ -56,6 +56,17 @@ fn signed(
     previous_digest: &str,
     effective_from_us: i64,
 ) -> PolicyDocument {
+    signed_with(owner, revision, previous_digest, effective_from_us, None)
+}
+
+/// The same, with ADR-0005 D5's optional `provenance` member set.
+fn signed_with(
+    owner: &SigningKey,
+    revision: u32,
+    previous_digest: &str,
+    effective_from_us: i64,
+    provenance: Option<policy::ProvenanceBlock>,
+) -> PolicyDocument {
     let mut document = policy::NewPolicy {
         owner: PolicyOwner {
             key_id: owner.public_key().key_id(),
@@ -66,6 +77,7 @@ fn signed(
         quorum: None,
         effective_from_us,
         expires_at_us: None,
+        provenance,
         annotations: None,
         revision,
         previous_digest: previous_digest.to_string(),
@@ -327,6 +339,7 @@ fn publish_refuses_a_policy_that_contradicts_itself_before_it_signs_or_writes() 
             },
             effective_from_us: CLOCK_US - DAY_US,
             expires_at_us: None,
+            provenance: None,
             annotations: None,
             revision: 1,
             previous_digest: GENESIS_PREVIOUS.to_string(),
@@ -820,4 +833,154 @@ fn default_selection(n: usize, agree: usize) -> gitiup_quorum::SelectionPolicy {
         tier_caps: BTreeMap::new(),
         max_per_identity: 1,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0005 D5 clause 3: what the owner says a copy is worth
+// ---------------------------------------------------------------------------
+
+/// The `provenance` member is a demand about *copies*, and it is worth nothing unless it
+/// travels with the document that carries it. Three things had to be true, and the second
+/// is the one a store serving copies would prefer to be false:
+///
+/// * it round-trips through a store, so the reader that resolved a policy can ask it;
+/// * it is inside the signed body, so a store holding a copy of the document cannot serve
+///   a softer one — neither by editing the demand nor by quietly not mentioning it;
+/// * it is checked before anything is written, because a demand this build cannot honour
+///   is worse than no demand at all.
+#[test]
+fn a_demand_about_copies_is_signed_resolved_and_impossible_to_soften() {
+    let dir = temp("provenance");
+    let store = FsHost::create(&dir).expect("a store");
+    let owner = key(31);
+    let roots = trust_of(&[&owner]);
+    let context = Context::new(&roots, TimeUs(CLOCK_US));
+    let mirrors = vec!["https://mirror.example.org/repo.git".to_string()];
+    let block = policy::ProvenanceBlock {
+        require_origin_seen: Some(true),
+        mirrors: Some(mirrors.clone()),
+    };
+
+    // It is in the document, and it comes out the same shape.
+    let document = signed_with(
+        &owner,
+        1,
+        GENESIS_PREVIOUS,
+        CLOCK_US - DAY_US,
+        Some(block.clone()),
+    );
+    policy::publish(&store, &document, &context, None)
+        .expect("publish a policy that names its mirrors");
+    let resolved = policy::resolve_store_at(
+        &store,
+        &roots,
+        policy::At::run_claim(TimeUs(CLOCK_US)),
+        TimeUs(CLOCK_US),
+    )
+    .expect("the revision resolves");
+    let published = resolved
+        .document
+        .as_ref()
+        .expect("a store policy resolves to its document")
+        .provenance
+        .clone()
+        .expect("the member survived the round trip");
+    assert_eq!(published.require_origin_seen, Some(true));
+    assert_eq!(published.mirrors.as_ref(), Some(&mirrors));
+    // …and it is a demand a caller can act on, in the host crate's own vocabulary.
+    let demand = published.demand();
+    assert!(demand.require_origin_seen);
+    assert_eq!(demand.mirrors.as_ref(), Some(&mirrors));
+
+    // The half that makes it a rule instead of a suggestion: the demand is inside what the
+    // owner signed, so a store with a copy of this document in its CAS has no way to serve
+    // a friendlier one. Stripping the member is the subtle edit — silence is the permissive
+    // answer, which is exactly why silence has to be the *signed* answer too.
+    let bare = signed_with(&owner, 1, GENESIS_PREVIOUS, CLOCK_US - DAY_US, None);
+    assert_ne!(
+        document.body_digest().expect("a body digest"),
+        bare.body_digest().expect("a body digest"),
+        "the demand changes the bytes the signature covers"
+    );
+    for (what, edited) in [
+        ("softened", softened(&document)),
+        ("stripped", stripped(&document)),
+    ] {
+        let error = match policy::verify_bytes(&edited, &context) {
+            Ok(verified) => panic!(
+                "a {what} policy is not the signed one, and it verified anyway: {:?}",
+                verified.revision
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.token(), token::BAD_SIGNATURE, "{error}");
+        assert_eq!(
+            error.exit_code(),
+            7,
+            "a policy whose signature does not fit its bytes is a signature failure, not a policy one"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `provenance` member the build cannot honour is refused at publish, even though the
+/// typed block let it be built: `mirrors` is a list an owner types from memory, and a
+/// demand that silently exceeds a limit is a demand that will silently go unmet.
+#[test]
+fn a_demand_beyond_what_this_build_honours_is_not_published() {
+    let dir = temp("provenance-shape");
+    let store = FsHost::create(&dir).expect("a store");
+    let owner = key(32);
+    let roots = trust_of(&[&owner]);
+    let context = Context::new(&roots, TimeUs(CLOCK_US));
+
+    let too_many = policy::ProvenanceBlock {
+        require_origin_seen: None,
+        mirrors: Some(
+            (0..=policy::MAX_MIRRORS)
+                .map(|n| format!("https://mirror{n}.example.org/repo.git"))
+                .collect(),
+        ),
+    };
+    let document = signed_with(
+        &owner,
+        1,
+        GENESIS_PREVIOUS,
+        CLOCK_US - DAY_US,
+        Some(too_many),
+    );
+    let error = match policy::publish(&store, &document, &context, None) {
+        Ok(outcome) => panic!(
+            "a mirror list past the limit is a refusal, not a truncation; it published              revision {:?}",
+            outcome.revision
+        ),
+        Err(error) => error,
+    };
+    assert_eq!(error.token(), token::FIELD_SHAPE, "{error}");
+    assert_eq!(error.exit_code(), 6);
+    assert!(
+        policy::current_policy(&store, &context)
+            .expect("the store is still readable")
+            .is_none(),
+        "and nothing was written on the way to saying so"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same signed document with the demand softened: the flag off, no mirrors named.
+/// This is what a store that would rather not enforce the owner's rule would serve.
+fn softened(document: &PolicyDocument) -> Vec<u8> {
+    let mut edited = document.clone();
+    edited.provenance = Some(policy::ProvenanceBlock {
+        require_origin_seen: Some(false),
+        mirrors: None,
+    });
+    edited.canonical_bytes().expect("canonical bytes")
+}
+
+/// …and with the member gone altogether.
+fn stripped(document: &PolicyDocument) -> Vec<u8> {
+    let mut edited = document.clone();
+    edited.provenance = None;
+    edited.canonical_bytes().expect("canonical bytes")
 }

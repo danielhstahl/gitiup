@@ -77,10 +77,15 @@
 //! unsigned document, a policy that would prune nothing) · 7 a signature that does
 //! not verify · 8 bytes that are not the document's own canonical form.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use gitiup_attest::{AttestationDoc, GitOid, RunManifest, RunReport, Tier, TimeUs};
 use gitiup_host::attest::{self, AttestationItem, GcOptions, Retention};
+use gitiup_host::federation::{
+    self,
+    provenance::{self, PruneAuthority},
+};
 use gitiup_host::{Oid, Timestamp};
 use serde_json::{Value, json};
 
@@ -138,7 +143,16 @@ show — one attestation, parsed:
     --dsse                   a spec in-toto DSSE envelope over the same bytes
 
 gc — retention:
-    --max-age <age>          90d, 2w, 36h, 90s, or seconds; `never` for no limit    --max-per-commit <n>     keep the newest n per commit
+    --max-age <age>          90d, 2w, 36h, 90s, or seconds; `never` for no limit
+                             an authority limit: refused against a store whose attestations
+                             all arrived by import (`mirror_may_not_prune_by_age`)
+    --max-per-commit <n>     keep the newest n per commit (an authority limit, same rule)
+    --max-bytes <size>       free space instead of time: 500m, 4g, or bytes. The mirror's
+                             limit — it evicts only copies this store can name a re-fetch
+                             source for (a kv/import/ record saying where it got them) and
+                             says so about every digest it could not touch
+    --evidence <path>        read a retention record somebody handed over, and refuse to
+                             act on it: `gc_record_not_instruction`
     --keep <digest>          never prune this digest (repeatable: a merge record's, a
                              verdict's; refs that still point at an object already pin it
                              without being told)
@@ -199,6 +213,8 @@ const VALUED: &[&str] = &[
     "--run-report",
     "--max-age",
     "--max-per-commit",
+    "--max-bytes",
+    "--evidence",
     "--keep",
     "--passphrase",
     "--passphrase-file",
@@ -856,6 +872,12 @@ fn gc(args: &Args) -> Result<(), CliError> {
     if let Some(()) = args.help(ATTEST_HELP) {
         return Ok(());
     }
+    // D8 rule 3, answered before a store is even opened: a retention record from
+    // somewhere else is evidence about *that* store, and an instruction from a stranger
+    // is the one thing a deletion tool must never read.
+    if let Some(path) = args.get("--evidence") {
+        return evidence(path, args.json());
+    }
     let store = participant::need_store(args)?;
     let max_per_commit =
         match args.get("--max-per-commit") {
@@ -864,12 +886,16 @@ fn gc(args: &Args) -> Result<(), CliError> {
             })?),
             None => None,
         };
-    let policy = Retention::new(args.get("--max-age"), max_per_commit)
+    let mut policy = Retention::new(args.get("--max-age"), max_per_commit)
         .map_err(|e| CliError::usage(format!("--max-age: {e}")))?;
+    if let Some(text) = args.get("--max-bytes") {
+        policy.max_bytes = Some(crate::fetch::human_bytes(text)?);
+    }
     if policy.is_unbounded() {
         return Err(CliError::refused(
             "this policy could not prune anything",
-            "give it a limit: --max-age 90d and/or --max-per-commit 5 (see `gitiup attest gc --help`)",
+            "give it a limit: --max-age 90d, --max-per-commit 5 or --max-bytes 500m (see \
+             `gitiup attest gc --help`)",
         ));
     }
     let apply = args.on("--apply");
@@ -920,14 +946,80 @@ fn gc(args: &Args) -> Result<(), CliError> {
             })),
         }
     }
-    let plan = attest::plan(&policy, TimeUs::now().as_us(), &items, &pins);
+    // Retention authority, asked before anything is planned (ADR-0005 D8 rule 2).
+    //
+    // "Proofs older than this no longer matter" is an authority claim, not a housekeeping
+    // preference, and the store entitled to make it is the one that gates merges on its
+    // own proofs and can write the namespace it is pruning. Every copy here arrived by
+    // import? Then this store is a mirror, and a mirror keeps a proof available — it does
+    // not decide when one stops mattering. Capacity is the other story: "this disk is
+    // full" is a fact about the box, so a mirror may answer that, among the copies it can
+    // go and get again.
+    if policy.by_authority() {
+        let candidates: Vec<Oid> = attest::list_all(&*store.host)
+            .map_err(|e| CliError::io(format!("list attestations: {e}")))?
+            .entries
+            .iter()
+            .map(|entry| entry.digest)
+            .collect();
+        match provenance::prune_authority(&*store.host, &candidates)
+            .map_err(|e| CliError::io(format!("what this store may prune: {e}")))?
+        {
+            PruneAuthority::Own => {}
+            PruneAuthority::ReadOnly(why) => {
+                return Err(CliError::refused(
+                    format!(
+                        "mirror_may_not_prune_by_age: {store} cannot write the namespace it is \
+                         being asked to prune: {why}",
+                        store = store.what
+                    ),
+                    "age and count are the origin's decisions. A read-only store may still \
+                     evict for capacity — --max-bytes frees space among the copies it can \
+                     fetch back — and if this store really is writable, say so in its \
+                     [[remote]] options (`read-only = \"false\"`).",
+                ));
+            }
+            PruneAuthority::Mirror { copies, total } => {
+                return Err(CliError::refused(
+                    format!(
+                        "mirror_may_not_prune_by_age: all {copies} of the {total} attestations \
+                         in {store} arrived by copy — every one has a kv/import/ record naming \
+                         where it came from",
+                        store = store.what
+                    ),
+                    "this store is a mirror, and age is not its decision to make: the origin's \
+                     --max-age fires at the same instant on every copy anyway, because \
+                     claimed_at_us is identical on all of them, so a mirror pruning by age \
+                     only deletes early. Evict for capacity instead with --max-bytes, which \
+                     touches only copies this store can name a re-fetch source for.",
+                ));
+            }
+        }
+    }
+
+    // Which digests may be evicted for capacity: exactly the ones with an arrival record
+    // saying where they came from. Everything else stays, however badly the limit is
+    // missed, and is reported (`eviction_needs_source`).
+    let sources: BTreeMap<Oid, String> = federation::arrivals(&*store.host)
+        .map_err(|e| CliError::io(format!("what arrived here: {e}")))?
+        .into_values()
+        .filter_map(|arrival| {
+            Oid::from_hex(&arrival.digest)
+                .ok()
+                .map(|digest| (digest, arrival.arrived_from))
+        })
+        .collect();
+    let plan = attest::plan_with_sources(&policy, TimeUs::now().as_us(), &items, &pins, &sources);
     let report = attest::apply(
         &*store.host,
         &plan,
         &pins,
         &GcOptions {
             actor: gitiup_host::Actor::from_env(),
-            purge_blobs: args.on("--purge-blobs"),
+            // A capacity limit is about bytes on a disk, so the bytes are what this run
+            // is after; a host that cannot forget them says so in the report instead of
+            // the run quietly freeing nothing.
+            purge_blobs: args.on("--purge-blobs") || policy.max_bytes.is_some(),
             dry_run: !apply,
             record: apply,
         },
@@ -943,10 +1035,18 @@ fn gc(args: &Args) -> Result<(), CliError> {
             "undatable": undatable,
             "note": if apply { "applied" } else { "dry run: nothing changed; add --apply" },
         }));
-        return Ok(());
+        // The report is printed first, then the refusal: a script that asked for JSON
+        // gets the blocked list either way, and the exit code is the part a cron reads.
+        return blocked_refusal(&report).map_or(Ok(()), Err);
     }
     println!("store    {}", store.what);
     println!("policy   {}", policy.describe());
+    if policy.max_bytes.is_some() {
+        println!(
+            "note     a capacity eviction asks the host to forget the bytes too; a git store \
+             and a versioned bucket will refuse and say why"
+        );
+    }
     println!("{}", report.summary_line());
     for pruned in &report.pruned {
         println!(
@@ -959,6 +1059,14 @@ fn gc(args: &Args) -> Result<(), CliError> {
             println!("     bytes stay: {why}");
         }
     }
+    for blocked in &report.blocked {
+        println!(
+            "  {}  {:<16} {}",
+            blocked.digest.short_default(),
+            blocked.token,
+            attest::human_bytes(blocked.size)
+        );
+    }
     if let Some(line) = report.explain_nothing_pruned() {
         println!("  nothing to do: {line}");
     }
@@ -969,12 +1077,100 @@ fn gc(args: &Args) -> Result<(), CliError> {
             undatable.len()
         );
     }
+    if let Some(error) = blocked_refusal(&report) {
+        return Err(error);
+    }
     if !apply {
         eprintln!("dry run: nothing changed. Add --apply to retire these.");
     } else if let Some(record) = report.record {
         println!("record   kv/gc/{record}");
     }
     Ok(())
+}
+
+/// The refusal a capacity eviction owes the operator when it could not make room
+/// ([`gitiup_host::attest::Verdict::NeedsSource`], ADR-0005 D8 rule 2).
+///
+/// A line inside a report is not enough: a retention cron that exits 0 while the disk
+/// stays full is the failure nobody notices. The blocked items are in the report either
+/// way, so the refusal adds the exit code and names the way out.
+fn blocked_refusal(report: &attest::Report) -> Option<CliError> {
+    if report.blocked.is_empty() {
+        return None;
+    }
+    Some(CliError::refused(
+        format!(
+            "eviction_needs_source: {} copy(ies) ({}) could not be evicted because no \
+             kv/import/ record names where to fetch them back, and the store is still over \
+             its capacity limit",
+            report.blocked.len(),
+            attest::human_bytes(report.blocked_bytes)
+        ),
+        "a mirror may only forget what it can go and get again. Either raise --max-bytes, \
+         or re-copy these digests with `gitiup fetch` (without --no-records) so this store \
+         knows where they came from.",
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// gc --evidence: a retention record from another store
+// ---------------------------------------------------------------------------
+
+/// Read somebody else's retention record, and refuse to be instructed by it
+/// ([ADR-0005 D8 rule 3](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+///
+/// A `kv/gc/<digest>` record is the account a store gave of what it deleted and why. It
+/// is worth carrying to a human — it is how you find out an origin has been pruning — and
+/// it is worth precisely nothing to a machine, because two stores with the same bytes and
+/// different retention policies are two healthy stores. The moment one store's deletion
+/// could authorise another's, the most cautious mirror in the federation becomes the one
+/// that deletes everything, on the day its policy is buggy and its owner is on holiday.
+///
+/// So this prints the record, in full, and exits 6 with `gc_record_not_instruction`.
+fn evidence(path: &str, json: bool) -> Result<(), CliError> {
+    let bytes = std::fs::read(path).map_err(|e| CliError::io(format!("{path}: {e}")))?;
+    let record = attest::read_record(&bytes).map_err(|e| {
+        CliError::refused(
+            format!("{path}: {e}"),
+            "the shape is the one `gitiup attest gc --apply` writes at kv/gc/<digest>; \
+             `gitiup attest show` prints what a store holds",
+        )
+    })?;
+    if json {
+        print_json(json!({
+            "record_type": "gc-evidence",
+            "path": path,
+            "says": record.evidence_line(),
+            "record": serde_json::to_value(&record).unwrap_or(Value::Null),
+            "token": attest::GC_EVIDENCE_NOT_INSTRUCTION,
+            "acted": false,
+        }));
+    } else {
+        println!("record   {path}");
+        println!("says     {}", record.evidence_line());
+        for pruned in &record.pruned {
+            println!(
+                "  {}  {:<12} {}",
+                pruned.digest.short_default(),
+                pruned.verdict.as_str(),
+                pruned.verdict.describe()
+            );
+        }
+        if let Some(line) = record.explain_nothing_pruned() {
+            println!("  nothing was pruned: {line}");
+        }
+    }
+    Err(CliError::refused(
+        format!(
+            "{}: the record above is {}'s account of what *that* store deleted; it is \
+             evidence to a human and never an instruction to this one",
+            attest::GC_EVIDENCE_NOT_INSTRUCTION,
+            record.actor
+        ),
+        "nothing here was changed, and nothing will be because a stranger pruned something. \
+         If this store has the same bytes and needs its own decision, run your own policy: \
+         `gitiup attest gc --store <dir> --max-age <age> --apply`.",
+    ))
 }
 
 // ---------------------------------------------------------------------------

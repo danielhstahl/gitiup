@@ -210,7 +210,7 @@ a listing that quietly drops a ref is how "there is no proof here" becomes a lie
 ### Retention
 
 A bucket that keeps every attestation forever is a bucket somebody has to pay for and
-somebody will eventually delete wholesale. Three limits, all optional, all checked in
+somebody will eventually delete wholesale. Four limits, all optional, all checked in
 this order:
 
 | limit | flag | what it means |
@@ -218,6 +218,7 @@ this order:
 | **referenced** | none — not a knob | an object any other live ref points at is never pruned |
 | `max_age_us` | `--max-age 90d` | age of the *claim* (the attestation's own `claimed_at`), falling back to when this host published it |
 | `max_per_subject` | `--max-per-commit 10` | newest N survive per subject; the rest are retired even if young |
+| `max_bytes` | `--max-bytes 512MiB` | a capacity limit, oldest-first until the store fits: the only limit a mirror may act on ([ADR-0005 D8](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)) |
 
 The first row is not a setting because it cannot be. `attest::referenced` collects the
 digests that live refs *outside* `refs/attestations/**` point at, and that is exactly
@@ -243,6 +244,19 @@ exits 6 when given no limit at all rather than guessing a retention policy for a
 vault of signed evidence. Each applied run writes a `kv/gc/<digest>` record: what was
 removed, what was pinned, and what each decision was *based on* (the timestamp and the
 limit it missed), because "the gc job ran and things disappeared" is not an audit trail.
+
+The bottom row of that table is a different authority from the two above it, which is why
+the planner separates them (`Retention::by_authority`). An age or a count is a statement
+about which proofs still *matter*, and only the store whose policy gates merges on them may
+make it; a size is a statement about a disk, and every store has one. So `--max-age` or
+`--max-per-commit` against a store whose attestations all arrived by import is refused with
+`mirror_may_not_prune_by_age` (exit 6), a capacity eviction runs among the digests a
+`kv/import/` record names a source for, and a copy with no named source is reported as
+`eviction_needs_source` and left exactly where it was. The record a run writes is evidence
+for a human and never an instruction for a machine: `gitiup attest gc --evidence <record>`
+prints another store's retention record in full and exits 6 with `gc_record_not_instruction`
+rather than copying its deletions. [Federation](federation.md#who-may-delete-retention-authority)
+has the whole argument.
 
 Retiring an advertisement is not the same as forgetting bytes, and a tool that
 conflates the two is lying about provenance. A git store's record chain is

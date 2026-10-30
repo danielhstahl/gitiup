@@ -488,6 +488,7 @@ fn the_json_shape_is_stable_and_the_ladder_is_in_order() {
             "checks",
             "exit",
             "policy",
+            "provenance",
             "reasons",
             "source",
             "stored",
@@ -535,6 +536,12 @@ fn the_json_shape_is_stable_and_the_ladder_is_in_order() {
     assert_eq!(pass["policy"]["min_signatures"], 1);
     assert_eq!(pass["policy"]["now"], NOW);
     assert_eq!(pass["policy"]["tiers"], Value::Array(vec!["local".into()]));
+    // Where the bytes came from is printed whatever the answer is, and the answer here is
+    // `null`: a file on a command line did not come from a store, so there is nothing to
+    // say about how it arrived (ADR-0005 D5 clause 2). The block itself is pinned by
+    // [`mirror_reading_cli`], which reads the same documents out of two stores.
+    assert_eq!(pass["provenance"], Value::Null, "{pass}");
+    assert_eq!(refused["provenance"], Value::Null, "{refused}");
 }
 
 #[test]

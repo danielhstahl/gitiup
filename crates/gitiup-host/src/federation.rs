@@ -1,7 +1,7 @@
 //! Federation: what a store serves, moved between two stores
 //! ([ADR-0005](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
 //!
-//! Two questions live here, and keeping them apart is the whole point of the ADR.
+//! Three questions live here, and keeping them apart is the whole point of the ADR.
 //!
 //! * **What may travel** — [`portable`]: the portable set is the verification closure of
 //!   what a store serves, and everything that is arbitration state or a statement about
@@ -11,6 +11,9 @@
 //! * **How it travels** — [`copy`]: bytes first, then the advertisement; create-only, so
 //!   a re-run is `already`; pointers resolved on the reader's side and moved only
 //!   forward; code by whichever pack path the two hosts agree on, or not at all.
+//! * **What the reader is told** — [`provenance`]: the block a verify report carries when
+//!   the bytes it judged arrived from another store, aged from the signed claim alone, and
+//!   the demand a policy may make about provenance (D5 clause 3).
 //!
 //! What is deliberately **not** here is trust. A copy moves a signature, and a signature
 //! is believed by a reader's own policy, in the reader's own process, from the reader's
@@ -30,6 +33,7 @@
 
 pub mod copy;
 pub mod portable;
+pub mod provenance;
 
 pub use copy::{
     AGE_BASIS, Arrival, CLOSURE_COMPLETE, CLOSURE_NOT_WALKED, CODE_OUTCOMES, CodeReport,
@@ -37,6 +41,11 @@ pub use copy::{
     TRUST_NONE, Verb, arrivals, copy, has_refetch_source, record, token_for,
 };
 pub use portable::{Budgets, Class, Decision, Row, TABLE, classify, namespace_travels};
+pub use provenance::Block as Provenance;
+pub use provenance::{
+    CLOSURE_NATIVE, Demand as ProvenanceDemand, Identity as StoreIdentity, STORE_COPY,
+    STORE_ORIGIN, arrival_for,
+};
 
 /// Every federation refusal token and the exit code it carries (D10).
 ///

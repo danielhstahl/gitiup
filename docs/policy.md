@@ -54,7 +54,7 @@ runs it).
 
 ## What a repository publishes
 
-One signed document, `type: "gitiup-policy-1"`, twelve members, at most 32 KiB
+One signed document, `type: "gitiup-policy-1"`, thirteen members, at most 32 KiB
 (ADR-0004 D2, D10):
 
 | member | what it fixes |
@@ -66,6 +66,7 @@ One signed document, `type: "gitiup-policy-1"`, twelve members, at most 32 KiB
 | `protects` | which refs it gates, globs inside `refs/heads/**` only (never `refs/changes/**`, never its own ref: a policy gates what is *trusted*, not what may be *offered*) |
 | `rules` | the proof rules — `PolicyFile` verbatim, the same vocabulary as a tree file: `allowed_tiers`, `allowed_sandboxes`, `trust_key_ids`, `min_signatures`, `max_age_us`, and the environment requirement |
 | `quorum` | the numbers a round is opened with: `default` and `by_job` selection policies, and `requirements` (what a verifier must be able to do) — [`SelectionPolicy`](../crates/gitiup-quorum/src/select.rs) and [`Requirements`](../crates/gitiup-quorum/src/capability.rs) verbatim, so opening a round is a copy and not a translation |
+| `provenance` | optional, and absent by default: what a *copy* of a proof is worth at a merge — `require_origin_seen` (do not gate on a proof this store did not see at the origin) and `mirrors` (the stores whose copies the owner treats as current). Written by `policy publish --require-origin-provenance` and `--mirror`; [ADR-0005 D5](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md) and [federation](federation.md#what-a-reader-is-told-about-a-copy) |
 | `annotations` | the sanctioned hatch: `x_<producer>_<name>`, ≤ 16, ≤ 512 bytes each |
 | `signatures` | exactly one, by the owner |
 
@@ -84,6 +85,18 @@ policy start disagreeing about how a quorum is counted — but it means the two 
 now one vocabulary, and the lists inside `quorum.requirements` are normalised
 (`sandboxes`, `image_digests`) exactly as the lists in `rules` are, so two owners who
 wrote the same rules in a different order publish the same bytes.
+
+`provenance` is optional, and its absence is the default for a reason: ADR-0005 lets
+proofs travel between repositories by default, so a policy that says nothing about copies
+gates a mirror's copy exactly as it gates a proof made here. The member is how an owner
+says *not here*: `require_origin_seen: true` refuses a proof that arrived by copy
+(`origin_provenance_required`, exit **6**), and `mirrors` lists the stores whose copies
+the owner treats as current (`unlisted_mirror`). Neither is a trust list — keys do that,
+and a mirror has no key — and neither is access control, which is a store's business. It
+is one sentence about how far from where the bytes were made this repository will merge on
+them, and it is signed with everything else so a mirror cannot edit it. The flags are
+`policy publish --require-origin-provenance` and `--mirror <url>`, and
+[federation](federation.md#what-a-reader-is-told-about-a-copy) has the reader's half.
 
 Everything the validator can prove is incoherent is refused **when it is written**: a
 quorum with no seats that can satisfy it, `required_agree` above `n`, a sandbox set
@@ -632,12 +645,12 @@ directly:
 
 ```console
 $ gitiup policy publish examples/gitiup-policy.json --store ./throwaway --key ada
-gitiup: 'examples/gitiup-policy.json' is not a policy document: unknown field `allowed_sandboxes`, expected one of `type`, `schema_version`, `owner`, `revision`, `previous_digest`, `effective_from_us`, `expires_at_us`, `protects`, `rules`, `quorum`, `annotations`, `signatures`
+gitiup: 'examples/gitiup-policy.json' is not a policy document: unknown field `allowed_sandboxes`, expected one of `type`, `schema_version`, `owner`, `revision`, `previous_digest`, `effective_from_us`, `expires_at_us`, `protects`, `rules`, `quorum`, `provenance`, `annotations`, `signatures`
 hint: `gitiup policy publish help` lists the fields; every one of them is checked before anything is written (ADR-0004 D2, D5)
 # exit 6
 ```
 
-That refusal is the whole design in one line: the twelve members on the right are the
+That refusal is the whole design in one line: the thirteen members on the right are the
 document — the draft's rules go in `rules`, and the rest is who signed it, what it
 gates, and where it sits in the chain. A first policy from flags is the other way in
 (`gitiup policy publish --store ./store --allow-tier local --trust ada`), and

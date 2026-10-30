@@ -928,6 +928,7 @@ fn retiring_an_attestation_unpublishes_it_and_says_the_bytes_stay() {
         reference: Some(published.reference.as_str().to_string()),
     };
     let policy = gitiup_host::attest::Retention {
+        max_bytes: None,
         max_age_us: Some(1_000),
         max_per_subject: None,
     };

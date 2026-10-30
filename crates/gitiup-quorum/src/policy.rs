@@ -205,6 +205,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "owner",
     "previous_digest",
     "protects",
+    "provenance",
     "quorum",
     "revision",
     "rules",
@@ -226,6 +227,9 @@ pub const REQUIRED_POLICY_FIELDS: &[&str] = &[
     "schema_version",
     "type",
 ];
+
+/// The members of the `provenance` block (ADR-0005 D5 clause 3).
+pub const PROVENANCE_FIELDS: &[&str] = &["mirrors", "require_origin_seen"];
 
 /// The members of the `quorum` block (D5).
 pub const QUORUM_FIELDS: &[&str] = &[
@@ -641,7 +645,56 @@ impl QuorumBlock {
     }
 }
 
-/// A `gitiup-policy-1` document: twelve members, one signature, one canonical form.
+/// The `provenance` block: how much the owner believes a *copy* of a proof
+/// ([ADR-0005 D5 clause 3](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+///
+/// It is optional, and the absence is the default behaviour: federation is on by default
+/// and demanding provenance is the opt-in, because a project that cannot be mirrored has
+/// not bought anything. When present it says one of two things:
+///
+/// * `require_origin_seen` — a proof may only gate a merge if it was read from the origin
+///   store, not copied out of a mirror;
+/// * `mirrors` — the stores the owner names as kept as fresh as itself.
+///
+/// `mirrors` is **not** a trust list (keys and policy decide that, and a mirror has no
+/// key: D3) and **not** an access-control list (a store not listed may still fetch and
+/// still serve; nothing here is a secret). It says only what a mirror can actually offer.
+///
+/// Absent fields are skipped, so every policy signed before this member existed keeps its
+/// bytes and its digest — and a build that cannot honour a provenance demand must refuse
+/// the policy that carries it rather than ignore it, which is ADR-0004 D10's "unknown
+/// fields refused" doing the work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceBlock {
+    /// Only a proof read from the origin may gate a merge (refusal:
+    /// `origin_provenance_required`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_origin_seen: Option<bool>,
+    /// Stores the owner keeps as fresh as itself (refusal for any other: `unlisted_mirror`).
+    /// An empty list is a demand, not an absence: it names no mirror, so no copy satisfies
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirrors: Option<Vec<String>>,
+}
+
+impl ProvenanceBlock {
+    /// The same demand in the shape the transport's own checker takes.
+    pub fn demand(&self) -> gitiup_host::federation::provenance::Demand {
+        gitiup_host::federation::provenance::Demand {
+            require_origin_seen: self.require_origin_seen.unwrap_or(false),
+            mirrors: self.mirrors.clone(),
+        }
+    }
+
+    /// Whether the block demands nothing, which is what an absent block means too.
+    pub fn is_empty(&self) -> bool {
+        self.require_origin_seen.is_none_or(|v| !v) && self.mirrors.is_none()
+    }
+}
+
+/// A `gitiup-policy-1` document: the members below, in canonical order, one signature,
+/// one canonical form.
 ///
 /// This is what a verdict cites and what a report prints. Build one with
 /// [`NewPolicy`], sign it, publish it with [`publish`]; read one back with
@@ -673,6 +726,10 @@ pub struct PolicyDocument {
     /// The tier-`quorum` block, when the policy has one (D5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quorum: Option<QuorumBlock>,
+    /// What the owner believes about copies of its proofs, when it says anything
+    /// ([ADR-0005 D5](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceBlock>,
     /// The sanctioned hatch: `x_<producer>_<name>` only (D10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
@@ -694,6 +751,8 @@ pub struct NewPolicy {
     pub rules: PolicyFile,
     /// The quorum block, if the policy names one.
     pub quorum: Option<QuorumBlock>,
+    /// The provenance demand, if the owner makes one (ADR-0005 D5 clause 3).
+    pub provenance: Option<ProvenanceBlock>,
     /// When the rules start counting.
     pub effective_from_us: i64,
     /// When they stop, if ever.
@@ -729,6 +788,7 @@ impl NewPolicy {
             protects: self.protects.clone(),
             rules: self.rules.clone(),
             quorum: self.quorum.clone(),
+            provenance: self.provenance.clone(),
             annotations: self.annotations.clone(),
             signatures: Vec::new(),
         }
@@ -1171,6 +1231,7 @@ fn validate_with(value: &Value, ctx: &Context<'_>) -> PolicyResult<()> {
         .ok_or_else(|| PolicyError::new(token::FIELD_MISSING, "`rules` is absent"))?;
     check_rules(rules)?;
     check_quorum(value, rules)?;
+    check_provenance(value)?;
     check_chain(value, ctx)?;
     require_normalised(value)
 }
@@ -1661,6 +1722,99 @@ fn check_rules(rules: &Value) -> PolicyResult<()> {
 /// rather than after a volunteer has fetched a repository, booted a container and
 /// produced nothing. The same table is applied at selection time, so a round that
 /// cannot be filled is never seated.
+/// How many stores a policy may name as mirrors: a list an owner types by hand, and a
+/// long one is a sign of something other than a federation.
+pub const MAX_MIRRORS: usize = 32;
+/// How long one mirror entry may be. A store url is not a poem.
+pub const MAX_MIRROR_BYTES: usize = 512;
+
+/// The `provenance` block, checked where every other member is checked — before the
+/// signature is asked to mean anything, so a typo prints the typo
+/// ([ADR-0005 D5 clause 3](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+///
+/// An absent block is the default and demands nothing. A present one is read strictly:
+/// an unknown member is refused rather than ignored, because a demand this build cannot
+/// see is a demand it will not honour, and "federation is on by default" must not be
+/// achievable by a typo.
+fn check_provenance(value: &Value) -> PolicyResult<()> {
+    let Some(provenance) = value.get("provenance") else {
+        return Ok(());
+    };
+    if provenance.is_null() {
+        return Ok(());
+    }
+    let object = provenance
+        .as_object()
+        .ok_or_else(|| PolicyError::new(token::FIELD_SHAPE, "`provenance` must be an object"))?;
+    let unknown = unknown_keys(object, PROVENANCE_FIELDS);
+    if !unknown.is_empty() {
+        return Err(PolicyError::new(
+            token::FIELD_UNKNOWN,
+            format!(
+                "unknown provenance field(s): {} (a provenance block carries {})",
+                unknown.join(", "),
+                PROVENANCE_FIELDS.join(", ")
+            ),
+        )
+        .with_hint(
+            "a demand this build cannot see is a demand it will not honour, so a policy \
+             refuses what it does not know instead of publishing it",
+        ));
+    }
+    if let Some(flag) = object
+        .get("require_origin_seen")
+        .filter(|v| !v.is_boolean() && !v.is_null())
+    {
+        return Err(PolicyError::new(
+            token::FIELD_SHAPE,
+            format!("`provenance.require_origin_seen` is `true` or `false`, not {flag}"),
+        ));
+    }
+    if let Some(mirrors) = object.get("mirrors").filter(|v| !v.is_null()) {
+        let list = mirrors.as_array().ok_or_else(|| {
+            PolicyError::new(
+                token::FIELD_SHAPE,
+                "`provenance.mirrors` is a list of store urls the owner keeps as fresh as \
+                 its own store",
+            )
+        })?;
+        if list.len() > MAX_MIRRORS {
+            return Err(PolicyError::new(
+                token::FIELD_SHAPE,
+                format!(
+                    "`provenance.mirrors` names {} stores; the most a policy may name is \
+                     {MAX_MIRRORS}",
+                    list.len()
+                ),
+            ));
+        }
+        for entry in list {
+            let Some(text) = entry.as_str() else {
+                return Err(PolicyError::new(
+                    token::FIELD_SHAPE,
+                    "every `provenance.mirrors` entry is a store url, as the reader spells it",
+                ));
+            };
+            if text.trim().is_empty() {
+                return Err(PolicyError::new(
+                    token::FIELD_SHAPE,
+                    "a `provenance.mirrors` entry is empty: an unnamed store names nothing",
+                ));
+            }
+            if text.len() > MAX_MIRROR_BYTES {
+                return Err(PolicyError::new(
+                    token::FIELD_SHAPE,
+                    format!(
+                        "a `provenance.mirrors` entry is {} bytes; the most is {MAX_MIRROR_BYTES}",
+                        text.len()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_quorum(value: &Value, rules: &Value) -> PolicyResult<()> {
     let Some(quorum) = value.get("quorum") else {
         return Ok(());

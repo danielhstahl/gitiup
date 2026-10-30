@@ -312,13 +312,18 @@ integrity becomes a rumour. *"Verify once and mark it"* is D3 clause 3.
 
 ## D5 — Authority, availability, and how a stale copy is marked
 
-**Status: decided in full; built for the copy's half of it.** `kv/import/<digest>` is
+**Status: built, except for a local knob to tighten the demand.** `kv/import/<digest>` is
 written by `gitiup fetch|push` for every digest that lands (`gitiup-import-1`: the
 source, `arrived_at_us`, the refs it was advertised under, and `closure: "not-walked"`
 until `.3` walks it), and the copy report prints `age_basis: "claimed_at_us"` as clause
-1's checkable invariant. The `provenance` block in a *verify* report and the *policy*
-member land with `giti-g5c.3` and `giti-91m`'s readers respectively; the latter is a
-compatibility change to [ADR-0004 D5](0004-published-policy-format-signing-and-resolution.md).
+1's checkable invariant. The `provenance` block is now printed by every read out of a store
+([`federation/provenance.rs`](../../crates/gitiup-host/src/federation/provenance.rs),
+`giti-g5c`), and clause 3's member is published by
+`gitiup policy publish --require-origin-provenance` / `--mirror` and judged by
+`gitiup verify change` ([`gitiup/tests/mirror_reading_cli.rs`](../../crates/gitiup/tests/mirror_reading_cli.rs),
+[`verify_change_cli.rs`](../../crates/gitiup/tests/verify_change_cli.rs)). What is not built
+is the optional local tightening: the demand currently has exactly one source, the signed
+document, so nothing can loosen it either.
 
 **Decision.** A mirror's promise is availability: *the bytes will still be here when the
 origin is not.* The thing it is forbidden to promise is freshness. Three clauses.
@@ -554,10 +559,15 @@ at; `diverged` costs a human ten seconds and preserves the audit.
 
 ## D8 — Retention: a mirror is a cache, and no store prunes another's copy
 
-**Status: partly built. `attest::gc`'s `plan`/`apply` split, its `kv/gc/` record, its
-`referenced` pin and `purge_cas`'s honesty already exist; D8's mirror rules, and the
-`--max-age` refusal, land with `giti-g5c.2`/`.3` (a store cannot tell it is a mirror until
-it has import records).**
+**Status: built.** `attest::gc`'s `plan`/`apply` split, its `kv/gc/` record, its
+`referenced` pin and `purge_cas`'s honesty already existed; rule 2's two authorities are
+now distinguished in the planner (`Retention::by_authority`: age and count are an authority
+limit, `--max-bytes` is a capacity limit), an age limit against a store whose proofs all
+arrived by copy is refused with `mirror_may_not_prune_by_age`, a capacity eviction chooses
+among digests a `kv/import/` record names a source for and reports the rest as
+`eviction_needs_source`, and rule 3's `gc_record_not_instruction` is
+`gitiup attest gc --evidence` ([`gitiup/tests/mirror_reading_cli.rs`](../../crates/gitiup/tests/mirror_reading_cli.rs)).
+A store learns it is a mirror the way D5 said it would: by holding import records.
 
 **Decision.** Three rules, in this order.
 

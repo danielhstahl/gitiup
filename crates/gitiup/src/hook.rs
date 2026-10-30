@@ -524,6 +524,7 @@ fn open_store(repo: &Repo, mirror: &Path) -> Result<Opened, CliError> {
     Ok(Opened {
         host: Box::new(host),
         what: format!("repository {}", repo.git_dir.display()),
+        url: format!("file://{}", repo.git_dir.display()),
     })
 }
 

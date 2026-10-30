@@ -275,6 +275,11 @@ pub fn participant(args: &[String]) -> Result<(), CliError> {
 pub(crate) struct Opened {
     pub(crate) host: Box<dyn Host>,
     pub(crate) what: String,
+    /// The store's address as configured — a remote url, or the directory a `--store`
+    /// named. `what` is what the operator typed and is for a human; this is what a policy
+    /// names when it names a store (`provenance.mirrors`, ADR-0005 D5), and what a
+    /// provenance block prints as `store_url`.
+    pub(crate) url: String,
 }
 
 /// The store `--store`/`--remote` names, if either does.
@@ -304,6 +309,7 @@ pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
         return Ok(Some(Opened {
             host: Box::new(host),
             what: format!("fs store {}", Path::new(dir).display()),
+            url: Path::new(dir).display().to_string(),
         }));
     }
     let named = args.get("--remote");
@@ -356,7 +362,11 @@ pub(crate) fn store_from(args: &Args) -> Result<Option<Opened>, CliError> {
     } else {
         format!("remote '{}' (the configured default)", remote.name)
     };
-    Ok(Some(Opened { host, what }))
+    Ok(Some(Opened {
+        host,
+        what,
+        url: remote.url.to_string(),
+    }))
 }
 
 /// The store, required: writing a record somewhere needs an explicit somewhere.

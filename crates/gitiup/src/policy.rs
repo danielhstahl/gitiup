@@ -57,8 +57,8 @@ use std::path::{Path, PathBuf};
 use gitiup_attest::{PolicyFile, TimeUs, Trust};
 use gitiup_host::attest::parse_age;
 use gitiup_quorum::policy::{
-    self, Context, GENESIS_PREVIOUS, NewPolicy, PolicyDocument, PolicyError, PolicyOwner, Purpose,
-    ResolvedPolicy, Source,
+    self, Context, GENESIS_PREVIOUS, NewPolicy, PolicyDocument, PolicyError, PolicyOwner,
+    ProvenanceBlock, Purpose, ResolvedPolicy, Source,
 };
 use serde_json::{Map, Value, json};
 
@@ -99,6 +99,15 @@ PUBLISH:
                                refs/heads/** (default: refs/heads/**)
     --max-age <age>            freshness rule for the built policy: 24h, 30d, `never`
     --min-signatures <n>       distinct trusted signatures the built policy requires
+    --require-origin-provenance  to build one: only a proof read from the origin store may
+                               gate a merge here. A mirror keeps a proof available; it
+                               cannot make one fresher, so a policy that must not act on a
+                               stale proof says so (ADR-0005 D5)
+    --mirror <url>             repeatable, to build one: a store the owner keeps as fresh
+                               as its own. A copy that arrived from anywhere else is
+                               `unlisted_mirror`. This is not a trust list and not an
+                               access-control list: naming a mirror says it is fresh, keys
+                               and policy say whom to believe
     --effective-from <time>    when the rules start counting: µs or RFC 3339 (default: now)
     --expires-at <time>        when they stop counting (default: until superseded)
     --revision <n>             default: one past what the store advertises
@@ -192,6 +201,7 @@ const VALUED: &[&str] = &[
     "--out",
     "--max-age",
     "--min-signatures",
+    "--mirror",
     "--passphrase",
     "--passphrase-file",
 ];
@@ -204,6 +214,7 @@ const SWITCHES: &[&str] = &[
     "--gate",
     "--advisory",
     "--allow-simulated",
+    "--require-origin-provenance",
 ];
 
 /// `gitiup policy …`
@@ -415,6 +426,9 @@ fn publish(args: &Args) -> Result<(), CliError> {
             "trusted_key_ids": sorted(&roots),
             "rules": document.rules,
             "quorum": quorum,
+            "provenance": document.provenance.clone().map_or(Value::Null, |p| {
+                serde_json::to_value(p).unwrap_or(Value::Null)
+            }),
         });
         println!(
             "{}",
@@ -549,6 +563,7 @@ fn built(args: &Args, publisher: &Publisher, roots: &Trust) -> Result<PolicyDocu
     } else {
         args.all("--protect")
     };
+    let provenance = provenance_block(args)?;
     let mut document = NewPolicy {
         owner: PolicyOwner {
             key_id: publisher.key_id.clone(),
@@ -557,6 +572,7 @@ fn built(args: &Args, publisher: &Publisher, roots: &Trust) -> Result<PolicyDocu
         protects,
         rules,
         quorum: None,
+        provenance,
         effective_from_us: 0,
         expires_at_us: None,
         annotations: None,
@@ -566,6 +582,38 @@ fn built(args: &Args, publisher: &Publisher, roots: &Trust) -> Result<PolicyDocu
     .build();
     policy::normalise_document(&mut document);
     Ok(document)
+}
+
+/// The `provenance` block the flags describe, or `None` when the owner says nothing about
+/// copies — which is the default, and means a copy gates a merge exactly as an origin does
+/// ([ADR-0005 D5 clause 3](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+fn provenance_block(args: &Args) -> Result<Option<ProvenanceBlock>, CliError> {
+    let require = args.on("--require-origin-provenance");
+    let mirrors = args.all("--mirror");
+    if !require && mirrors.is_empty() {
+        return Ok(None);
+    }
+    let mirrors = if mirrors.is_empty() {
+        None
+    } else {
+        let mut list: Vec<String> = mirrors
+            .iter()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect();
+        list.sort();
+        list.dedup();
+        if list.is_empty() {
+            return Err(CliError::usage(
+                "--mirror names an empty store: give a url, or drop the flag",
+            ));
+        }
+        Some(list)
+    };
+    Ok(Some(ProvenanceBlock {
+        require_origin_seen: require.then_some(true),
+        mirrors,
+    }))
 }
 
 /// Trust roots for a publish: `--trust`, or the key that just signed.
@@ -716,6 +764,15 @@ fn report(resolved: &ResolvedPolicy, store: Option<&Opened>) -> Value {
                 .collect::<Vec<Value>>()
                 .into(),
         );
+        // What the owner demands of a *copy*, when it demands anything (ADR-0005 D5).
+        // Named apart from the `policy` block above, which is this answer's own
+        // provenance — where the rule came from — and not the same fact.
+        if let Some(demand) = &document.provenance {
+            map.insert(
+                "provenance_demand".into(),
+                serde_json::to_value(demand).unwrap_or(Value::Null),
+            );
+        }
     }
     map.insert("rules".into(), rules(resolved));
     Value::Object(map)

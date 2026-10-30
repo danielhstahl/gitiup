@@ -222,6 +222,7 @@ fn pinned_proofs_survive_every_policy(open: &dyn Fn() -> Box<dyn Host>) {
         item(&seat.digest, &subject, 0),
     ];
     let policy = Retention {
+        max_bytes: None,
         max_age_us: Some(MICROS),
         max_per_subject: Some(1),
     };
@@ -279,6 +280,7 @@ fn an_already_gone_ref_counts_as_retired(open: &dyn Fn() -> Box<dyn Host>) {
         .expect("publish");
     let plan = attest::plan(
         &Retention {
+            max_bytes: None,
             max_age_us: Some(1),
             max_per_subject: None,
         },
@@ -358,6 +360,7 @@ fn the_fs_host_can_actually_forget_a_blob() {
     .expect("publish");
     let plan = attest::plan(
         &Retention {
+            max_bytes: None,
             max_age_us: Some(1),
             max_per_subject: None,
         },
@@ -400,6 +403,7 @@ fn the_fs_host_can_actually_forget_a_blob() {
         .expect("a seat points at it");
     let later = attest::plan(
         &Retention {
+            max_bytes: None,
             max_age_us: Some(1),
             max_per_subject: Some(0),
         },
@@ -581,6 +585,7 @@ fn a_bucket_refuses_to_forget_and_says_so() {
         .expect("publish");
     let plan = attest::plan(
         &Retention {
+            max_bytes: None,
             max_age_us: Some(1),
             max_per_subject: None,
         },

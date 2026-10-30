@@ -636,10 +636,45 @@ pub(crate) struct Input {
     pub(crate) source: String,
     /// The store's name for the record, when it came from a store.
     pub(crate) stored: Option<String>,
+    /// Where these bytes were read from, when a store served them (ADR-0005 D5).
+    pub(crate) store: Option<gitiup_host::federation::StoreIdentity>,
+    /// What the reading is worth: `origin` or `copy`, how old, and what the importing
+    /// store recorded about it. `None` when there was no store, or nothing could be read.
+    pub(crate) provenance: Option<gitiup_host::federation::provenance::Block>,
     pub(crate) failure: Option<(&'static str, AttestError)>,
 }
 
 impl Input {
+    /// Say where the bytes were read from, and age them from their own claim
+    /// ([ADR-0005 D5](../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+    ///
+    /// Called by every path that read from a host, and by nothing else: bytes handed over
+    /// as a file did not travel, so there is nothing to say about their arrival.
+    fn stamped_by(&mut self, store: &Opened) {
+        let identity =
+            gitiup_host::federation::StoreIdentity::new(store.what.clone(), store.url.clone());
+        // The claim's own time, whichever of the two document shapes came back.
+        let claimed = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.manifest.claims.claimed_at_us)
+            .or_else(|| self.quorum.as_ref().map(|q| q.claimed_at_us));
+        self.provenance = match (claimed, &self.stored) {
+            (Some(claimed), Some(hex)) => gitiup_host::Oid::from_hex(hex).ok().and_then(|digest| {
+                gitiup_host::federation::provenance::Block::read(
+                    &*store.host,
+                    &identity,
+                    &digest,
+                    claimed,
+                    gitiup_host::federation::provenance::now_us(),
+                )
+                .ok()
+            }),
+            _ => None,
+        };
+        self.store = Some(identity);
+    }
+
     fn refused(
         code: &'static str,
         error: AttestError,
@@ -651,6 +686,8 @@ impl Input {
             quorum: None,
             source,
             stored,
+            store: None,
+            provenance: None,
             failure: Some((code, error)),
         }
     }
@@ -670,6 +707,8 @@ impl Input {
                     quorum: Some(attestation),
                     source,
                     stored,
+                    store: None,
+                    provenance: None,
                     failure: None,
                 }),
                 Err(error) => Ok(Input::refused(
@@ -686,6 +725,8 @@ impl Input {
                 quorum: None,
                 source,
                 stored,
+                store: None,
+                provenance: None,
                 failure: None,
             }),
             Err(error) => Ok(Input::refused("structure", error, source, stored)),
@@ -764,7 +805,17 @@ fn from_file(args: &Args) -> Result<Input, CliError> {
 }
 
 /// From a host: by digest, or the single attestation a commit has.
+///
+/// The read and the *stamping* are split so that every path out of the read — the answer
+/// and the three ways a store can lie about bytes — gets the same provenance block, and
+/// the code that says "this came from a mirror" is written once.
 fn from_store(args: &Args, store: &Opened) -> Result<Input, CliError> {
+    let mut input = read_from_store(args, store)?;
+    input.stamped_by(store);
+    Ok(input)
+}
+
+fn read_from_store(args: &Args, store: &Opened) -> Result<Input, CliError> {
     let wanted = args
         .get("--digest")
         .map(|text| {
@@ -1253,6 +1304,16 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
                 .map(Value::String)
                 .unwrap_or(Value::Null),
         );
+        // The same argument, and the same constant: `age_basis` is printed whether or not
+        // the bytes travelled, because the rule it states has no exception (D5 clause 1).
+        shape.insert(
+            "provenance".into(),
+            input
+                .provenance
+                .as_ref()
+                .map(|provenance| provenance.json())
+                .unwrap_or(Value::Null),
+        );
         shape.insert("policy".into(), spec.json());
         if let Some(quorum) = quorum_json {
             // A gate reading this shape needs to know which kind of document it judged,
@@ -1276,6 +1337,9 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
     out.push(Row::new("source", input.source.clone()));
     if let Some(stored) = &input.stored {
         out.push(Row::new("stored", stored.clone()));
+    }
+    if let Some(provenance) = &input.provenance {
+        out.push(Row::new("provenance", provenance.summary()));
     }
     match &facts {
         Some(facts) => facts.rows(now, &mut out),
@@ -1740,6 +1804,7 @@ fn evidence_from(args: &Args) -> Result<Option<participant::Opened>, CliError> {
         return Ok(Some(participant::Opened {
             host: Box::new(host),
             what: format!("fs store {}", std::path::Path::new(dir).display()),
+            url: std::path::Path::new(dir).display().to_string(),
         }));
     }
     participant::store_from(args)

@@ -1353,3 +1353,173 @@ fn the_json_is_one_object_with_every_answer_a_gate_needs() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// provenance: what a copy of a proof is worth to a gate (ADR-0005 D5)
+// ---------------------------------------------------------------------------
+
+/// File an arrival record for a digest, in the shape `gitiup attest import` writes.
+///
+/// This is the *only* evidence a store has that it is a mirror — there is no `mirror`
+/// flag anywhere, and there never will be — and it is what a policy's provenance demand is
+/// judged against. Writing it here, rather than running an import, keeps the test about
+/// the gate's decision instead of about two stores.
+fn mark_as_copy(h: &Harness, digest: &str, reference: &str, from: &str) {
+    let host = FsHost::open_or_create(h.store()).expect("open the store");
+    let oid = Oid::from_hex(digest).expect("a digest");
+    let arrival = gitiup_host::federation::Arrival::new(
+        &oid,
+        &RefName::new(reference).expect("a ref"),
+        from,
+        1_793_395_000_000_000,
+    );
+    gitiup_host::federation::record(&host, &arrival).expect("file the arrival record");
+}
+
+/// The `provenance` block is printed whatever the policy says, because a reader who is
+/// not told a proof arrived by copy cannot ask whether that matters. The refusal is the
+/// owner's: a policy that says "I will not gate a merge on a copy" is obeyed, and a
+/// policy that says nothing is the default — federation on, a copy gates what an origin
+/// gates.
+#[test]
+fn a_policy_that_will_only_gate_on_an_origin_proof_refuses_the_copy_of_one() {
+    let h = harness();
+    let c = change(&h);
+    h.publish_policy(&["--require-origin-provenance"]);
+    let pushed = h.push("matrix-build", "runner", &c.hex);
+    let digest = pushed["digest"].as_str().expect("a digest").to_string();
+
+    // Made here, so the demand is satisfied and the block says which of the two this is.
+    let (code, value, _) = h.verify(&c.id, &["--json"]);
+    assert_eq!(code, 0, "an origin proof satisfies the demand: {value}");
+    let proof = &value["attestations"][0]["provenance"];
+    assert_eq!(proof["store"], "origin");
+    assert_eq!(proof["origin_seen"], true);
+    assert_eq!(proof["age_basis"], "claimed_at_us");
+
+    // The same bytes, arrived from elsewhere. Nothing about the document changed — it is
+    // the same signature over the same manifest — and yet a gate that must not act on a
+    // stale proof now refuses it, which is the whole of what a mirror can and cannot do.
+    mark_as_copy(
+        &h,
+        &digest,
+        pushed["reference"].as_str().unwrap(),
+        "https://stranger.example.org/repo.git",
+    );
+    let (code, value, text) = h.verify(&c.id, &["--json"]);
+    assert_eq!(
+        code, 6,
+        "a copy may not gate a merge under this policy: {value}"
+    );
+    let attestation = &value["attestations"][0];
+    assert_eq!(attestation["accepted"], false, "{attestation}");
+    assert_eq!(attestation["provenance"]["store"], "copy");
+    assert_eq!(
+        attestation["provenance"]["arrived_from"],
+        "https://stranger.example.org/repo.git"
+    );
+    assert_eq!(attestation["provenance"]["origin_seen"], false);
+    assert!(
+        reason_codes(attestation).contains(&"origin_provenance_required".to_string()),
+        "the refusal is named by its token: {attestation}"
+    );
+    // The gate's own question — does this add up to a merge? — is answered no. The
+    // `attestations` check stays `passed` because it is the check that says the store's
+    // proofs were read and parsed; the refusal is the ladder's and the combination's.
+    assert_eq!(check(&value, "min_signatures"), "not_run", "{value}");
+    assert!(
+        value["notes"].as_array().unwrap().iter().any(|note| note
+            .as_str()
+            .unwrap_or_default()
+            .contains("passed on its own")),
+        "and the report says why nothing added up: {value}"
+    );
+    assert_eq!(value["accepted"], false);
+    assert!(
+        reason_codes(&value).contains(&"origin_provenance_required".to_string()),
+        "and the reason reaches the change, not only the attestation: {value}"
+    );
+
+    // …and the human report says the same sentence.
+    let (_, _, prose) = h.verify(&c.id, &[]);
+    assert!(prose.contains("origin_provenance_required"), "{prose}");
+    assert!(text.contains("origin_provenance_required"));
+}
+
+/// A policy may instead name the stores it keeps as fresh as itself. This is not a trust
+/// list — keys do that, and a mirror has no key — and not an access-control list; it
+/// states only which copies the owner is willing to treat as current.
+#[test]
+fn a_named_mirror_may_gate_a_merge_and_an_unnamed_one_may_not() {
+    let mirror = "https://mirror.example.org/repo.git";
+
+    let h = harness();
+    let c = change(&h);
+    h.publish_policy(&["--mirror", mirror]);
+    let pushed = h.push("matrix-build", "runner", &c.hex);
+    mark_as_copy(
+        &h,
+        pushed["digest"].as_str().expect("a digest"),
+        pushed["reference"].as_str().unwrap(),
+        mirror,
+    );
+    let (code, value, _) = h.verify(&c.id, &["--json"]);
+    assert_eq!(code, 0, "the owner named this store: {value}");
+    assert_eq!(value["attestations"][0]["provenance"]["store"], "copy");
+
+    let h = harness();
+    let c = change(&h);
+    h.publish_policy(&["--mirror", mirror]);
+    let pushed = h.push("matrix-build", "runner", &c.hex);
+    mark_as_copy(
+        &h,
+        pushed["digest"].as_str().expect("a digest"),
+        pushed["reference"].as_str().unwrap(),
+        "https://somebody-elses.example.org/repo.git",
+    );
+    let (code, value, _) = h.verify(&c.id, &["--json"]);
+    assert_eq!(code, 6, "nobody named this store: {value}");
+    let attestation = &value["attestations"][0];
+    assert!(
+        reason_codes(attestation).contains(&"unlisted_mirror".to_string()),
+        "the refusal names both the store and the list: {attestation}"
+    );
+    assert!(
+        attestation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("somebody-elses.example.org")),
+        "and says which one it means: {attestation}"
+    );
+}
+
+/// Absent the member — the shape of every policy signed before this existed — a copy is
+/// an ordinary proof. Making provenance opt-in is what keeps "not tied to one bucket"
+/// from quietly becoming "not mirrored at all".
+#[test]
+fn a_policy_that_says_nothing_about_copies_gates_on_them_like_anything_else() {
+    let h = harness();
+    let c = change(&h);
+    let policy = h.publish_policy(&[]);
+    let pushed = h.push("matrix-build", "runner", &c.hex);
+    mark_as_copy(
+        &h,
+        pushed["digest"].as_str().expect("a digest"),
+        pushed["reference"].as_str().unwrap(),
+        "https://anybody.example.org/repo.git",
+    );
+    let (code, value, _) = h.verify(&c.id, &["--json"]);
+    assert_eq!(
+        code, 0,
+        "a copy gates a merge unless the owner says otherwise: {value}"
+    );
+    assert_eq!(value["attestations"][0]["provenance"]["store"], "copy");
+    assert!(
+        policy["provenance"].is_null(),
+        "the published policy says nothing about copies: {policy}"
+    );
+}
