@@ -84,6 +84,7 @@ mod doctor;
 mod env;
 mod fetch;
 mod hook;
+mod import;
 mod keys;
 mod normalise;
 mod participant;
@@ -120,7 +121,9 @@ COMMANDS:
     hook uninstall pre-receive --repo <path> take the gate back out (refuses a hook gitiup
                                    did not write)
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
-    attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc, migrate
+    attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc, migrate —
+                                   and `import`, which copies them in from another store
+                                   after re-verifying each one here
     change new [OPTIONS]           draft a signed change record from local commits
     change submit [OPTIONS]        publish one attempt of it to the store you name, and
                                    open the quorum rounds its published policy demands

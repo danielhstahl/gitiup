@@ -61,7 +61,11 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   forge) using each host's own pack and CAS paths; what travels, what is refused out loud
   and by which token, why a pointer is resolved rather than copied, what an arrival record
   at `kv/import/<digest>` answers, and why the report says `trust none` on every run of
-  every host pair.
+  every host pair. And `gitiup attest import`, the verb that checks what it copies: it walks
+  each attestation's own citations instead of listing a namespace, runs the
+  `gitiup verify attestation` ladder on every document before filing it, refuses a
+  `tier: quorum` attestation whose round and reveals did not come with it, and records the
+  verdict it reached here as an audit note and never as an inherited belief.
 * [The sandbox](docs/sandbox.md) — what `provenance.sandbox` is allowed to claim, the
   ladder (`docker`/`podman` → `bwrap` → Landlock → `unshare` → opt-in `plain`), what each
   rung denies and what it does not, how egress is refused by default, and what the escape

@@ -6,7 +6,7 @@
 * **Blocks**: `giti-g5c.2` (`gitiup fetch|push`: D1, D2, D6, D7, D8), `giti-g5c.3` (`gitiup attest import`: D3, D4, D9, D10), `giti-g5c.4` (`gitiup migrate repo`: D1, D6, D7), `giti-g5c.5` (anonymous read and credential scoping: D1's privacy row, D6's write direction); and it grows [ADR-0004](0004-published-policy-format-signing-and-resolution.md)'s field set by one optional member (`provenance`, D5), which `giti-91m`'s `.3`/`.4` readers have to accept before a mirror is useful
 * **Depends on**: [ADR-0001](0001-attestation-encoding-hash-and-signature.md) — canonical bytes and the digest that names them (D1, D2), the signature framing that makes byte identity load-bearing (D3), *freshness is policy, not a property of the document* (D6 — the whole of D5 below rests on it), the verification order and the exit-code taxonomy (D7), the volatile-field register as the template for "as of now" (D5), limits (D7); [ADR-0002](0002-roster-verifier-selection-and-sybil-resistance.md) — signed-record framing, roster epochs and the anti-rollback guard (D8), revocation voiding at verdict time (D9), `refs/gitiup/**` + hex slots as the record layout (D10), "the store's CAS *is* the arbitration" (D10, and the reason a copy cannot arbitrate); [ADR-0003](0003-change-record-format-and-merge-semantics.md) — the content-derived `chg-` id a copy re-derives identically (D3), two digests with different jobs (D4), refs and bytes-first write order (D5), attempts as create-only refs (D6), states derived from which refs exist (D7), a merge as a CAS fast-forward that cannot happen anywhere but the base's owner (D8); [ADR-0004](0004-published-policy-format-signing-and-resolution.md) — trust roots are local config and never travel in the document (C3, D3 below), the policy chain and `policy_history_missing` (D6), `policy/current` + `policy/history/**` (D7), "unknown fields refused" as the fail-closed reading rule (D10 below), the `protects` asymmetry that keeps `refs/attestations/**` and `refs/gitiup/**` open (C8); [host abstraction](../host-abstraction.md) — the CAS contract, bytes-then-ref publication, `referenced`-is-not-a-knob retention, `purge_cas` as the only honest forgetting, dumb HTTP as a legitimate read-only mirror, and `refs/gitiup/kv` as a per-store commit chain
 * **Reference vectors**: [`fixtures/federation-v1/`](fixtures/federation-v1/) — `generate.py` is a stdlib-only second implementation of the portability table (D1, D2) and the closure walk (D9); `portable.json` is the namespace table with a token for every `no`, `cases.json` is the closure cases and the refusal table. `--check-ad` fails if this document's tables and the generated data disagree
-* **Implemented by**: **`giti-g5c.2`, for the transport half — `gitiup fetch | gitiup push`** ([`crates/gitiup/src/fetch.rs`](../../crates/gitiup/src/fetch.rs) for the verbs, [`gitiup-host::federation`](../../crates/gitiup-host/src/federation.rs) for the rules, [`tests/federation.rs`](../../crates/gitiup-host/tests/federation.rs) and [`tests/fetch_cli.rs`](../../crates/gitiup/tests/fetch_cli.rs) for the proofs): D1's table as Rust rows asserted against the generated fixture by [`tests/federation_vectors.rs`](../../crates/gitiup-host/tests/federation_vectors.rs), the forge as both ends of a copy over the mock forge ([`gitiup-host-github/tests/federation.rs`](../../crates/gitiup-host-github/tests/federation.rs)), D2's refusals per ref by token, D6's one-way shape and the `read_only` refusal, D7's create-only collision semantics, pointer rule and legacy respelling, and D8 rule 1's write order with `kv/import/**` arrival records for every digest that lands. What is *still* not built belongs to the tickets named above: `gitiup attest import`'s verify ladder and closure walk (D4, D9), the `provenance` block in a verify report and the `provenance` policy member (D5), the mirror's capacity eviction and `mirror_may_not_prune_by_age` (D8 rule 2 — now buildable, since a store can at last tell it is a mirror), and any refusal token below that no code prints yet. `federation::REFUSALS` registers all 27 so an exit code is never guessed at, and `federation::knows_token` is what a test asserts against.
+* **Implemented by**: **`giti-g5c.2` (`gitiup fetch | gitiup push`) and `giti-g5c.3` (`gitiup attest import`)** ([`crates/gitiup/src/fetch.rs`](../../crates/gitiup/src/fetch.rs) and [`crates/gitiup/src/import.rs`](../../crates/gitiup/src/import.rs) for the verbs, [`gitiup-host::federation`](../../crates/gitiup-host/src/federation.rs) for the rules, [`tests/federation.rs`](../../crates/gitiup-host/tests/federation.rs), [`tests/fetch_cli.rs`](../../crates/gitiup/tests/fetch_cli.rs) and [`tests/import_cli.rs`](../../crates/gitiup/tests/import_cli.rs) for the proofs): D1's table as Rust rows asserted against the generated fixture by [`tests/federation_vectors.rs`](../../crates/gitiup-host/tests/federation_vectors.rs), the forge as both ends of a copy over the mock forge ([`gitiup-host-github/tests/federation.rs`](../../crates/gitiup-host-github/tests/federation.rs)), D2's refusals per ref by token, D6's one-way shape and the `read_only` refusal, D7's create-only collision semantics, pointer rule and legacy respelling, and D8 rule 1's write order with `kv/import/**` arrival records for every digest that lands. `giti-g5c.3` added the verify ladder and the closure walk (D3's no-flag rule as an asserted refusal of every trust-flavoured flag, D4's no-waiver-for-duplicates, D9's citation walk with `closure_incomplete`, `no_commitment` and `subject_missing`, D10's budgets and exit codes, and the `kv/import/<digest>` record written with the closure, the verifier and the verdict it reached). What is *still* not built belongs to the tickets named above: the `provenance` block in a verify report and the `provenance` policy member (D5), the mirror's capacity eviction and `mirror_may_not_prune_by_age` (D8 rule 2 — now buildable, since a store can at last tell it is a mirror), and any refusal token below that no code prints yet. `federation::REFUSALS` registers all 27 so an exit code is never guessed at, and `federation::knows_token` is what a test asserts against.
 
 > A copy is the easiest feature in this product to build: the bytes are signed, the
 > names are content-derived, and git already moves packs for a living. That is exactly
@@ -197,8 +197,7 @@ ways* is D6.
 
 ## D3 — A copy transfers bytes and never trust
 
-**Status: decided; `giti-g5c.3` implements it, and `giti-g5c.2` must not grow the flag —
-and has not.** The transport surface has no trust flag of any spelling (its CLI test
+**Status: decided; implemented by `giti-g5c.2` and `giti-g5c.3`, neither of which grew the flag.** The transport surface has no trust flag of any spelling (its CLI test
 asserts the four forbidden spellings each exit 2), its report's only trust field is the
 constant `trust: "none"`, and it writes no `kv/**` mark, no manifest and no mirror
 signature. There is no capability bit for it either: `Capabilities` is unchanged by this
@@ -263,7 +262,7 @@ such a path and turns it on.
 
 ## D4 — Arrival checks: everything, again, here
 
-**Status: decided; `giti-g5c.3` is the implementation and reuses `gitiup verify attestation`'s code path rather than paralleling it.**
+**Status: decided; implemented by `giti-g5c.3` ([`crates/gitiup/src/import.rs`](../../crates/gitiup/src/import.rs)), which calls `gitiup verify attestation`'s code path rather than paralleling it.**
 
 **Decision.** An imported document is verified by the same ordered checks as a locally
 produced one, in the same order (ADR-0001 D7), with federation-specific steps bolted on
@@ -630,7 +629,7 @@ conservative one.
 
 ## D9 — Import is a closure walk
 
-**Status: decided; this is `giti-g5c.3`'s main loop.**
+**Status: decided; implemented by `giti-g5c.3` as the walk in [`crates/gitiup/src/import.rs`](../../crates/gitiup/src/import.rs), with its edges and refusals proven by [`tests/import_cli.rs`](../../crates/gitiup/tests/import_cli.rs).**
 
 **Decision.** An import walks a closure, and the edges are not invented here — they are the
 digest citations the records already carry:
@@ -899,7 +898,7 @@ the arbitration test for any write it is offered (D6), the collision semantics t
 idempotent (`already`, create-only, D7) and the pointer rule that keeps an interrupted run
 harmless, plus the write ordering its "no ref advertising a partial set" criterion needs
 (D8 rule 1) and the shape of `--proofs-only` as a closure rather than a namespace.
-`giti-g5c.3` gets the verify ladder with its two new steps (D4), the closure walk with its
+`giti-g5c.3` got the verify ladder with its two new steps (D4), the closure walk with its
 edges and its budgets (D9, D10), the import record's fields (D5), the per-record versus
 per-command exit rule (D10), and the rule that makes its headline refusal — *a verdict
 without its evidence is a rumour* — a general principle instead of a special case.

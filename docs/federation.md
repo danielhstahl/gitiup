@@ -1,16 +1,20 @@
 # Federation — moving proofs between stores
 
-*Ticket: `giti-g5c.2` (epic `giti-g5c`, *federation — proofs and changes travel between
-repositories*). Decision: [ADR-0005](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)
-— D1 (the portable set), D2 (the register of what may not be copied), D6 (direction), D7
-(collision semantics), D8 rule 1 (advertisement ⊆ possession). Implementation:
-[`crates/gitiup/src/fetch.rs`](../crates/gitiup/src/fetch.rs) for the two verbs and
+*Tickets: `giti-g5c.2` and `giti-g5c.3` (epic `giti-g5c`, *federation — proofs and changes
+travel between repositories*). Decision:
+[ADR-0005](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md) — D1 (the portable
+set), D2 (the register of what may not be copied), D5 (arrival records), D6 (direction),
+D7 (collision semantics), D8 rule 1 (advertisement ⊆ possession), D9 (the closure an import
+must carry), D10 (budgets and exit codes). Implementation:
+[`crates/gitiup/src/fetch.rs`](../crates/gitiup/src/fetch.rs) and
+[`crates/gitiup/src/import.rs`](../crates/gitiup/src/import.rs) for the verbs and
 [`gitiup-host::federation`](../crates/gitiup-host/src/federation.rs) for the rules; the
 proofs are [`gitiup-host/tests/federation.rs`](../crates/gitiup-host/tests/federation.rs),
 [`tests/federation_vectors.rs`](../crates/gitiup-host/tests/federation_vectors.rs),
 [`gitiup-host-github/tests/federation.rs`](../crates/gitiup-host-github/tests/federation.rs)
-(the forge as a destination and a source, over the mock forge) and
-[`gitiup/tests/fetch_cli.rs`](../crates/gitiup/tests/fetch_cli.rs).*
+(the forge as a destination and a source, over the mock forge),
+[`gitiup/tests/fetch_cli.rs`](../crates/gitiup/tests/fetch_cli.rs) and
+[`gitiup/tests/import_cli.rs`](../crates/gitiup/tests/import_cli.rs).*
 
 > A mirror is the easiest feature in this product to build and the easiest to build wrong.
 > The bytes are signed, the names are content-derived, and git moves packs for a living —
@@ -22,6 +26,7 @@ proofs are [`gitiup-host/tests/federation.rs`](../crates/gitiup-host/tests/feder
 ```text
 gitiup fetch --remote upstream --store ./store        pull a copy into one of your stores
 gitiup push  --remote mirror   --store ./store       publish a copy out to one
+gitiup attest import --from upstream --to ./store    pull proofs, and re-verify each one
 ```
 
 Both verbs run the same function with its arguments swapped
@@ -182,11 +187,72 @@ pair:
 | `trust`, `age_basis` | `none` and `claimed_at_us`, always, for every host pair, whatever you pass |
 
 Every digest that arrives gets an arrival record in the *importing* store at
-`kv/import/<digest>` — `gitiup-import-1`, naming `arrived_from`, `arrived_at_us`, the refs
-it was advertised under, and `closure: "not-walked"` until
-`gitiup attest import` (`giti-g5c.3`) walks it. It answers the question a mirror exists to
-make answerable — *how did this get here* — and it is local by construction: the one thing
-a copy never copies is another store's account of itself.
+`kv/import/<digest>` — `gitiup-import-1`, naming `arrived_from`, `arrived_at_us` and the
+refs it was advertised under, with `closure: "not-walked"` from `fetch` and
+`closure: "complete"` from an import, which records the whole closure it carried, the
+verifier that checked it here and the exit code that check produced. It answers the
+question a mirror exists to make answerable — *how did this get here* — and it is local by
+construction: the one thing a copy never copies is another store's account of itself.
+
+## Import: a copy that checks
+
+`gitiup fetch` answers *what does the source advertise*; `gitiup attest import` answers
+*what do these bytes lean on*. That is a different question, and it is why the verb is not
+a flag on `fetch`:
+
+```console
+$ gitiup attest import --from ./upstream --to ./down --allow-missing-subject --dry-run
+import         fs store ./upstream → fs store ./down  (plan only: nothing written)
+policy         trust: this machine's keystore, 1 key(s) · tiers local · min 1 signature(s) · max age never · env nothing required
+budget         4096 records · 8 hops · 64 policy revisions · 1024 MiB
+offered        1 attestation(s) advertised by the source, 1 in scope
+imported       1 attestation(s) with their closure (planned) · 1 record(s) deep to 0 hops
+objects        1 new, 0 already (3200 bytes), 1 re-hashed
+refs           1 written, 0 already, 0 moved, 0 respelled
+refused        none
+subject        0 present, 1 excused (--allow-missing-subject)
+records        0 kv/import/<digest> written (planned) · closure walked, subject presence excused — recorded, and never an input to a later verdict
+trust          none: what was checked is written down, and the next reader recomputes it
+  imported   876e4f02…201c  local       1 record(s) · signed by ItVqc+Vz…5VfM
+             subject excused: the object it is about bbbbbbbb…bbbb (--allow-missing-subject)
+plan only: nothing was written. Add --apply to import these.
+```
+
+For each attestation the source advertises, in this order:
+
+1. **Walk its citations** — an attestation's subject, a verdict's round, roster and policy,
+   a round's roster, reveals and (for a sealed round) its commitments, a roster's
+   revocations, a policy's predecessor chain. Every edge must be a ref the source
+   advertises, or the document is refused with `closure_incomplete` naming the edge that
+   has no foot (D9). Two edges are answered by derivation instead of by a copy, and the
+   report says so out loud rather than assuming it: a round's `policy_digest` names the
+   selection policy *inside* the round record under the selector's signature, and a
+   `tier: quorum` attestation's `verdict_digest` names a verdict this command recomputes
+   from the round, the roster epoch and the reveals it just took.
+2. **Run the ladder** — the same checks `gitiup verify attestation` runs, from the same
+   code, with a policy built by the same flags: canonical bytes, digest, signature, trust,
+   tier, sandbox, environment, and freshness against *this* clock. A proof the source was
+   happy with is refused here if this machine's policy does not take it, and `--tier`,
+   `--max-age`, `--trust`, `--allow-simulated` and `--now` behave exactly as they do on
+   `verify`.
+3. **File it, or report it.** A document that fails is reported and skipped and the rest of
+   the import goes ahead; an integrity failure fails the command. Then the whole set that
+   passed goes through `federation::copy` — the same write path `fetch` uses, restricted to
+   the digests the walk admitted — so bytes before refs, create-only, re-hashed at both
+   ends, with one place in the workspace that decides what "never overwrite" means.
+4. **Record the arrival**, with the closure, the verifier and the verdict in it.
+
+Nothing is written without `--apply`; a bare run is the plan. `--proofs-only` and
+`--allow-missing-subject` excuse a subject this store cannot name, *in the report and in the
+arrival record*, so "deliberately not here" and "lost" stay two sentences. And the rule
+that gives the verb its reason for existing: a `tier: quorum` attestation whose round,
+roster or reveals are not offered is a rumour, and an import is what turns it into evidence
+— after an import that carried the closure, `gitiup verify attestation --store ./store
+--tier quorum` accepts the document with no reference to where it came from
+(`import_cli.rs` asserts exactly that).
+
+There is no flag here that makes an imported proof count as one you witnessed, and there
+never will be: `"trust": "none"` is a constant in this verb too.
 
 ## Exit codes
 
@@ -202,13 +268,9 @@ something was skipped.
 
 ## What is not here yet
 
-* **the closure walk** — `gitiup attest import` (`giti-g5c.3`) follows a record's own
-  citations (`round_digest`, `roster_digest`, `policy_digest`, `previous_digest`) instead
-  of listing a namespace, re-verifies everything on arrival, and refuses a record whose
-  edges are absent with `closure_incomplete`. These verbs copy *scope*; `.3` is the verb
-  that copies *closure* and belief.
 * **`provenance` in a verify report, and the `provenance` policy member** (`origin_provenance_required`,
-  `unlisted_mirror`) — D5, landing with `.3` and `giti-91m`'s policy readers.
+  `unlisted_mirror`) — D5's policy half, waiting on `giti-91m`'s policy readers. The
+  arrival records an import writes are the data that rule will read.
 * **mirror eviction** — a store can now tell it is a mirror, because it has arrival
   records, so `mirror_may_not_prune_by_age` and capacity eviction (`eviction_needs_source`)
   are now buildable (D8 rule 2).

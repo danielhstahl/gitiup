@@ -96,6 +96,7 @@ USAGE:
     gitiup attest push [DOC|-] [OPTIONS]
     gitiup attest list [OPTIONS]
     gitiup attest show [DIGEST|ARGS] [OPTIONS]
+    gitiup attest import [OPTIONS]        (see `gitiup attest import help`)
     gitiup attest gc [OPTIONS]
     gitiup attest migrate [OPTIONS]
 
@@ -137,8 +138,7 @@ show — one attestation, parsed:
     --dsse                   a spec in-toto DSSE envelope over the same bytes
 
 gc — retention:
-    --max-age <age>          90d, 2w, 36h, 90s, or seconds; `never` for no limit
-    --max-per-commit <n>     keep the newest n per commit
+    --max-age <age>          90d, 2w, 36h, 90s, or seconds; `never` for no limit    --max-per-commit <n>     keep the newest n per commit
     --keep <digest>          never prune this digest (repeatable: a merge record's, a
                              verdict's; refs that still point at an object already pin it
                              without being told)
@@ -161,6 +161,16 @@ migrate — move a store's old single-level attestation refs to <subject>/<diges
 All: -j, --json on anything a script reads. Passphrases follow `gitiup key`:
 --passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a script cannot
 answer.
+
+import — copy proofs out of another store, and re-verify every one on arrival:
+    It is the ladder of `gitiup verify attestation` run at the boundary: canonical bytes,
+    digest, signature, trust, tier, environment, and freshness evaluated *here and now*,
+    plus the evidence each record cites (its verdict, round, roster epoch, policy chain).
+    A document that fails is reported and skipped, and the rest still lands; a `tier:
+    quorum` attestation without its round and verdict is a rumour and is refused; nothing
+    is overwritten; `--dry-run` writes nothing. Every digest that arrives is recorded at
+    kv/import/<digest> with where it came from and what the check said. Full flags:
+    `gitiup attest import help`.
 
 Exit codes: 0 ok · 2 usage · 3 I/O, store unreachable · 6 refused (no key, no store,
 an unsigned document, nothing over the policy's limits) · 7 a signature that does not
@@ -210,9 +220,14 @@ pub fn attest(args: &[String]) -> Result<(), CliError> {
         "show" => show(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "gc" => gc(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "migrate" => migrate(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        // `import` parses its own flags: it takes the whole `gitiup verify attestation`
+        // vocabulary (it *is* that ladder, run at the boundary) plus its own two-store
+        // flags, and sharing one flag list with `push`/`list` would mean one flag meaning
+        // two things.
+        "import" => crate::import::import(&args[1..]),
         other => Err(CliError::usage(format!(
             "unknown `gitiup attest` command '{other}'; `gitiup attest help` lists push, list, \
-             show, gc and migrate"
+             show, import, gc and migrate"
         ))),
     }
 }

@@ -32,9 +32,9 @@ pub mod copy;
 pub mod portable;
 
 pub use copy::{
-    AGE_BASIS, Arrival, CODE_OUTCOMES, CodeReport, CopyReport, IMPORT_TYPE, Objects, Options,
-    PointerMove, Refs, Refusal, SubjectReport, TRUST_NONE, Verb, arrivals, copy,
-    has_refetch_source, token_for,
+    AGE_BASIS, Arrival, CLOSURE_COMPLETE, CLOSURE_NOT_WALKED, CODE_OUTCOMES, CodeReport,
+    CopyReport, IMPORT_TYPE, Objects, Options, PointerMove, Refs, Refusal, SubjectReport,
+    TRUST_NONE, Verb, arrivals, copy, has_refetch_source, record, token_for,
 };
 pub use portable::{Budgets, Class, Decision, Row, TABLE, classify, namespace_travels};
 

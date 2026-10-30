@@ -102,6 +102,23 @@ pub struct Options {
     pub now_us: i64,
     /// Write a `kv/import/<digest>` arrival record for each digest that arrived.
     pub record_arrivals: bool,
+    /// The closure allowlist ([ADR-0005 D9](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)):
+    /// the hex digests a caller has decided this run may take, and nothing else.
+    ///
+    /// `gitiup attest import` fills this in by walking each record's own citations
+    /// (D9), so the *scope* of a copy is decided by a caller that has read the records
+    /// and verified them, while the *mechanics* of the copy — bytes before refs,
+    /// create-only, re-hash on both ends — stay here, in one place, for every verb
+    /// (D7: "`gitiup attest import` inherits all of it by calling the same write
+    /// path"). A selection is a scope, never a trust decision: this says "these
+    /// digests", and the destination re-hashes every one of them exactly as it would
+    /// for a namespace copy.
+    pub only: Option<BTreeSet<String>>,
+    /// The reason recorded on every ref this run writes, overriding [`Options::reason`].
+    ///
+    /// A reflog is durable evidence of who moved what, so the verb that actually ran
+    /// belongs in it: an import's ref writes say `import from …` and not `fetch from …`.
+    pub reason: Option<String>,
 }
 
 impl Options {
@@ -120,12 +137,16 @@ impl Options {
             budgets: Budgets::default(),
             now_us: crate::attest::MICROS * crate::time::Timestamp::now().as_unix() as i64,
             record_arrivals: true,
+            only: None,
+            reason: None,
         }
     }
 
     /// The reason a pointer write records, so a store's reflog says which verb made it.
     fn reason(&self) -> String {
-        format!("{} from {}", self.verb.as_str(), self.from)
+        self.reason
+            .clone()
+            .unwrap_or_else(|| format!("{} from {}", self.verb.as_str(), self.from))
     }
 }
 
@@ -933,6 +954,13 @@ fn record_refusal(name: &RefName, bytes: &[u8], digest: &Oid) -> Option<Refusal>
 
 /// Which refs a run is about.
 fn in_scope(reference: &Ref, options: &Options, change_subjects: &BTreeSet<String>) -> bool {
+    // An explicit selection wins, and is not narrowed by anything else: it was chosen
+    // record by record by a caller that read each record's citations and re-verified it
+    // (D9). A `--commit` or `--change` filter on top of a closure would only be a way to
+    // forget part of one, and a partial closure is the failure D9 exists to prevent.
+    if let Some(only) = &options.only {
+        return only.contains(&reference.oid.hex());
+    }
     if options.change.is_none() && options.commit.is_none() {
         return true;
     }
@@ -1167,6 +1195,25 @@ fn change_pointers(
             Some(ChangeRef::Attempt { index, .. }) => index,
             _ => continue,
         };
+        // Under a closure selection a pointer may only be moved to an attempt this run
+        // was allowed to take: a ref naming a digest the destination does not hold is
+        // the one advertisement D8 rule 1 forbids, and it is the caller's selection,
+        // not this store's choice, that decided which attempts are here.
+        if let Some(only) = &options.only
+            && !only.contains(&named.oid.hex())
+        {
+            out.push(PointerMove {
+                reference: head_ref.as_str().to_string(),
+                resolved: named.name.as_str().to_string(),
+                action: "nothing".to_string(),
+                detail: Some(
+                    "the attempt this pointer names is not in the selection being copied, so there is \
+                     no digest here for a pointer to point at"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
         let here = to.get_ref(&head_ref)?;
         let (action, detail) = match &here {
             Some(existing) if existing.oid == named.oid => ("already".to_string(), None),
@@ -1300,6 +1347,11 @@ pub const IMPORT_SCHEMA_VERSION: u32 = 1;
 /// What a namespace copy says about closure: it did not walk one, and says so instead
 /// of claiming a completeness it did not check.
 pub const CLOSURE_NOT_WALKED: &str = "not-walked";
+/// What `gitiup attest import` records when it walked a record's citations and every
+/// edge had a foot at the source ([ADR-0005 D9](../../../../docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md)).
+/// It is a statement about the closure of *this* record, not a promise about the rest
+/// of the store.
+pub const CLOSURE_COMPLETE: &str = "complete";
 
 /// What a copy records about each digest that landed, at `kv/import/<digest>`.
 ///
@@ -1307,6 +1359,12 @@ pub const CLOSURE_NOT_WALKED: &str = "not-walked";
 /// — and it is local by construction: arrival records are never portable, and
 /// `verified_by`/`verify_exit` are absent from every record a copy writes, because a
 /// copy verifies nothing (D3).
+///
+/// Those two fields exist for one verb. `gitiup attest import` fills them in because it
+/// runs the verify ladder before it files (D4), and they are an audit note about a
+/// machine — *this box checked this, and here is the verdict it reached* — never an
+/// input to a later one. A reader believes what it re-checks, not what its neighbour
+/// reports having believed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arrival {
@@ -1326,6 +1384,20 @@ pub struct Arrival {
     pub arrived_at_us: i64,
     /// Whether this record's closure is present.
     pub closure: String,
+    /// Who checked it, spelled the way the reader spelled its own trust list — set by
+    /// `gitiup attest import`, and absent from every record a copy writes (D3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_by: Option<String>,
+    /// The exit code the verify ladder produced: `0`, `6`, `7` or `8`. Additive under
+    /// D10's "additive only" rule, and read strictly like everything an auditor leans on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_exit: Option<u8>,
+    /// Why the object the proof is about was allowed to be absent, in the operator's own
+    /// words (`--allow-missing-subject`, `--proofs-only`). Present only when it was
+    /// excused, and never a silent blank (D9): "deliberately not here" and "lost" are
+    /// different sentences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_excused: Option<String>,
 }
 
 impl Arrival {
@@ -1339,6 +1411,36 @@ impl Arrival {
             arrived_from: from.to_string(),
             arrived_at_us: now_us,
             closure: CLOSURE_NOT_WALKED.to_string(),
+            verified_by: None,
+            verify_exit: None,
+            subject_excused: None,
+        }
+    }
+
+    /// The record for one digest an *import* walked and then re-verified (D4, D5).
+    ///
+    /// `refs` is every ref the importing store advertises it under, which a closure walk
+    /// knows and a namespace listing does not; `verified_by` and `verify_exit` say who
+    /// checked it and with what verdict.
+    pub fn walked(
+        digest: &Oid,
+        refs: impl IntoIterator<Item = String>,
+        from: &str,
+        now_us: i64,
+        verified_by: &str,
+        verify_exit: u8,
+    ) -> Arrival {
+        Arrival {
+            record_type: IMPORT_TYPE.to_string(),
+            schema_version: IMPORT_SCHEMA_VERSION,
+            digest: digest.hex(),
+            refs: refs.into_iter().collect(),
+            arrived_from: from.to_string(),
+            arrived_at_us: now_us,
+            closure: CLOSURE_COMPLETE.to_string(),
+            verified_by: Some(verified_by.to_string()),
+            verify_exit: Some(verify_exit),
+            subject_excused: None,
         }
     }
 
@@ -1362,7 +1464,18 @@ fn write_arrival(
     options: &Options,
 ) -> HostResult<()> {
     let arrival = Arrival::new(digest, reference, &options.from, options.now_us);
-    to.put_cas(&portable::IMPORT, &arrival.canonical_bytes()?)?;
+    record(to, &arrival)
+}
+
+/// File one arrival record.
+///
+/// Public because `gitiup attest import` writes its own — it knows the closure, the
+/// verifier and the verdict, and a namespace copy records none of those — so that there
+/// is still exactly one place that knows where the record goes and how it is spelled
+/// (D5). The write is a create-only CAS write like every other record: the record is
+/// itself content-addressed, so the same account written twice is a no-op.
+pub fn record(host: &dyn Host, arrival: &Arrival) -> HostResult<()> {
+    host.put_cas(&portable::IMPORT, &arrival.canonical_bytes()?)?;
     Ok(())
 }
 

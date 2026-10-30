@@ -231,23 +231,23 @@ pub fn verify(args: &[String]) -> Result<(), CliError> {
 /// under a policy that trusted every key on the box is not the same fact as
 /// "accepted" against the owner's list — so how the trust list was decided is part
 /// of the output, not an implementation detail.
-struct PolicySpec {
-    policy: Policy,
+pub(crate) struct PolicySpec {
+    pub(crate) policy: Policy,
     /// Where the policy file came from, if one did.
-    file: Option<String>,
+    pub(crate) file: Option<String>,
     /// How the trust list was decided, in the words the output prints.
-    trust_source: String,
+    pub(crate) trust_source: String,
     /// The trusted key ids, unless any key was accepted (then empty, and
     /// [`PolicySpec::any_key`] says why).
-    trusted: Vec<String>,
+    pub(crate) trusted: Vec<String>,
     /// True when nothing about the signer's identity was trusted.
-    any_key: bool,
+    pub(crate) any_key: bool,
     /// Flags that narrowed the policy beyond the file, so a re-read says which.
-    notes: Vec<String>,
+    pub(crate) notes: Vec<String>,
 }
 
 impl PolicySpec {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         let policy = &self.policy;
         let mut out = Map::new();
         insert(&mut out, "file", self.file.clone().map(Value::String));
@@ -362,7 +362,7 @@ impl PolicySpec {
     }
 
     /// The one-line summary the table prints under the document's own facts.
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let policy = &self.policy;
         let mut parts = vec![
             format!("trust: {}", self.trust_source),
@@ -406,7 +406,7 @@ fn policy_path(args: &Args) -> Option<String> {
 }
 
 /// Build the policy: the file first, then every flag, then the trust fallback.
-fn policy_spec(args: &Args) -> Result<PolicySpec, CliError> {
+pub(crate) fn policy_spec(args: &Args) -> Result<PolicySpec, CliError> {
     let file = policy_path(args);
     let mut policy = match &file {
         Some(path) => {

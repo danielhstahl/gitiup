@@ -155,9 +155,9 @@ pub fn push(args: &[String]) -> Result<(), CliError> {
 }
 
 /// One endpoint of a copy, opened and described.
-struct Side {
-    host: Box<dyn Host>,
-    what: String,
+pub(crate) struct Side {
+    pub(crate) host: Box<dyn Host>,
+    pub(crate) what: String,
 }
 
 fn transport(args: &[String], verb: Verb) -> Result<(), CliError> {
@@ -333,7 +333,10 @@ fn near_or_far(
 ///
 /// In that order on purpose: a working directory that happens to contain a directory
 /// called `mirror` must not silently stop meaning the remote called `mirror`.
-fn open_side(value: &str, config: &Option<(PathBuf, HostConfig)>) -> Result<Side, CliError> {
+pub(crate) fn open_side(
+    value: &str,
+    config: &Option<(PathBuf, HostConfig)>,
+) -> Result<Side, CliError> {
     if let Some((_, host_config)) = config
         && let Ok(remote) = host_config.remote(value)
     {
