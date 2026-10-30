@@ -671,6 +671,14 @@ pub(crate) fn plan(args: &Args, store: &Opened, record: &ChangeRecord) -> Result
         ));
     }
 
+    // The quarantines, read as what they are: an input to selection and nothing else. The
+    // keys an owner has kept out are excluded from every round this opens - through
+    // `RoundInputs::excluding`, so the exclusion is inside the signed round record and the
+    // roster stays byte-unchanged (giti-zp1.8).
+    let kept = crate::quarantine::kept_out(store, &trust, roster.epoch, now)?;
+    notes.extend(kept.notes.iter().cloned());
+    let quarantined = kept.list();
+
     // The selector: whoever publishes the change derives the seed, unless a delegated
     // secret is handed over. An agent-held key cannot: HKDF-Extract needs the seed, and an
     // agent — correctly — will not hand it out.
@@ -803,7 +811,10 @@ pub(crate) fn plan(args: &Args, store: &Opened, record: &ChangeRecord) -> Result
         // Applied before the seed is derived, so the audit record says `excluded` for every
         // one of the author's boxes instead of leaving it to whichever filter happened to
         // bite first.
-        .excluding(&roster, &proposer)?;
+        .excluding(&roster, &proposer)?
+        // ...and the same door for every key an owner has quarantined: one mechanism, one
+        // place an exclusion can come from, and the round record publishes both.
+        .excluding(&roster, &quarantined)?;
         // The owner's policy says how the seats must submit, and the round says it to
         // everyone afterwards: `gitiup work` commits before it reveals because the round
         // says `sealed`, not because anybody passed a flag (giti-zp1.6).

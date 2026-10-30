@@ -789,11 +789,22 @@ fn derive(
     }
     let selector = signing_key(args, here)?;
     let secret = selection_secret(args, &selector)?;
-    let exclusions: BTreeSet<String> = args
+    let mut exclusions: BTreeSet<String> = args
         .all("--exclude")
         .iter()
         .map(|value| key_id_of(here, value))
         .collect::<Result<_, _>>()?;
+    // The owner's quarantines, read through the one door they have (giti-zp1.8): the names
+    // join the exclusion set the round signs, and the roster is not touched. A selector
+    // with no store or no trust root simply has nothing to apply, and says which it has.
+    let kept = match (opened, trust) {
+        (Some(opened), Some((trust, _))) => {
+            crate::quarantine::kept_out(opened, trust, roster.epoch, now)?
+        }
+        _ => crate::quarantine::Kept::empty(),
+    };
+    notes.extend(kept.notes.iter().cloned());
+    exclusions.extend(kept.names.iter().cloned());
     let inputs = RoundInputs {
         schema_version: gitiup_quorum::select::SELECTION_SCHEMA_VERSION,
         kind: None,

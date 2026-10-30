@@ -21,6 +21,8 @@
 //! refs/gitiup/reveal/<change>/<job>/<slot>       one verifier's submission (phase 2 of a
 //!                                                sealed round: the bytes it promised)
 //! refs/gitiup/verdict/<change>/<job>             the signed verdict
+//! refs/gitiup/quarantine/<slot>/<digest>         one owner's quarantine of one key
+//! refs/gitiup/quarantine-lift/<slot>/<digest>    one owner ending one
 //! ```
 //!
 //! Every write here is a CAS write, and every read re-checks canonical bytes and
@@ -70,7 +72,9 @@
 //! rejection in a signed verdict with a silent `missing` seat — so the bytes go in, and
 //! the verdict names them ([`crate::commit`] carries the argument).
 
-use gitiup_attest::{AttestationDoc, Signer, TimeUs};
+use std::collections::BTreeSet;
+
+use gitiup_attest::{AttestationDoc, Digest, Signer, TimeUs};
 use gitiup_host::{
     Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefDeletion, RefName, RefQuery, RefUpdate,
 };
@@ -80,6 +84,7 @@ use crate::error::{Error, Result};
 use crate::job::{
     Advertisement, JobAddress, Lease, LeaseRequest, Taken, record_steal, short_slot, ttl_text,
 };
+use crate::quarantine::{Ledger, Quarantine, QuarantineLift};
 use crate::record::{Record, short_key};
 use crate::roster::{Revocation, Roster, SignUp, Withdrawal};
 use crate::round::Round;
@@ -104,6 +109,11 @@ pub mod ns {
     pub const REVOCATION: Namespace = Namespace::const_new("revocation");
     /// Endorsements (advice with a signature on it — never a selection input).
     pub const ENDORSEMENT: Namespace = Namespace::const_new("endorsement");
+    /// Quarantine records (giti-zp1.8): an owner keeping a key out of the pool for N
+    /// epochs. One ref per record, so a quarantine is a trail and never an edit.
+    pub const QUARANTINE: Namespace = Namespace::const_new("quarantine");
+    /// Records ending a quarantine early (giti-zp1.8).
+    pub const QUARANTINE_LIFT: Namespace = Namespace::const_new("quarantine-lift");
     /// Per-key submission slots: one attestation per seat, claimed CAS. In a sealed
     /// round this is phase 2 — the bytes the seat promised in [`COMMIT`].
     pub const REVEAL: Namespace = Namespace::const_new("reveal");
@@ -270,6 +280,23 @@ fn gitiup_ref(rel: &str, what: &'static str) -> Result<RefName> {
 
 fn host_error(error: gitiup_host::HostError) -> Error {
     Error::store("ref name", &error)
+}
+
+/// A digest used as a ref component: 64 lower-case hex, the same shape rule a seat slot
+/// follows, because both are hashes wearing a pathname.
+fn require_hex(text: &str, what: &'static str) -> Result<()> {
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(Error::invalid(
+            "store",
+            format!("{what} '{text}' is not 64 lower-case hex characters"),
+        )
+        .with_hint("a record's ref carries the hex of its own digest, never the `sha256:` form"));
+    }
+    Ok(())
 }
 
 /// A change or job id must survive the journey into a ref name.
@@ -469,6 +496,216 @@ pub fn list_revocations(
     Ok(out)
 }
 
+/// `refs/gitiup/quarantine/<slot>/<digest>` — one quarantine record, addressed by its own
+/// digest.
+///
+/// One ref per **record** rather than one per key (the way `revocation/` works) because a
+/// quarantine is a history and not a status: a second quarantine for the same key adds a
+/// record instead of moving a pointer, so a quarantine cannot be laundered by being
+/// overwritten and the audit trail an excluded key is entitled to read is actually there.
+pub fn quarantine_ref(slot: &str, digest_hex: &str) -> Result<RefName> {
+    crate::job::check_slot(slot)?;
+    require_hex(digest_hex, "quarantine digest")?;
+    gitiup_ref(&format!("quarantine/{slot}/{digest_hex}"), "quarantine ref")
+}
+
+/// `refs/gitiup/quarantine/<slot>` — every record one key has against it.
+pub fn quarantine_prefix(slot: &str) -> Result<String> {
+    crate::job::check_slot(slot)?;
+    Ok(format!("refs/gitiup/quarantine/{slot}"))
+}
+
+/// `refs/gitiup/quarantine-lift/<slot>/<digest>` — one lift record.
+pub fn lift_ref(slot: &str, digest_hex: &str) -> Result<RefName> {
+    crate::job::check_slot(slot)?;
+    require_hex(digest_hex, "quarantine lift digest")?;
+    gitiup_ref(
+        &format!("quarantine-lift/{slot}/{digest_hex}"),
+        "quarantine lift ref",
+    )
+}
+
+/// Publish a signed quarantine: CAS-create its own ref, idempotent on a retry.
+///
+/// The record's signatures are checked here (crypto, not trust): a store is not a trust
+/// root and must not be able to accept a forged quarantine, and a later reader must never
+/// have to wonder whether the store invented one. *Who is trusted as an owner* is the
+/// reader's decision and belongs to [`quarantine_exclusions`].
+pub fn publish_quarantine(host: &dyn Host, quarantine: &Quarantine) -> Result<Oid> {
+    quarantine.verify_signatures()?;
+    let bytes = quarantine.canonical_bytes()?;
+    let digest = quarantine.digest()?;
+    put_record(
+        host,
+        &ns::QUARANTINE,
+        &quarantine_ref(&quarantine.slot(), &digest.hex())?,
+        &bytes,
+        "quarantine",
+    )
+}
+
+/// Publish a signed lift, naming the quarantine it ends.
+pub fn publish_lift(host: &dyn Host, lift: &QuarantineLift) -> Result<Oid> {
+    lift.verify_signatures()?;
+    let bytes = lift.canonical_bytes()?;
+    let digest = lift.digest()?;
+    put_record(
+        host,
+        &ns::QUARANTINE_LIFT,
+        &lift_ref(&lift.slot(), &digest.hex())?,
+        &bytes,
+        "lift",
+    )
+}
+
+/// Every quarantine record the store holds, each signature re-checked.
+///
+/// No trust list, for the reason [`Quarantine::verify_signatures`] gives: the trail is
+/// public, and a key that has been quarantined is entitled to read why.
+pub fn list_quarantines(host: &dyn Host) -> Result<Vec<Quarantine>> {
+    let mut out = Vec::new();
+    for reference in host
+        .list_refs(&RefQuery::prefix("refs/gitiup/quarantine/"))
+        .map_err(|e| Error::store("list quarantines", &e))?
+    {
+        let name = reference.name.as_str();
+        // `refs/gitiup/quarantine-lift/**` shares the ref root; it is a different record
+        // class and must not be parsed as one.
+        if name.starts_with("refs/gitiup/quarantine-lift/") {
+            continue;
+        }
+        if let Some(bytes) = host
+            .get(&reference.oid)
+            .map_err(|e| Error::store("get quarantine", &e))?
+        {
+            let record = Quarantine::from_canonical_bytes(&bytes)?;
+            record.verify_signatures()?;
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// Every lift record the store holds, signature-checked.
+pub fn list_lifts(host: &dyn Host) -> Result<Vec<QuarantineLift>> {
+    let mut out = Vec::new();
+    for reference in host
+        .list_refs(&RefQuery::prefix("refs/gitiup/quarantine-lift/"))
+        .map_err(|e| Error::store("list quarantine lifts", &e))?
+    {
+        if let Some(bytes) = host
+            .get(&reference.oid)
+            .map_err(|e| Error::store("get quarantine lift", &e))?
+        {
+            let record = QuarantineLift::from_canonical_bytes(&bytes)?;
+            record.verify_signatures()?;
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// Everything the store has ever said about who is kept out.
+pub fn quarantine_ledger(host: &dyn Host) -> Result<Ledger> {
+    Ledger::new(list_quarantines(host)?, list_lifts(host)?)
+}
+
+/// What the store's quarantines do to a selection at roster epoch `epoch`.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    /// Names to hand [`RoundInputs::excluding`](crate::select::RoundInputs::excluding) —
+    /// the record's own key id, which `excluding` closes over the identity family.
+    pub named: BTreeSet<String>,
+    /// Each record believed at this epoch, with the digest it is cited by.
+    pub believed: Vec<(Quarantine, Digest)>,
+    /// Each record **not** applied, with the sentence saying why (not trusted by this
+    /// caller; lifted; expired). Never dropped quietly: a quarantine that silently stopped
+    /// applying is a quarantine nobody can audit.
+    pub ignored: Vec<(Quarantine, String)>,
+}
+
+impl Applied {
+    /// Whether any of it changes the pool.
+    pub fn empty(&self) -> bool {
+        self.believed.is_empty()
+    }
+}
+
+/// The store's quarantines, filtered by what *this* caller trusts and by their own clocks.
+///
+/// A quarantine is only a selection input when a key the caller trusts as an owner signed
+/// it — exactly the rule a verdict follows, and for the same reason: "the store holds a
+/// signed thing" is not an argument. Records that fail that test are reported in
+/// [`Applied::ignored`] rather than skipped, because the difference between "ignored
+/// because untrusted" and "does not exist" is the difference between a store bug and a
+/// store lying.
+pub fn quarantine_exclusions(
+    host: &dyn Host,
+    owner_trust: &gitiup_attest::Trust,
+    epoch: u64,
+    now: gitiup_attest::TimeUs,
+) -> Result<Applied> {
+    let ledger = quarantine_ledger(host)?;
+    let mut applied = Applied {
+        named: BTreeSet::new(),
+        believed: Vec::new(),
+        ignored: Vec::new(),
+    };
+    for filed in &ledger.quarantines {
+        let record = &filed.quarantine;
+        if record.verify(owner_trust).is_err() {
+            applied.ignored.push((
+                record.clone(),
+                format!(
+                    "no signature on it is from a key this machine trusts as an owner \
+                     (--owner); it is public and it is not applied"
+                ),
+            ));
+            continue;
+        }
+        if let Some(lift) = ledger.lift_of(filed, epoch) {
+            applied.ignored.push((
+                record.clone(),
+                format!(
+                    "lifted by {} from epoch {}",
+                    short_key(&lift.issuer),
+                    lift.effective_epoch
+                ),
+            ));
+            continue;
+        }
+        if !record.covers_epoch(epoch) {
+            applied.ignored.push((
+                record.clone(),
+                if epoch < record.start_epoch {
+                    format!(
+                        "starts at epoch {}, which this round does not pin yet",
+                        record.start_epoch
+                    )
+                } else {
+                    format!("ran out at epoch {}", record.ends_epoch())
+                },
+            ));
+            continue;
+        }
+        if !record.clock_live(now) {
+            applied.ignored.push((
+                record.clone(),
+                format!(
+                    "its clock bound {} passed while the roster sat on epoch {epoch}",
+                    TimeUs(record.expires_at_us.unwrap_or(0)).to_rfc3339()
+                ),
+            ));
+            continue;
+        }
+        applied.named.insert(record.key_id.clone());
+        applied
+            .believed
+            .push((record.clone(), filed.digest.clone()));
+    }
+    Ok(applied)
+}
+
 /// Publish a round record. Re-publishing the same round is idempotent; publishing a
 /// *different* round for the same change/job/attempt is a conflict, because that would
 /// be two different quorums for one change, which is the thing the seed exists to make
@@ -523,6 +760,56 @@ pub fn rounds_for(host: &dyn Host, change: &str) -> Result<Vec<Round>> {
             .then(a.inputs.attempt.cmp(&b.inputs.attempt))
     });
     Ok(out)
+}
+
+/// Every round the store holds, up to `limit` blobs fetched.
+///
+/// This is the one listing that has to be bounded by a cap rather than by a key: a store
+/// with ten thousand rounds cannot be summarised by fetching ten thousand records, and a
+/// command that tried would look like a hung one. `limit` is the caller's budget and
+/// [`Scan::truncated`] is the honest remainder — a `history` report that scanned part of
+/// the store says so instead of implying it read everything.
+pub fn scan_rounds(host: &dyn Host, limit: usize) -> Result<Scan> {
+    let refs = host
+        .list_refs(&RefQuery::prefix("refs/gitiup/round/"))
+        .map_err(|e| Error::store("list rounds", &e))?;
+    let seen = refs.len();
+    let fetched = limit.min(seen);
+    let mut rounds = Vec::new();
+    for reference in refs.into_iter().take(fetched) {
+        if let Some(bytes) = host
+            .get(&reference.oid)
+            .map_err(|e| Error::store("fetch round", &e))?
+        {
+            rounds.push(Round::from_canonical_bytes(&bytes)?);
+        }
+    }
+    rounds.sort_by(|a, b| {
+        a.inputs
+            .change_id
+            .cmp(&b.inputs.change_id)
+            .then(a.inputs.job_id.cmp(&b.inputs.job_id))
+            .then(a.inputs.attempt.cmp(&b.inputs.attempt))
+    });
+    Ok(Scan {
+        rounds,
+        seen,
+        fetched,
+        truncated: fetched < seen,
+    })
+}
+
+/// What [`scan_rounds`] read: the records, how many refs exist, and how many were fetched.
+#[derive(Debug, Clone)]
+pub struct Scan {
+    /// The rounds, ordered by `(change, job, attempt)`.
+    pub rounds: Vec<Round>,
+    /// Round refs the store named, whether or not they were fetched.
+    pub seen: usize,
+    /// How many records were fetched — less than `seen` exactly when it was truncated.
+    pub fetched: usize,
+    /// Whether the scan stopped early.
+    pub truncated: bool,
 }
 
 /// Fetch the round for one change/job/attempt.

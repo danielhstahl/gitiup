@@ -10,8 +10,11 @@ that answer (`gitiup verify change`) and the change merges (`gitiup change merge
 it does not come out clean there are two more commands: `gitiup quorum dispute` reads the
 evidence behind the state and `gitiup quorum retry` opens a wider attempt under a cap the
 policy signed — exit 9 when the attempts have run out.
-What is *not* here is in [Still open](#still-open-with-the-reason) — quarantine and
-reputation, endorsement records, rate limits — and none of it is on the path above.
+A key that diverges can be kept out of the next selections
+([`gitiup participant quarantine`](#keeping-a-key-out-gitiup-participant-quarantine)), which
+is an exclusion and never a roster edit. What is *not* here is in
+[Still open](#still-open-with-the-reason) — endorsement records and rate limits — and none
+of it is on the path above.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -539,10 +542,11 @@ needs most.
   reveals land, and — if they disagree with its own — simply withholds its reveal. Its
   commitment then counts as `missing` and its seat is wasted; X has traded a vote for a
   look. That is a real option, and the answer to it is not cryptography: a `missing` is a
-  miss, misses are what reputation and quarantine
-  ([giti-zp1.8](#still-open-with-the-reason)) count, and the protocol's job was never to make cheating
-  impossible but to make it cost the cheater the thing it came for. Sealing removes the
-  free copy; it does not install good faith.
+  miss, misses are what [reputation](#what-absence-is-worth-gitiup-participant-history)
+  counts and what [quarantine](#keeping-a-key-out-gitiup-participant-quarantine) refuses to
+  punish, and the protocol's job was never to make cheating impossible but to make it cost
+  the cheater the thing it came for. Sealing removes the free copy; it does not install
+  good faith.
 * **A commitment binds bytes, not truths.** The preimage is the canonical attestation, and
   an attestation's claims are self-asserted ([ADR-0001 D9](adr/0001-attestation-encoding-hash-and-signature.md)).
   Sealing a claim does not make it true; it makes it unretractable.
@@ -919,6 +923,145 @@ worth waiting for, and the refusal says what to do instead of a fourth attempt: 
 that survived three verifications is a bug to fix and re-submit as a new change attempt,
 which is a different head and starts its own count.
 
+## Keeping a key out: `gitiup participant quarantine`
+
+Selection always had a door for this. `RoundInputs::excluding` is an input to the
+seed-derived ordering, it is inside the signed round record, and every auditor reads it —
+which is exactly why [ADR-0002 D5](adr/0002-roster-verifier-selection-and-sybil-resistance.md)
+said reputation may walk through it and nowhere else. What the loop never had was a way to
+*remember*: every verdict recomputes from the store's own records, which is the right rule
+for an auditor and no way at all to say "this key has now diverged twice".
+
+The rule, in one sentence: **verdict history comes back as an exclusion, never as a roster
+edit.**
+
+```sh
+# a verifier whose result diverged from the consensus a filed verdict reached
+gitiup participant quarantine "SHA256:…" --reason divergence \
+    --change chg-6a6a --job build/matrix/linux-x86_64 \
+    --epochs 3 --store ./store --key owner --publish
+
+# what the store has ever said about who is kept out, and what its roster's history says
+gitiup participant history --store ./store
+
+# the appeal: a human act, signed by an owner, and the only one there is
+gitiup participant unquarantine "SHA256:…" --note "host rebuilt and re-tested" \
+    --store ./store --key owner --publish
+```
+
+Each is an owner-signed record, CAS-written under its own ref and never edited:
+`refs/gitiup/quarantine/<slot>/<digest>` and
+`refs/gitiup/quarantine-lift/<slot>/<digest>` — one ref per **record**, not one per key, so
+a second quarantine about the same key is a second record and a quarantine cannot be
+laundered by being overwritten ([`quarantine.rs`](../crates/gitiup-quorum/src/quarantine.rs)).
+
+### Exclusion, in one place, and nowhere else
+
+* **the roster does not move.** A quarantine never touches an epoch, an entry or a tier:
+  the roster is the owner's signed trust list and "keep them out for three epochs" is a
+  different sentence from "I never vouched for them". A *permanent* removal is
+  `gitiup participant approve --drop <key>`, where it is visible as what it is — which is
+  also why `--epochs` is capped at 52: a quarantine long enough to be permanent is a roster
+  edit wearing a costume, and the refusal says so.
+* **one door.** Every command that opens a round asks one question
+  ([`quarantine_exclusions`](../crates/gitiup-quorum/src/store.rs)) and feeds the answer to
+  `RoundInputs::excluding`: `gitiup select`, `gitiup change submit`, `gitiup quorum retry`.
+  There is no filter inside the tally, no weight in the score, and no second list to keep in
+  sync — so the exclusion is inside the signed round record, where an auditor reads it
+  beside the proposer's family.
+* **a name reaches the family.** Excluding one box excludes every box of that principal,
+  the same closure ADR-0002 D4 applies to an author, because a principal's boxes are
+  interchangeable *to that principal*. The command prints how many roster entries a name
+  reaches, so nobody learns it from a surprise.
+* **prospective only.** A round that is already open keeps its seats. Voiding seats
+  retroactively is [`Revocation`](../crates/gitiup-quorum/src/roster.rs)'s job, with its own
+  reasons and its own voids matrix, and a record that did both would make "was it stolen" and
+  "was it wrong" the same question.
+* **a quarantine counts only when a trusted owner signed it** — the rule a verdict follows,
+  for the reason the store is not a trust root. Records signed by somebody else stay
+  readable and are reported as *not applied*, never silently dropped.
+
+### What a quarantine has to stand on
+
+The reason is a closed vocabulary, because "they were wrong twice" and "I do not like their
+owner" must not land in the same field:
+
+| `--reason` | what it cites | the fact behind it |
+|---|---|---|
+| `divergence` | a **filed, `verified`** verdict | the key signed a `ResultDigest` the consensus did not |
+| `commitment_mismatch` | a verdict's `rejected` row | in a sealed round it revealed bytes that do not open its own commitment |
+| `capability_lie` | a verdict's `rejected` row (`arch_mismatch`, `sandbox_mismatch`) | its own signed environment contradicts the claim its seat was taken on |
+| `evidence_replay` | `no_commitment`, `foreign_commitment`, `stale_commitment`, `wrong_round` | its evidence belongs to another round or another seat |
+| `bad_signature` | `bad_signature`, `unsigned`, `many_signers` | its own claim does not verify |
+| `owner_decision` | nothing, and `--note` says why | the owner's judgement, which is allowed to exist as long as it is signed and stated |
+
+Three refusals carry the argument, and all three exit 6:
+
+* **absence is not a ground.** `--reason absence` (and `silent`, `missing`, `no_show`,
+  `late`, `timeout`) is refused by name, and so is citing a verdict in which the key's only
+  row is `missing`. Silence has a hundred innocent causes, and a volunteer that learns "not
+  showing up gets me in trouble" learns to show up with a copied answer — the exact
+  behaviour [sealing](#committing-before-revealing-a-sealed-round) exists to catch. Silence
+  is scored instead, [below](#what-absence-is-worth-gitiup-participant-history).
+* **a reason that claims a fact has to cite it**, and the citation must be a **filed**
+  verdict: a punishment cites a document that still exists next week, not a tally that is
+  currently in somebody's process memory (which hashes differently every time it is
+  recomputed). If the verdict says `commitment_mismatch` and the owner types `--reason
+  divergence`, the evidence names the reason and the command says so.
+* **a `failed` verdict has no divergence to point at.** Where the quorum reached no
+  consensus, nobody can be shown to have diverged from it; escalating is the answer, and an
+  owner who really means it says `owner_decision` and signs their judgement rather than
+  borrowing the verdict's authority for it.
+
+A quarantine runs for `--epochs` roster epochs and also carries a clock bound — three
+epochs at the roster's own published interval — so a store whose owner stops publishing
+epochs cannot turn "three epochs" into a life sentence. `history` prints whichever one ends
+it.
+
+### The appeal is a human act
+
+There is no `gitiup participant appeal`, no vote, no timer and no cool-down, and the CLI says
+so on the spot instead of inventing a ballot an owner would only have to override. The way
+back in is `gitiup participant unquarantine`, which an owner signs, which **names the record
+it ends** by digest (two quarantines about one key are two decisions to undo, and "the
+current one" would be a guess), and which cannot backdate: a lift ends an exclusion from an
+epoch forward, because the rounds that ran without the key are a fact about those rounds.
+Lifting what is already lifted or never was is a refusal, not a no-op that looks like
+success.
+
+### What absence is worth: `gitiup participant history`
+
+`history` prints two halves, and the difference between them is the ticket:
+
+```sh
+gitiup participant history --store ./store                    # text, for an owner
+gitiup participant history --store ./store --key "SHA256:…"   # one key's whole record
+gitiup participant history --store ./store --json | jq .reputation.keys
+```
+
+* **the trail is public.** Every record, its issuer, its cited verdict, its window and
+  whether it is in force at the epoch asked about. A quarantined key can read why it was
+  quarantined with no keys of its own — the signatures are checked, and *"believed by this
+  machine"* is printed beside each row because who to trust is the reader's policy, not a
+  condition of being told.
+* **the score is recomputed, never remembered.** `history` re-tallies the store's rounds the
+  way `gitiup quorum verdict` does (bounded by `--max-rounds`, and it says when it stopped)
+  and prints, per key: seats held, counted, diverged, refused, silent, and — in a column
+  called *what a quarantine could cite* — exactly the counts that
+  `--reason` may be written for. Silence is never in that column.
+* **and the roster reads as what it is.** Absence is the difference between a roster of
+  eleven and a quorum of four wearing eleven names, so it gets a number: seats handed out
+  versus seats that answered, for every key and for the store. The threshold is stated in
+  the open — **a third of the seats handed out went silent** — because a subtler rule is a
+  reputation weight again, and a blunt one can be recomputed in your head from the table
+  printed beside it.
+
+What a score may never do is decide anything. [ADR-0002 D5](adr/0002-roster-verifier-selection-and-sybil-resistance.md)
+allows reputation two powers — exclude, and demote — and forbids one: to be a multiplier.
+Nothing here touches a score or a seat ordering; the only thing a count can become is a
+quarantine an owner signs, and every row that could support one names the verdict it came
+from.
+
 ## Every command, in one place
 
 Nothing here is a sketch of a command; each line is what you type, and `gitiup help`,
@@ -930,6 +1073,8 @@ a verb that exists but is not documented is a build failure.
 |---|---|---|
 | may this box verify? | `gitiup participant register --ram-mb 32768 --disk-mb 262144 --sandbox docker --sandbox-level 2 --arch x86_64 --out signup.json`, then the owner's `gitiup participant approve --from signup.json --tier endorsed --store ./store --publish` | [`roster`](../crates/gitiup-quorum/src/roster.rs) |
 | who is on the epoch, and what does each entry qualify for? | `gitiup participant list --store ./store --require-arch x86_64 --require-ram-mb 16384`, `gitiup participant verify-roster --store ./store` | `roster`, [`capability`](../crates/gitiup-quorum/src/capability.rs) |
+| a key diverged, and what keeps it out of the next rounds? | `gitiup participant quarantine <key-id> --reason divergence --change chg-6a6a --job build/matrix/linux-x86_64 --epochs 3 --store ./store --key owner --publish` | [`quarantine`](../crates/gitiup-quorum/src/quarantine.rs) |
+| who is out, why, and does this roster ever turn up? | `gitiup participant history --store ./store` (`--key`, `--change`, `--json`); the appeal is `gitiup participant unquarantine <key-id> --store ./store --key owner --publish` | `quarantine`, [`reputation`](../crates/gitiup-quorum/src/reputation.rs) |
 | a key is dead, and what does that void? | `gitiup participant revoke <key-id> --reason compromised --store ./store --publish` | `roster`, [`gate`](../crates/gitiup-quorum/src/gate.rs) |
 | who verifies this job, and why them? | `gitiup select --change chg-1 --job build/matrix/linux-x86_64 --head "sha1:$(git rev-parse HEAD)" --proposer ada --require-arch x86_64 --store ./store --explain --publish`; and with no key at all, `gitiup select --change chg-1 --store ./store --explain` | [`select`](../crates/gitiup-quorum/src/select.rs), [`round`](../crates/gitiup-quorum/src/round.rs) |
 | a change opens the rounds its policy asked for | `gitiup change submit --repository . --base main --store ./store` (`--no-quorum` opts out of it out loud, `--explain` prints the audit table) | [`gitiup/src/quorum.rs`](../crates/gitiup/src/quorum.rs) |
@@ -946,13 +1091,6 @@ a verb that exists but is not documented is a build failure.
 
 The loop above is what shipped. What did not, and where it plugs in:
 
-* **quarantine and reputation as selection inputs** (giti-zp1.8). The exclusions are
-  already an input to selection (`RoundInputs::excluding`, carried forward by
-  `gitiup quorum retry`), and a verdict already names every `missing` and `rejected` seat
-  with a code — so quarantine is a policy that *writes* exclusions from that evidence, and
-  the two ends exist with the middle missing. What does not exist is anybody remembering
-  that a key was late twice: every verdict recomputes from the store's own records, which
-  is the right rule for an auditor and no way to have a memory.
 * **endorsement records** ([ADR-0002 D6](adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
   The `ENDORSEMENT` namespace is declared and unused: a tier can be *set* to `endorsed` by
   an owner's `approve --tier endorsed`, but the signed endorsement document that would be
@@ -988,6 +1126,8 @@ cargo test -p gitiup --test quorum_attest_cli -- --nocapture
 cargo test -p gitiup --test quorum_attest_change_cli -- --nocapture
 cargo test -p gitiup --test quorum_dispute_cli -- --nocapture
 cargo test -p gitiup --test quorum_retry_cli -- --nocapture
+cargo test -p gitiup-quorum --test quarantine -- --nocapture
+cargo test -p gitiup --test participant_quarantine_cli -- --nocapture
 ```
 
 The end-to-end test is the acceptance criterion as code: seven volunteers in the roster,
@@ -1038,6 +1178,18 @@ failed verdict produces no bytes at all — and
 commands: `gitiup quorum verdict --attest` writing a file or filing in the store, and
 `gitiup verify change` carrying a change whose policy demands the quorum tier only when
 the quorum actually happened.
+
+`quarantine` is the same discipline for the memory the loop used to lack: a divergence that
+a filed verdict supports becomes a quarantine and nothing else does, a `missing` seat is
+refused by name and scored instead, the roster's bytes are identical before and after, the
+exclusion lands in a later round's inputs and not in a current round's seats, a stranger's
+signature excludes nobody, two quarantines about one key are two records, and a clock bound
+expires a quarantine the epoch arithmetic would have kept.
+`participant_quarantine_cli` runs the same rules as the binary: the cited verdict must be
+filed, absence is refused at exit 6 with the sentence that explains it, `history` prints the
+trail to a reader with no keys at all, the reputation table names what a quarantine may cite
+and keeps silence out of that column, and `unquarantine` — the appeal — is the only way back
+in, with `gitiup participant appeal` existing only as a refusal that says so.
 
 The command line has its own acceptance test, run as the built binary against a real
 keystore, a real store and a real signed policy —

@@ -51,6 +51,13 @@ pub const LEASE_PAYLOAD_TYPE: &str = "application/vnd.gitiup.lease+json";
 /// A phase-1 commitment in a sealed round (giti-zp1.6): one key's promise about the
 /// bytes it is about to reveal. Signed by that key alone, like a lease.
 pub const COMMITMENT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.commitment+json";
+/// A quarantine record (giti-zp1.8): an owner's decision to keep a key out of the
+/// selection pool for N roster epochs. Owner-signed — a key quarantining itself is not a
+/// check on anything.
+pub const QUARANTINE_PAYLOAD_TYPE: &str = "application/vnd.gitiup.quarantine+json";
+/// The record ending a quarantine early (giti-zp1.8). Also owner-signed, and it names the
+/// quarantine it ends rather than "whichever one is current".
+pub const QUARANTINE_LIFT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.quarantine-lift+json";
 
 /// The canonical bytes of `value`, with `signatures` and `self_signature` removed.
 ///

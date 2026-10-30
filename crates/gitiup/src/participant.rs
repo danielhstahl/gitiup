@@ -18,6 +18,9 @@
 //! gitiup participant verify-roster   check one epoch before you believe it
 //! gitiup participant approve         the owner's act: a new signed epoch
 //! gitiup participant revoke          kill a key, with a reason that decides what it voids
+//! gitiup participant quarantine      keep a key out of the *selection* for N epochs
+//! gitiup participant unquarantine    end one quarantine early (a human act, and only one)
+//! gitiup participant history         the public trail, and what the roster's history says
 //! ```
 //!
 //! # The rules this surface keeps
@@ -69,6 +72,7 @@ use serde_json::{Value, json};
 
 use crate::CliError;
 use crate::keys::{self, Args};
+use crate::quarantine;
 use crate::remotes;
 
 /// Help for `gitiup participant`.
@@ -143,6 +147,33 @@ revoke — a key is dead, and the reason says what that means:
     --bad-faith              with `removed`: void what this key already signed too
     --note <text>            free text for the record (never trusted)
 
+quarantine — keep a key out of the *next* selections, for N epochs (the owner):
+    --reason <r>             required: divergence, commitment_mismatch, capability_lie,
+                             evidence_replay, bad_signature, owner_decision.
+                             `--reason absence` (and its synonyms) is refused: silence is
+                             insufficient, not guilt — see `history`
+    --epochs <n>             how many roster epochs it runs (default 3, max 52)
+    --change <id> --job <id> cite a filed verdict as the evidence; the reason is derived
+    --attempt <n>            ...and insist which attempt of that job it cites
+    --start-epoch <n>        first epoch it applies to (default: the store's current epoch)
+    --note <text>            required with owner_decision: the sentence an appeal answers
+    A quarantine is an exclusion input (`RoundInputs::excluding`), never a roster edit: no
+    epoch moves, and rounds already open keep the seats they were given.
+
+unquarantine — end one quarantine early: <KEY-ID> [--epoch <n>] [--digest <hex>] [--note …]
+    Names the record it ends; with two quarantines about one key, `--digest` says which.
+    There is no vote, no timer and no appeal command: this is the appeal, and it is signed.
+
+history — the trail and the score (read-only; no key of your own is needed to read it):
+    --key <id>               only this key            --change <id>  only this change (repeatable)
+    --epoch <n>              judge standing at this epoch (default: the store's current)
+    --max-rounds <n>         how many round records the reputation scan reads (default 500)
+    --now <time>             the clock the tallies are taken at
+    Prints every quarantine record with who signed it, what it cites and whether it is in
+    force — and below it, per key, seats held / diverged / refused / silent, with the
+    turn-up rate and what a quarantine could legitimately be written for. Silence is
+    counted there and is never a ground anywhere.
+
 All: -j, --json on anything a script reads. Passphrases follow `gitiup key`:
 --passphrase-file <path|-> or GITIUP_KEY_PASSPHRASE, never a prompt a script cannot answer.
 
@@ -184,6 +215,16 @@ const VALUED: &[&str] = &[
     "--keep",
     "--reason",
     "--note",
+    "--epochs",
+    "--start-epoch",
+    "--digest",
+    "--change",
+    "--job",
+    "--attempt",
+    "--max-rounds",
+    "--now",
+    "--max-age",
+    "--max-skew",
     "--passphrase",
     "--passphrase-file",
     "--require-arch",
@@ -213,9 +254,15 @@ pub fn participant(args: &[String]) -> Result<(), CliError> {
         }
         "approve" => approve(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         "revoke" => revoke(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "quarantine" => quarantine::quarantine(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
+        "unquarantine" => {
+            quarantine::unquarantine(&Args::parse_with(&args[1..], VALUED, SWITCHES)?)
+        }
+        "history" => quarantine::history(&Args::parse_with(&args[1..], VALUED, SWITCHES)?),
         other => Err(CliError::usage(format!(
             "unknown `gitiup participant` command '{other}'; `gitiup participant help` lists \
-             register, withdraw, list, verify-roster, approve and revoke"
+             register, withdraw, list, verify-roster, approve, revoke, quarantine, \
+             unquarantine and history"
         ))),
     }
 }

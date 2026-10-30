@@ -78,11 +78,13 @@ assert!(verdict.state.mergeable());
 | [`round`](src/round.rs) | the signed record that pins epoch + roster digest + seats, and re-verifies them without a secret; `Escalation` is the pointer from an attempt to the one it replaces |
 | [`job`](src/job.rs) | the advertisement (a round's seats, copied) and the TTL lease on one seat: claimed by CAS, stealable when it dies, and the steal recorded |
 | [`gate`](src/gate.rs) | admission at submission time — this key, this epoch, this round, this document — with its own refusal code for each |
-| [`store`](src/store.rs) | the ref names and CAS writes: `refs/roster/*`, `refs/signup/*`, `refs/withdrawal/*`, `refs/revocation/*`, `refs/round/*`, `refs/job/*`, `refs/lease/*`, `refs/commit/*`, `refs/reveal/*`, `refs/verdict/*`, and `store::tally`, which picks the flow the round names |
+| [`store`](src/store.rs) | the ref names and CAS writes: `refs/roster/*`, `refs/signup/*`, `refs/withdrawal/*`, `refs/revocation/*`, `refs/round/*`, `refs/job/*`, `refs/lease/*`, `refs/commit/*`, `refs/reveal/*`, `refs/verdict/*`, `refs/quarantine/*`, `refs/quarantine-lift/*`, and `store::tally`, which picks the flow the round names |
 | [`commit`](src/commit.rs) | phase 1 of a sealed round: `H(attestation bytes ‖ slot ‖ challenge)`, and the check that a reveal opens it |
 | [`participate`](src/participate.rs) | the volunteer's fail-closed checklist, and `serve_once` |
 | [`verdict`](src/verdict.rs) | the tally, every rejection with its reason, the divergent results |
 | [`attestation`](src/attestation.rs) | the `tier: quorum` attestation: `from_verdict` is the only way to build one, and it refuses anything but `verified` |
+| [`quarantine`](src/quarantine.rs) | verdict history as a selection input: the owner-signed `Quarantine` (reason vocabulary, epoch window, cited verdict) and `QuarantineLift`, the ledger that reads them, and the refusal of absence as a ground — silence is insufficient, not guilt |
+| [`reputation`](src/reputation.rs) | the scored half: turn-up per key and per roster, recomputed from verdicts, with the counts a quarantine may cite named and silence kept out of that list |
 | [`escalate`](src/escalate.rs) | the attempt cap: `quorum.max_attempts` from the published policy, the count read off the store's own refs, and `attempt_cap_exhausted` at exit 9 |
 | [`policy`](src/policy.rs) | the published policy (ADR-0004): the document, its digests, its trust and coherence checks, the resolution ladder, and the `quorum` block a round's numbers come from |
 | [`record`](src/record.rs) | the signed-record framing ADR-0001 D3 sets and every record here re-uses: canonical body bytes, PAE, the signature list kept out of the digest |
@@ -104,10 +106,12 @@ assert!(verdict.state.mergeable());
   advertisement is a ref, the lease is a ref, and the two loops that touch them — `gitiup
   work --watch` and `gitiup quorum retry` — are run by a volunteer and an owner respectively,
   the second of them bounded by the policy's attempt cap;
-* **no memory of bad behaviour** — exclusions are an *input* to selection and a verdict
-  names every `missing` and `rejected` seat with its code, but nothing here accumulates one
-  key's history across verdicts. Quarantine is giti-zp1.8, and it will be a policy that
-  writes exclusions;
+* **no hidden memory of bad behaviour** — nothing here keeps a score that changes who is
+  picked. What a verdict established can be written down, once, as a signed
+  [`Quarantine`](src/quarantine.rs) that an owner authorises and that selection reads as an
+  exclusion (`giti-zp1.8`); what is merely *counted* ([`reputation`](src/reputation.rs)) is
+  printed and decides nothing. A background process that quietly learned which keys are
+  unfashionable is the thing this crate refuses to be;
 * **no endorsement document** — ADR-0002 D6's signed endorsement record is unimplemented
   (the namespace is declared and unused), so `endorsed` is the owner's word at
   `approve --tier endorsed` and not a document a reader can check.

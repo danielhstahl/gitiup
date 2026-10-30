@@ -777,6 +777,18 @@ impl<'a> Runner<'a> {
             })?;
             widened
         };
+        // The owner's quarantines, carried into the new attempt through the exclusion set
+        // like every other exclusion (giti-zp1.8): the roster is not edited, and the round
+        // record publishes who was kept out and why the store says so.
+        let kept = crate::quarantine::kept_out(
+            self.opened,
+            self.trust,
+            roster.epoch,
+            self.evaluation.now,
+        )?;
+        for note in &kept.notes {
+            self.notes.push(note.clone());
+        }
         let proposers: Vec<String> = match self.proposers {
             Some(named) => named.clone(),
             None => previous.inputs.exclusions.iter().cloned().collect(),
@@ -801,7 +813,8 @@ impl<'a> Runner<'a> {
                 .collect(),
             policy,
         }
-        .excluding(&roster, &proposers)?;
+        .excluding(&roster, &proposers)?
+        .excluding(&roster, &kept.list())?;
         if proposers.is_empty() {
             self.notes.push(format!(
                 "job {job}: attempt {} excluded no author and none was named, so attempt \

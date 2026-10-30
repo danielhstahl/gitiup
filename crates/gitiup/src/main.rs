@@ -90,6 +90,7 @@ mod normalise;
 mod participant;
 mod policy;
 mod policy_ask;
+mod quarantine;
 mod quorum;
 mod remotes;
 mod retry;
@@ -156,7 +157,8 @@ COMMANDS:
     identity [COMMAND] [OPTIONS]   who this machine signs as (publish, list, show,
                                    verify, endorse, use, whoami, import)
     participant [COMMAND] [OPTS]   the quorum roster: register, withdraw, list,
-                                   verify-roster, approve, revoke
+                                   verify-roster, approve, revoke, quarantine,
+                                   unquarantine, history
     select [OPTIONS]               who verifies one change: re-derive a published
                                    selection, or open a new round and exclude the author
     quorum verdict <ID> [OPTIONS]  what the quorum decided about a change: re-verify every

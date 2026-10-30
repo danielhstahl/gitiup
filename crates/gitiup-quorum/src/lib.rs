@@ -111,7 +111,9 @@ pub mod job;
 pub mod ledger;
 pub mod participate;
 pub mod policy;
+pub mod quarantine;
 pub mod record;
+pub mod reputation;
 pub mod roster;
 pub mod round;
 pub mod select;
@@ -141,6 +143,13 @@ pub use policy::{
     PolicyDocument, PolicyError, PolicyProvenance, ResolvedPolicy, Source as PolicySource,
     resolve as resolve_policy,
 };
+pub use quarantine::{
+    DEFAULT_QUARANTINE_EPOCHS, Evidence, LIFT_SCHEMA_VERSION, LIFT_TYPE, MAX_QUARANTINE_EPOCHS,
+    MAX_QUARANTINE_SIGNATURES, QUARANTINE_SCHEMA_VERSION, QUARANTINE_TYPE, Quarantine,
+    QuarantineLift, QuarantineReason, Standing as QuarantineStanding, is_absence_code,
+    reason_for_rejection,
+};
+pub use reputation::{Report as ReputationReport, Sheet as ReputationSheet};
 pub use roster::{
     EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
 };
@@ -164,6 +173,7 @@ pub use verdict::{
 pub mod prelude {
     pub use crate::capability::{Capabilities, Requirements, RosterTier};
     pub use crate::error::Error;
+    pub use crate::quarantine::{Quarantine, QuarantineLift, QuarantineReason};
     pub use crate::roster::{
         EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
     };

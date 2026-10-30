@@ -1017,7 +1017,7 @@ fn match_attempt<'a>(args: &Args, rounds: &[&'a Round]) -> Result<Vec<&'a Round>
 /// "the latest" is the rule because that is what an escalation *means*: attempt 1 exists
 /// to replace attempt 0's answer, and a command that reported both would be reporting a
 /// quorum that has already been superseded.
-fn latest_attempt_per_job<'a>(rounds: &[&'a Round]) -> Vec<&'a Round> {
+pub(crate) fn latest_attempt_per_job<'a>(rounds: &[&'a Round]) -> Vec<&'a Round> {
     let mut latest: Vec<&Round> = Vec::new();
     for round in rounds {
         match latest.last_mut() {

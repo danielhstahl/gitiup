@@ -6,8 +6,8 @@
 * **Blocks**: `giti-msi.2` (roster + registration), `giti-msi.3` (selection), `giti-msi.4` (jobs/leases — reserve order and exclusion input), `giti-msi.6` (commit-reveal slots and handles), `giti-msi.7` (policy defaults, one-vote-per-identity), `giti-msi.8` (escalation rounds), `giti-msi.9` (threat model, rate limits); `giti-kd4.5` (merge gate re-checks revocation); and, added when the epic was re-numbered, `giti-zp1.1`–`giti-zp1.7` (jobs and leases, the volunteer's loop, the verdict, `tier: quorum`, sealed submission, dispute and escalation) and `giti-91m.2` (the published policy a round's numbers come from)
 * **Depends on**: [ADR-0001](0001-attestation-encoding-hash-and-signature.md) — canonical JSON (D1), `sha256:` digest strings (D2), Ed25519 + SSH key ids (D3), freshness-as-policy (D6), limits and fail-closed reading (D7)
 * **Reference vectors**: [`fixtures/selection-v1/`](fixtures/selection-v1/) — `generate.py` is a stdlib-only implementation of the algorithm in D3, and `roster.json` / `round.json` / `selection.json` are the golden vectors `gitiup select` must reproduce byte-for-byte
-* **Implemented by**: [`crates/gitiup-quorum`](../../crates/gitiup-quorum/README.md), driven by `gitiup participant`, `gitiup select`, `gitiup work` and `gitiup quorum verdict|dispute|retry`; the operational document is [docs/quorum.md](../quorum.md). The crate's first commit put D1–D5, D7–D10's *mechanism* in Rust; `giti-msi.2` and `.3` put the roster and the selection behind a command line; `giti-zp1.1` the D10 jobs and leases, `giti-zp1.3` the D11 checklist as a loop, `giti-zp1.4` the tally, `giti-zp1.5` the tier D5 reserves, `giti-zp1.6` D11's `sealed` mode, `giti-zp1.7` D5's escalation and its cap. **Two decisions here are not implemented: D6 (endorsement records) and the reputation half of D5** (giti-zp1.8) — and the rate limits this document hands to `giti-msi.9` were never written, so D10's listing is bounded by construction and not metered. The vectors still earn their keep: they are what let an auditor be *wrong loudly* about a selection rather than differ quietly.
-* **Decision-by-decision status**: D1 sortition ✓ (`select.rs`, `roster.rs`) · D2 the seed ✓ (`derive.rs`, `round.rs`) · D3 the algorithm and its vectors ✓ (`tests/selection_vectors.rs`) · D4 one identity one vote and the exclusion family ✓ (`roster.rs`, `select.rs`, re-checked at submit) · D5 tiers and caps ✓, reputation ✗ · D6 endorsements ✗ · D7 capabilities, claimed and post-checked ✓ (`capability.rs`, `gate.rs`, measured live by `gitiup work`) · D8 epochs and the rollback guard ✓ (`roster.rs`, `ledger.rs`) · D9 revocation at verdict time ✓ (`verdict.rs`, `gate.rs`) · D10 records, namespaces, hex slots ✓ with three divergences named there · D11 what is secret until when ✓, handles ✗ by design
+* **Implemented by**: [`crates/gitiup-quorum`](../../crates/gitiup-quorum/README.md), driven by `gitiup participant`, `gitiup select`, `gitiup work` and `gitiup quorum verdict|dispute|retry`; the operational document is [docs/quorum.md](../quorum.md). The crate's first commit put D1–D5, D7–D10's *mechanism* in Rust; `giti-msi.2` and `.3` put the roster and the selection behind a command line; `giti-zp1.1` the D10 jobs and leases, `giti-zp1.3` the D11 checklist as a loop, `giti-zp1.4` the tally, `giti-zp1.5` the tier D5 reserves, `giti-zp1.6` D11's `sealed` mode, `giti-zp1.7` D5's escalation and its cap, `giti-zp1.8` D5's reputation half as an **exclusion** (`gitiup participant quarantine|unquarantine|history`). **One decision here is not implemented: D6 (endorsement records)** — and the rate limits this document hands to `giti-msi.9` were never written, so D10's listing is bounded by construction and not metered. The vectors still earn their keep: they are what let an auditor be *wrong loudly* about a selection rather than differ quietly.
+* **Decision-by-decision status**: D1 sortition ✓ (`select.rs`, `roster.rs`) · D2 the seed ✓ (`derive.rs`, `round.rs`) · D3 the algorithm and its vectors ✓ (`tests/selection_vectors.rs`) · D4 one identity one vote and the exclusion family ✓ (`roster.rs`, `select.rs`, re-checked at submit) · D5 tiers and caps ✓ and reputation ✓ as an exclusion, never a weight (D5's *demotion* option was not taken) · D6 endorsements ✗ · D7 capabilities, claimed and post-checked ✓ (`capability.rs`, `gate.rs`, measured live by `gitiup work`) · D8 epochs and the rollback guard ✓ (`roster.rs`, `ledger.rs`) · D9 revocation at verdict time ✓ (`verdict.rs`, `gate.rs`) · D10 records, namespaces, hex slots ✓ with three divergences named there · D11 what is secret until when ✓, handles ✗ by design
 
 > The epic asks five volunteer machines to independently re-run one change. Everything
 > else in the epic — jobs, leases, commit-reveal, verdicts — is downstream of three
@@ -388,15 +388,20 @@ the owner's three boxes plus a stranger's laptop is a quorum); self-declared tie
 (tier is the owner's answer to "do I vouch", so letting a candidate set it is
 meaningless); reputation-weighted selection and reputation-weighted voting (above).
 
-> **Implemented — the tiers, not the memory.** `RosterTier` (trusted / endorsed /
-> anonymous), the `tier_floor` filter and `tier_caps` are code, and `max_per_identity` is
-> enforced in the greedy pass *and* re-checked by the tally, so a roster cannot smuggle two
-> boxes into two votes. The reputation half is not: `exclusions` is an input every caller
-> can fill — `gitiup quorum retry` carries the previous attempt's forward — and nothing
-> accumulates a key's history to write it, because every verdict recomputes from the
-> store's own records and no verdict has a memory. That is the honest state of "reputation
-> may only exclude": the door it would walk through is built (giti-zp1.8 is the policy that
-> opens it), and nothing walks through it yet.
+> **Implemented — the tiers, and the memory that may only exclude.** `RosterTier`
+> (trusted / endorsed / anonymous), the `tier_floor` filter and `tier_caps` are code, and
+> `max_per_identity` is enforced in the greedy pass *and* re-checked by the tally, so a
+> roster cannot smuggle two boxes into two votes. The reputation half landed in
+> `giti-zp1.8` in the only shape this decision allows: an owner-signed
+> [`Quarantine`](../../crates/gitiup-quorum/src/quarantine.rs) record — which cites a filed
+> verdict, names a closed set of reasons, runs for N epochs and is bounded so it cannot be
+> permanent — is applied as `RoundInputs::excluding` input by every command that opens a
+> round. No roster ref moves, no seat in a round already opened is disturbed, and no number
+> enters the score: what is scored but decides nothing (a key's turn-up rate, printed by
+> `gitiup participant history`) is kept in a different place from what decides, which is
+> signed. D5's *other* option — demotion to `anonymous` — was deliberately not taken,
+> because a demotion is an edit to the owner's signed trust list and the roster is the one
+> document a quarantine must never rewrite.
 
 ## D6 — Endorsements: advice with a signature on it
 
@@ -834,7 +839,7 @@ of inventing one. "Ticket" is where the mitigation is implemented and tested.
 | **Roster/revocation suppression by the store operator** | epoch bump carries the revocation; verifiers publish their own records naming the epoch; optional log anchor (D9, ADR-0001 D9). Bounded as a liveness attack, stated as such | `.2`, `.9` |
 | **Targeted attack on the selected verifiers** | selection is public only from advertisement; reserves + lease expiry mean a knocked-out verifier costs latency not soundness; no addresses in the store; sealed handles if it ever matters (D11) | `.4`, `.5` |
 | **Capability lying** — claim `docker`/x86_64/64 GB to get seats | ordered pre-filter (D7) plus post-check against the signed `EnvFingerprint`; a mismatch is a refused attestation and a reputation event | `.7`, `.9` |
-| **Reputation poisoning** — flapping, strategic divergence | reputation may only *exclude* or *demote*, never weight (D5); decay is in `.9` | `.9` |
+| **Reputation poisoning** — flapping, strategic divergence | reputation may only *exclude*, never weight (D5): a divergence becomes an owner-signed quarantine applied as a selection exclusion, and absence is scored but never punished; decay and rate limits are still `.9` | `.9`, `giti-zp1.8` |
 | **Vote laundering via a friend's key** | endorsements grant no weight (D6); a colluding pair is two identities and the honest claim is only that each cost a human "yes" | `.9` |
 | **Resource abuse via expensive workflows / volunteer swamping** | fan-out caps, per-key and per-change rate limits, capacity claims in the roster, lease TTLs | `.4`, `.9`, `giti-bgy.2` |
 | **Exfiltration / parsing bombs through attestation fields** | ADR-0001 D7 limits and `deny_unknown_fields`; roster fields likewise bounded (entries ≤ 4096, key ids fixed shape, `annotations` strings only) | `.2`, `.9` |
@@ -909,7 +914,8 @@ is `giti-91m.4`'s `gitiup verify change`. What did not land, in the same words: 
 (a verdict is recomputed from the store's records every time, which is slower and is the
 point), **fan-out caps and back-pressure** (a change opens one round per job per arm and
 the only ceiling is the size of the workflow that asked for them), and **rate limits and
-reputation decay** (`giti-msi.9`, whose remaining half is giti-zp1.8). The threat table
+reputation decay** (`giti-msi.9`): reputation now excludes through `giti-zp1.8`'s signed
+quarantines, but nothing decays a record early and nothing meters a flood. The threat table
 above is therefore still an enumeration without its document.
 
 **How we change our minds.** The domain strings (`gitiup-round-1` — which is also the

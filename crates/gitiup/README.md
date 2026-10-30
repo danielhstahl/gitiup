@@ -475,6 +475,11 @@ checks that are already here rather than adding new ones.
   which, and a pool too small for five saying `Insufficient` instead of shrinking.
 * `tests/participant_cli.rs` — the roster round trip: register, approve, list, revoke, and
   a published epoch that re-verifies from the store's own bytes.
+* `tests/participant_quarantine_cli.rs` — verdict history becoming a selection input: a
+  divergence a filed verdict supports quarantines and moves no roster ref, absence is
+  refused as a ground (`6`) and scored instead, the exclusion reaches a later round's
+  `inputs.exclusions` and never a current round's seats, and `history` prints the trail to a
+  reader with no keys
 * `tests/attest_cli.rs` — `gitiup attest` as command lines, each in a fresh process with a
   temp home and store: push → list → show with digests that match `gitiup digest` for the
   same report, an unsigned document refused (`6`), a re-push reported idempotent, `gc`
