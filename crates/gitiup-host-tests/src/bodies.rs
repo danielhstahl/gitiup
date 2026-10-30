@@ -6,10 +6,11 @@
 //! suite. The rest are the edges the shared suite was asked to cover explicitly:
 //! an empty store, a deleted ref, a pack big enough to matter, a listing wide
 //! enough to page, credentials that were refused, a host that cannot do
-//! compare-and-swap, and the change workflow of ADR-0003 end to end — proposed,
-//! re-attempted, listed, shown, merged once, and refused the second time. Those two
-//! bodies are written in [`crate::changes`], which is also where the cross-host body
-//! lives.
+//! compare-and-swap, the change workflow of ADR-0003 end to end — proposed,
+//! re-attempted, listed, shown, merged once, and refused the second time — and the
+//! published policy of ADR-0004 read back by the stranger it was published for.
+//! Those bodies are written in [`crate::changes`] and [`crate::policy`], which is also
+//! where the cross-host body lives.
 //!
 //! A body asserts; it does not return `Result`. That is what makes them readable,
 //! and it is why [`crate::runner`] runs each one in its own `#[test]` (so the
@@ -26,6 +27,7 @@ use gitiup_host::{
 };
 
 use crate::changes;
+use crate::policy;
 use crate::registration::Denial;
 use crate::registration::Knobs;
 
@@ -885,6 +887,27 @@ fn a_stale_base_merge_is_refused_the_same_way_everywhere(ctx: &Ctx<'_>) {
     changes::stale_base(ctx.host());
 }
 
+/// A published policy, read back the way a stranger with a fresh clone reads it.
+///
+/// The written half is [`crate::policy::workflow`]. This is the body `giti-91m` exists
+/// for: the epic's promise is that a repository's rules are readable *from the store*,
+/// and a store is a transport the publisher did not choose. Publish two revisions, then
+/// insist on the read path — the bytes byte-for-byte, the two refs, the history glob, the
+/// chain walk down `previous_digest`, the revision in force at a timestamp, and the
+/// refusal of a run that predates the first policy — through the same library calls
+/// `gitiup policy show` and `gitiup verify change` make.
+fn a_published_policy_is_read_back_from_the_store(ctx: &Ctx<'_>) {
+    policy::workflow(ctx.host());
+}
+
+/// A publish that was refused left nothing behind, on a host where a write is a push.
+///
+/// See [`crate::policy::refused_publish_writes_nothing`]: five ways for a publication to
+/// be a bad idea, and after each one the store answers exactly what it answered before.
+fn a_refused_policy_publish_writes_nothing(ctx: &Ctx<'_>) {
+    policy::refused_publish_writes_nothing(ctx.host());
+}
+
 /// Credentials that were refused come back as a refusal.
 ///
 /// The dangerous failure mode of an expired or revoked credential is not the
@@ -1135,7 +1158,7 @@ pub fn bodies() -> &'static [Body] {
     &BODIES
 }
 
-static BODIES: [Body; 18] = [
+static BODIES: [Body; 20] = [
     Body {
         name: "blobs_round_trip",
         shape: Shape::Single,
@@ -1240,6 +1263,20 @@ static BODIES: [Body; 18] = [
         requires_cas: true,
         note: "a branch that moved is refused with one kind, one exit code and both oids",
         run: a_stale_base_merge_is_refused_the_same_way_everywhere,
+    },
+    Body {
+        name: "a_published_policy_is_read_back_from_the_store",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "two signed revisions, and every way a clone can ask what the rules are",
+        run: a_published_policy_is_read_back_from_the_store,
+    },
+    Body {
+        name: "a_refused_policy_publish_writes_nothing",
+        shape: Shape::Single,
+        requires_cas: true,
+        note: "five refusals, and a store that did not move for any of them",
+        run: a_refused_policy_publish_writes_nothing,
     },
     Body {
         name: "describe_and_capabilities",

@@ -60,6 +60,8 @@ checking them makes that body *fail*, on purpose.
 | two proofs about one commit | `attestations_about_one_subject_are_found_by_subject` |
 | the change workflow, end to end | `a_change_goes_from_proposal_to_merge_and_merges_once` |
 | a stale base must not merge | `a_stale_base_merge_is_refused_the_same_way_everywhere` |
+| the published policy, read back by a stranger | `a_published_policy_is_read_back_from_the_store` |
+| a refused policy publish writes nothing | `a_refused_policy_publish_writes_nothing` |
 | multi-ref atomicity | `multi_ref_writes_are_all_or_nothing` |
 | capability honesty | `describe_and_capabilities` |
 

@@ -181,6 +181,32 @@ jobs:
             a_change_goes_from_proposal_to_merge_and_merges_once \
             a_stale_base_merge_is_refused_the_same_way_everywhere
 
+      # The published policy, on every host, as its own step. The epic's first sentence is
+      # that a clone can read the rules *from the store*, and a store is a transport the
+      # publisher did not choose — so the policy read path is measured on all of them and
+      # not only on the directory store the library's own tests use. Named as a step so a
+      # failing host says out loud that it was the policy that drifted, and run against the
+      # services demanded above: `refs/gitiup/policy/current` is a pointer commit on a
+      # served repository and a conditional write on a bucket, and those are exactly the two
+      # promises a merge gate rests on.
+      - name: The published policy, on every host
+        env:
+          GITIUP_CONFORMANCE_GIT_HTTP_URL: http://127.0.0.1:8080
+          GITIUP_CONFORMANCE_GIT_ROOT: ${{ github.workspace }}/ci-git-root
+          GITIUP_S3_LIVE_ENDPOINT: http://127.0.0.1:9000
+          GITIUP_S3_LIVE_BUCKET: gitiup-conformance
+          GITIUP_S3_LIVE_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: gitiup-conformance
+          AWS_SECRET_ACCESS_KEY: gitiup-conformance-secret
+          GITIUP_CONFORMANCE_REQUIRE_HOSTS: s3-minio,git-http
+          GITIUP_CONFORMANCE_REQUIRE_CAS: "1"
+        run: |
+          cargo test -p gitiup-host-tests --features s3,github -j 3 \
+            --test fs --test git --test s3_memory --test github --test s3_minio \
+            -- --nocapture \
+            a_published_policy_is_read_back_from_the_store \
+            a_refused_policy_publish_writes_nothing
+
       # ...and across two hosts: published on the bucket, read and merged through the
       # plain-git host, with the same digests from both. Against these services that
       # means a live MinIO and a real git-http-backend — the pair a contributor and an

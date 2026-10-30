@@ -29,6 +29,8 @@ macro_rules! conformance_body_names {
             "attestations_about_one_subject_are_found_by_subject",
             "a_change_goes_from_proposal_to_merge_and_merges_once",
             "a_stale_base_merge_is_refused_the_same_way_everywhere",
+            "a_published_policy_is_read_back_from_the_store",
+            "a_refused_policy_publish_writes_nothing",
             "describe_and_capabilities",
             "refused_credentials_are_denied_not_dropped",
             "a_host_without_cas_refuses_cas_writes",
@@ -118,6 +120,17 @@ macro_rules! each_conformance_body {
                 "a_stale_base_merge_is_refused_the_same_way_everywhere",
                 &$registration,
             );
+        }
+        #[test]
+        fn a_published_policy_is_read_back_from_the_store() {
+            $crate::runner::require_body(
+                "a_published_policy_is_read_back_from_the_store",
+                &$registration,
+            );
+        }
+        #[test]
+        fn a_refused_policy_publish_writes_nothing() {
+            $crate::runner::require_body("a_refused_policy_publish_writes_nothing", &$registration);
         }
         #[test]
         fn describe_and_capabilities() {

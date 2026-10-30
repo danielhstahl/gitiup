@@ -277,6 +277,12 @@ change_bodies=(
     a_change_goes_from_proposal_to_merge_and_merges_once
     a_stale_base_merge_is_refused_the_same_way_everywhere
 )
+# The two policy bodies, named for the same reason: a host that cannot serve a published
+# policy is not a host a merge gate can live on, and the CI log should say that in words.
+policy_bodies=(
+    a_published_policy_is_read_back_from_the_store
+    a_refused_policy_publish_writes_nothing
+)
 
 say "format check"
 cargo fmt --all -- --check
@@ -299,6 +305,15 @@ say "the change workflow, on every host"
 cargo test -p gitiup-host-tests "${features[@]}" -j 3 \
     --test fs --test git --test s3_memory --test github --test s3_minio \
     -- --nocapture "${change_bodies[@]}"
+
+# The published policy, one step of its own, for the same reason the change bodies have
+# one: the promise being measured is that a stranger with a fresh clone can read the rules
+# from the store itself, and "the store" is whichever transport the owner happened to
+# choose. The fs host alone proves nothing about a pointer commit or a conditional write.
+say "the published policy, on every host"
+cargo test -p gitiup-host-tests "${features[@]}" -j 3 \
+    --test fs --test git --test s3_memory --test github --test s3_minio \
+    -- --nocapture "${policy_bodies[@]}"
 
 # ...and across two of them: published on the bucket, read and merged through the
 # plain-git host, with identical digests from both. With a live endpoint this crosses a

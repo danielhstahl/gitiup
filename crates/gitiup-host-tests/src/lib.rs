@@ -38,6 +38,8 @@
 //! | blob listing, pagination | `listings_are_complete_across_pages` |
 //! | the change workflow, propose → merge | `a_change_goes_from_proposal_to_merge_and_merges_once` |
 //! | a stale base must not merge | `a_stale_base_merge_is_refused_the_same_way_everywhere` |
+//! | a published policy, read back by a stranger | `a_published_policy_is_read_back_from_the_store` |
+//! | a refused policy publish writes nothing | `a_refused_policy_publish_writes_nothing` |
 //! | expired / refused credentials | `refused_credentials_are_denied_not_dropped` |
 //! | `cas = false` degradation | `a_host_without_cas_refuses_cas_writes` |
 //! | unsupported operations | `unsupported_operations_are_refused_by_name` |
@@ -74,6 +76,7 @@ pub mod changes;
 pub mod fixtures;
 pub mod hosts;
 mod macro_support;
+pub mod policy;
 pub mod registration;
 pub mod runner;
 

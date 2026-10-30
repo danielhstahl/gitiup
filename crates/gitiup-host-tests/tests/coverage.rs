@@ -76,6 +76,13 @@ const REQUIRED_EDGES: &[(&str, &[&str])] = &[
         "a stale-base merge refused, identically",
         &["a_stale_base_merge_is_refused_the_same_way_everywhere"],
     ),
+    (
+        "the published policy a clone reads for itself",
+        &[
+            "a_published_policy_is_read_back_from_the_store",
+            "a_refused_policy_publish_writes_nothing",
+        ],
+    ),
 ];
 
 /// Every host kind a gitiup build can ship. A new one here means a new host, and a

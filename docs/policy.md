@@ -159,6 +159,13 @@ Nothing about a policy is secret — it is published precisely so a stranger can
 before running anything — and history is **never pruned**, because pruning is what turns
 last month's merge into `policy_history_missing`.
 
+Every read in that list is executed on every host the workspace ships — a directory, a
+bare repository over `file://`, a repository served by `git-http-backend`, an in-memory
+bucket, a live MinIO and the forge adapter — by
+[`gitiup-host-tests/src/policy.rs`](../crates/gitiup-host-tests/src/policy.rs), because
+"readable from the store" is a claim about transports the owner chose and the reader did
+not, and the fs host this library was developed against is only one of them.
+
 The revision in force at a moment is a walk, not a guess: among the documents reachable
 from `current` by `previous_digest`, the newest with `effective_from_us ≤ at` that has
 not expired. `--at` is how you ask that question
@@ -674,6 +681,8 @@ signature. It does not prove:
 | publish/show semantics: store writes, `--dry-run`, self-trust, refusals | [`gitiup/tests/policy_cli.rs`](../crates/gitiup/tests/policy_cli.rs) |
 | `check` and `explain`: rules in D7 order, first failure is the exit code | [`gitiup/tests/policy_ask_cli.rs`](../crates/gitiup/tests/policy_ask_cli.rs) |
 | the same ladder under `verify change` | [`gitiup/tests/verify_change_cli.rs`](../crates/gitiup/tests/verify_change_cli.rs) |
+| the same policy read back from a directory, a bare repository, a served repository, a bucket and a forge | [`gitiup-host-tests/src/policy.rs`](../crates/gitiup-host-tests/src/policy.rs), as `a_published_policy_is_read_back_from_the_store` — bytes byte-for-byte, both refs, the history glob, the chain walk and the walk's refusal, run on every host in CI |
+| a publish that was refused left nothing behind, on a host where a write is a push | the same file, as `a_refused_policy_publish_writes_nothing` |
 | the same answer from a bucket, a directory, a repository and a forge | [`gitiup-host-tests`](../crates/gitiup-host-tests/README.md), run in CI with `GITIUP_CONFORMANCE_REQUIRE_HOSTS` |
 
 Related: [provenance tiers](provenance-tiers.md) (what `simulated`, `local` and `quorum`

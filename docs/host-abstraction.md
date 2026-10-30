@@ -625,7 +625,9 @@ errors so typos surface instead of silently disabling a safety setting
    every host owes — empty store, CAS conflict, pack round-trip, huge pack, paged
    listings, ref deletion, refused credentials, unsupported operations, forgetting
    one object, the `cas = false` degradation, the change workflow from proposal to
-   merge, and the stale-base refusal that must be the *same kind* on every host — and
+   merge, the stale-base refusal that must be the *same kind* on every host, and the
+   published policy a stranger reads back from the store (two revisions walked and all,
+   and five refusals that must write nothing) — and
    one `test_host!` line runs all of them against your host. Changes are also measured
    *between* hosts: `tests/change_across_hosts.rs` publishes on a bucket and merges
    through a plain-git repository, and CI runs that pair again against a live MinIO and
