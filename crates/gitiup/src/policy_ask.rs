@@ -655,6 +655,17 @@ impl Explanation {
         self
     }
 
+    /// The verdict as the process exit code — `pub(crate)` for the same reason the
+    /// renderer is: a `pre-receive` hook that recomputed this number would be a second
+    /// gate, and two gates disagree.
+    pub(crate) fn code(&self) -> u8 {
+        self.exit
+    }
+
+    pub(crate) fn satisfied(&self) -> bool {
+        self.satisfied
+    }
+
     /// The process exit code is the verdict, and it is the same ladder `gitiup verify`
     /// uses, so a hook cannot get one answer from one command and a different one from
     /// this one.
@@ -665,7 +676,8 @@ impl Explanation {
         Err(CliError::verdict(self.exit))
     }
 
-    fn quiet(&self) -> String {
+    /// The word a `--quiet` gate prints, and the word a one-line hook summary leads with.
+    pub(crate) fn quiet(&self) -> String {
         if self.satisfied {
             return "satisfied".to_string();
         }
@@ -676,7 +688,7 @@ impl Explanation {
     }
 
     /// The primary reason, as the one-line sentence every report leads with.
-    fn headline(&self) -> String {
+    pub(crate) fn headline(&self) -> String {
         match self.reasons.first() {
             Some(reason) => format!("[{}] {}", reason.code, one_line(reason.detail())),
             None if self.satisfied => "every rule the policy names was satisfied".to_string(),
@@ -705,8 +717,9 @@ impl Explanation {
     }
 
     /// The stable machine-readable document: see this module's docs for why each key is
-    /// there and why none of them is optional.
-    fn json(&self) -> Value {
+    /// there and why none of them is optional. `pub(crate)` so that the hook's `--json`
+    /// carries *this* document and not a summary of it.
+    pub(crate) fn json(&self) -> Value {
         let mut out = Map::new();
         out.insert("record_type".into(), self.record.into());
         out.insert("verdict".into(), self.verdict.into());
@@ -768,8 +781,10 @@ impl Explanation {
     }
 
     /// The human report. `full` is the difference between `check` and `explain`: the same
-    /// answer, and — in `explain` — every rule that ran, passed or not.
-    fn text(&self, full: bool) -> String {
+    /// answer, and — in `explain` — every rule that ran, passed or not. `pub(crate)`
+    /// because a refused push prints this report, unchanged, on the other end of a
+    /// network: the sentence the hook saw is the sentence the pusher reads.
+    pub(crate) fn text(&self, full: bool) -> String {
         let mut out = String::new();
         out.push_str(&format!(
             "{}  {}\n",
@@ -829,8 +844,9 @@ impl Explanation {
     }
 
     /// The sentence that says *what was accepted*, because "satisfied" without the
-    /// combination is a claim a reader cannot check.
-    fn accepted_line(&self) -> String {
+    /// combination is a claim a reader cannot check. `pub(crate)` because the accepted line
+    /// is what a pusher is told when a gate lets their branch move: "proven", plus by what.
+    pub(crate) fn accepted_line(&self) -> String {
         let Some(accepted) = &self.accepted else {
             return self.headline();
         };
@@ -912,9 +928,34 @@ pub(crate) fn check(args: &[String]) -> Result<(), CliError> {
         question.ask_advisory();
     }
 
+    let out = verdict_for_commit(&store, &commit, args.get("--ref"), &question, now)?;
+    print(out, &args, false)
+}
+
+/// The verdict about one commit at one ref, as one document.
+///
+/// `gitiup policy check` prints this, and so does the `pre-receive` hook
+/// (`gitiup hook run pre-receive`), which is the only way the box that accepted a push
+/// and the person who pushed at it can be *known* to have seen the same answer: one
+/// assessment, two renderings ([`crate::policy_ask::Explanation`]'s own trick, one level
+/// up). The hook hand-builds its [`Question`] because [ADR-0004
+/// D4](../../../docs/adr/0004-published-policy-format-signing-and-resolution.md) says it
+/// takes no override; that is the only difference between the two callers.
+pub(crate) fn verdict_for_commit(
+    store: &Opened,
+    commit: &GitOid,
+    reference: Option<&str>,
+    question: &Question<'_>,
+    now: TimeUs,
+) -> Result<Explanation, CliError> {
     let mut out = Explanation::new("policy-check", "commit", store.what.clone(), now);
     out.subject.push(("commit".to_string(), commit.to_string()));
-    ask_commit(&store, &commit, &question, &args, &mut out)?;
+    // A gate that names the ref it was asked about says which rule applied to it; a
+    // commit on its own is not a ref, and `protects` knows the difference.
+    if let Some(reference) = reference {
+        out.subject.push(("ref".to_string(), reference.to_string()));
+    }
+    ask_commit(store, commit, reference, question, &mut out)?;
     // Some proofs adding up is one of the answers, not the whole of it. A store holding
     // one broken proof and one good one is not a store a merge may trust, so any standing
     // refusal means `not satisfied` — and, exactly as `verify change` does, the accepted
@@ -925,8 +966,7 @@ pub(crate) fn check(args: &[String]) -> Result<(), CliError> {
     if !satisfied {
         out.accepted = None;
     }
-    let out = out.finish(satisfied);
-    print(out, &args, false)
+    Ok(out.finish(satisfied))
 }
 
 /// Judge every proof the store advertises for one commit against the effective policy.
@@ -939,8 +979,8 @@ pub(crate) fn check(args: &[String]) -> Result<(), CliError> {
 fn ask_commit(
     store: &Opened,
     commit: &GitOid,
+    reference: Option<&str>,
     question: &Question<'_>,
-    args: &Args,
     out: &mut Explanation,
 ) -> Result<(), CliError> {
     let at = question.at.unwrap_or(question.now);
@@ -990,7 +1030,7 @@ fn ask_commit(
     // Does this policy even govern the ref the caller cares about? Only answerable when the
     // caller names one: a commit is not a ref, and a gate that guessed which branch was
     // meant would be applying `protects` rules nobody asked it to apply.
-    out.rules.push(match args.get("--ref") {
+    out.rules.push(match reference {
         None => Rule::outcome(
             "protects",
             CheckOutcome::NotAsked,

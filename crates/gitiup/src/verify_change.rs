@@ -1215,6 +1215,37 @@ impl Question<'_> {
         self.purpose = Purpose::Advisory;
     }
 
+    /// The question a `pre-receive` hook asks: the store's published policy and nothing
+    /// else.
+    ///
+    /// Every local override field is `None` here on purpose, and that is [ADR-0004
+    /// D4](../../../docs/adr/0004-published-policy-format-signing-and-resolution.md) as
+    /// a type rather than as a comment: *the pre-receive hook takes no override* — no
+    /// `--policy`, no `$GITIUP_POLICY`, no tree file, no built-in default. The hook's
+    /// entire value is that a stranger with a clone and the box that accepted the push
+    /// reach the same verdict, and an override in a hook script on one machine destroys
+    /// that. The trust roots are the one input a repository has to state out loud, so
+    /// `gitiup hook install` records them at install time and prints them in `hook
+    /// status`; they are still only about *whose* policy this box will apply, never about
+    /// what it demands.
+    pub(crate) fn published<'a>(
+        store: &'a Opened,
+        roots: Trust,
+        now: gitiup_attest::TimeUs,
+    ) -> Question<'a> {
+        Question {
+            store: Some(store),
+            roots,
+            now,
+            at: None,
+            expect: None,
+            policy_file: None,
+            policy_env: None,
+            tree_file: None,
+            purpose: Purpose::Gate,
+        }
+    }
+
     /// Resolve the policy for one timestamp through the whole D4 ladder, in gate mode.
     ///
     /// This is `.2`'s entry point and nothing else: the ladder, the chain walk, the

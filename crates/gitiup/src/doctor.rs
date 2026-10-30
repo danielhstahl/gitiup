@@ -9,6 +9,14 @@
 //! stranger's job exits 6, the same refusal code the rest of the taxonomy uses, so a
 //! supervisor can branch on `gitiup doctor --sandbox` instead of reading prose. A
 //! machine that may serve, with warnings, exits 0 — warnings are for the human.
+//!
+//! `--hooks` keeps that contract and points it at a repository instead of a machine: it
+//! prints what the proof gate on that repository's ref updates actually is — installed or
+//! not, proof required or opted out, which policy is in force and when it was read — by
+//! way of [`crate::hook`]'s own assessment, so `doctor` cannot promise a gate the next
+//! push will not find. An opt-out (`--no-proof-required`) is reported here for exactly that
+//! reason: an escape hatch only its author can find is how a policy stops being enforced
+//! without anybody deciding to stop enforcing it.
 
 use gitiup_sandbox::doctor;
 
@@ -23,6 +31,7 @@ serves which remote.
 USAGE:
     gitiup doctor --sandbox [--json]
     gitiup doctor --remotes [--json]
+    gitiup doctor --hooks [--repo <path>] [--json]
 
 OPTIONS:
     --sandbox     survey the isolation backends: kernel support, each backend's probe,
@@ -30,10 +39,16 @@ OPTIONS:
     --remotes     for every `[[remote]]` in gitiup.toml, which host serves it and what
                   that host warns about; a forge remote in a build without the forge
                   adapter is named and refused here
+    --hooks       the proof gate on one repository's ref updates: is the `pre-receive`
+                  gate installed and runnable, does it require proof at all, and which
+                  policy is in force right now (see `gitiup hook status`)
+    --repo <path> with --hooks: which repository (default: the one you are standing in)
     --json        the same report as JSON, for a dashboard or a support ticket
 
 Exit codes: 0 this machine may serve jobs and every remote has a host (warnings
 possible — read them) · 6 it may not, or a remote has no host this build can serve ·
+with --hooks: 0 when a push with no satisfying proof is refused here, 6 when it is not
+(no gate, an opt-out, or a gate that cannot gate).
 2 usage.
 ";
 
@@ -47,6 +62,13 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
             // A different subject, with its own report and its own exit conditions:
             // hand the whole argument list over rather than re-parse it here.
             "--remotes" | "--remote" => return remotes::run(args),
+            // A repository's question rather than this machine's: the gate and its report
+            // live in `hook`, and `doctor` lends them its exit-code convention.
+            "--hooks" | "--hook" => return crate::hook::doctor(args),
+            // Only `--hooks` takes a repository, so a bare `--repo` is that question in
+            // the other order: hand the whole list over rather than re-parse a flag that
+            // belongs to the other command.
+            "--repo" => return crate::hook::doctor(args),
             "--sandbox" | "--sandboxes" => sandbox = true,
             "--json" => json = true,
             "--help" | "-h" => {

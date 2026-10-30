@@ -47,9 +47,11 @@ Two conventions fall out of that table, and both are tested
 
 ```sh
 # A pre-receive hook: refuse the ref unless the proof for this commit is good enough.
-gitiup verify attestation --store ./store --commit "$newrev" \
-    --policy ./gitiup-policy.json --json >/tmp/verify.json || {
-    jq -r '.reasons[] | "refused: [\(.code)] \(.detail)"' /tmp/verify.json >&2
+# (`gitiup hook install pre-receive` writes this and more — see
+# [the gate that runs where the refs land](#the-gate-that-runs-where-the-refs-land).)
+gitiup policy check --commit "$newrev" --ref refs/heads/main \
+    --store ./store --json >/tmp/check.json || {
+    jq -r '.reasons[] | "refused: [\(.code)] \(.detail)"' /tmp/check.json >&2
     exit 1
 }
 ```
@@ -341,6 +343,63 @@ compact projection, `attestations[]` one entry per proof with its own ladder, th
 a check: the outcomes come from the report the verifier produced, and the demand and claim
 strings name the values that check read.
 
+## The gate that runs where the refs land: `gitiup hook install pre-receive`
+
+Everything above answers a question. A question cannot stop a branch from moving — only
+something running on the box that receives the push, after the objects have arrived and
+before the refs are written, can say *no* in a way that leaves the repository untouched.
+That is a `pre-receive` hook, and gitiup writes one:
+
+```console
+$ gitiup hook install pre-receive --repo /srv/git/repo.git --trust ada
+gitiup hook pre-receive — installed in /srv/git/repo.git
+  proves    required — a refs/heads/** update needs an attestation set the published policy accepts
+  policy    store · revision 1 · cited sha256:7495… · signed by SHA256:zGeY… · gate-eligible
+  trusts    1 key(s) [SHA256:zGeY…] — --trust, given at install time
+  open      refs/changes/**, refs/attestations/**, refs/gitiup/** — writable by anyone the git transport admits
+```
+
+The hook reads git's `<old-oid> <new-oid> <ref>` lines and refuses the whole push when a
+`refs/heads/**` update names a new head the repository's **published** policy does not
+accept. A refused push prints [the same report](#the-policy-question-gitiup-policy-check-and-explain)
+`gitiup policy check` prints — relayed through the transport, so the person who pushed
+reads the reason and not just a status — and no ref moves. `gitiup hook status` answers
+which policy is in force, its revision, its citation, whose signature this box believes,
+and when it was read; `gitiup doctor --hooks` says the same thing at
+[`0 · 6`](#the-exit-codes-are-the-interface) so a nightly check can branch on it.
+
+**What it does not guard is the design.** `refs/changes/**`, `refs/attestations/**` and
+`refs/gitiup/**` stay open to anyone the transport admits: a proposal and the evidence
+offered for it cost nothing to make and are checked when read, so filing them must never
+need permission — that is how a stranger submits work to a repository they have no
+special rights in. A branch is what everybody else builds on, so it moves on evidence.
+[ADR-0004 D5](adr/0004-published-policy-format-signing-and-resolution.md) makes this a
+format rule rather than a local one: a policy whose `protects` reaches outside
+`refs/heads/**` cannot be published at all. The asymmetry is written into the hook's own
+`--help` (and the installed script prints it), because a gate whose exceptions are
+undocumented gets worked around instead of fixed.
+
+Two rules fall out of that, both worth knowing before the first push breaks:
+
+* **No override.** The hook resolves `refs/gitiup/policy/current` and nothing else — no
+  `--policy`, no `$GITIUP_POLICY`, no tree file, no default
+  ([ADR-0004 D4](adr/0004-published-policy-format-signing-and-resolution.md)); the flags
+  are refused rather than ignored. A stranger with a clone has to be able to reach the
+  verdict the box that accepted their push reached. If no policy resolves, every guarded
+  push is refused with `no_policy_published`: a gate with nothing to go on does not wave
+  things through.
+* **The proof has to be on record first.** Refs move only after the hook returns, so a
+  push that files an attestation and moves the branch in the same transaction cannot be
+  judged by that attestation: publish it (`gitiup attest push --remote …`), then push the
+  branch. That is what "the proof was on record before the branch moved" means.
+
+`gitiup hook install --no-proof-required` is the one escape, and it is per-repository and
+loud: it keeps the script installed with the gate off, says so on every push, is printed
+by `hook status`, and makes `gitiup doctor --hooks` exit 6. The record lives in the
+repository's own `info/gitiup/pre-receive.json` — never a ref, because `refs/gitiup/**`
+is writable by anyone the transport admits and a gate whose opt-out a contributor could
+push over is not a gate.
+
 ## What it deliberately does not do
 
 * **No network, no fetch, no key discovery.** Keys are supplied by the caller (a
@@ -373,6 +432,7 @@ strings name the values that check read.
 | argv, the keystore, the store, the two renderings | [`gitiup/src/verify.rs`](../crates/gitiup/src/verify.rs) |
 | the merge gate over a change: the change-level checks, the combination rule, the verdicts | [`gitiup/src/verify_change.rs`](../crates/gitiup/src/verify_change.rs) |
 | "does this commit satisfy the policy", and every rule printed in D7 order | [`gitiup/src/policy_ask.rs`](../crates/gitiup/src/policy_ask.rs) |
+| the gate that refuses a push, its install record, its opt-out and its reports | [`gitiup/src/hook.rs`](../crates/gitiup/src/hook.rs) |
 
 `verify` (the `Result`-returning one a library caller uses) is `verify_report` with
 the tail dropped — one set of checks, one order, two question shapes. A printed

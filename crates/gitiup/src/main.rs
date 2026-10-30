@@ -13,6 +13,11 @@
 //!                                      whether a policy would accept it
 //! gitiup doctor --sandbox               what this machine can confine, and whether it
 //!                                      may serve a stranger's job at all
+//! gitiup hook install pre-receive --repo <path>
+//!                                      the gate where the refs land: a refs/heads/** update
+//!                                      whose new head has no policy-satisfying proof set is
+//!                                      refused, and the ref does not move. `hook status`
+//!                                      says which policy is in force and when it was read
 //! gitiup digest [OPTIONS] [REPORT]      RunDigest of a local run
 //! gitiup attest push|list|show|gc|migrate  file signed attestations in a host store and reads it
 //!                                      back, and retire the ones a retention policy
@@ -66,6 +71,7 @@ mod change;
 mod digest;
 mod doctor;
 mod env;
+mod hook;
 mod keys;
 mod normalise;
 mod participant;
@@ -92,6 +98,14 @@ COMMANDS:
     env [OPTIONS]                  this machine's environment fingerprint, and whether
                                    a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides
+    doctor --hooks [--repo <path>]  report the proof gate on a repository's ref updates
+    hook install pre-receive --repo <path>   refuse an unproven refs/heads/** update at the
+                                   repository itself: installs the gate, prints the policy
+                                   in force, and says what it leaves open and why
+    hook status [pre-receive] [--repo <path>]  which policy is in force, read when, by which
+                                   key — and whether proof is required at all
+    hook uninstall pre-receive --repo <path> take the gate back out (refuses a hook gitiup
+                                   did not write)
     digest [OPTIONS] [REPORT]      compute the RunDigest of a local run
     attest [COMMAND] [OPTIONS]     attestations in a host: push, list, show, gc, migrate
     change new [OPTIONS]           draft a signed change record from local commits
@@ -408,6 +422,7 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         }
         "run" => run::run(&args[1..]),
         "doctor" => doctor::run(&args[1..]),
+        "hook" => hook::hook(&args[1..]),
         "digest" => digest::run(&args[1..]),
         "attest" => attest::attest(&args[1..]),
         "change" => change::change(&args[1..]),
