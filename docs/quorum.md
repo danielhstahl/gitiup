@@ -796,7 +796,7 @@ gitiup quorum verdict chg-6a6a --store ./store --attest ./quorum.json --key owne
 It binds the round id and digest, the roster epoch and digest, the agreeing
 `ResultDigest` and the seats that produced the verdict, and it re-summarises none of
 their bytes: the seats are *named*, their attestations are still fetched from the store.
-There are two rules and both are in the library, not the CLI:
+There are three rules and all three are in the library, not the CLI:
 
 * **only a verdict makes one.** `QuorumAttestation::from_verdict` is the only way to build
   one, and it refuses a verdict that is not `verified` — a `failed` tally has no
@@ -806,6 +806,13 @@ There are two rules and both are in the library, not the CLI:
   `VerdictRecord::evaluate` — the same call, on the same records, as this command just
   made — and refuses anything the evidence does not back. See
   [the quorum ladder](verification.md#the-quorum-ladder-tier-quorum).
+* **the hand that signs it is the hand that opened the round.** The round was derived and
+  signed by the selector — with `gitiup change submit`, the submitter — so a `tier:
+  quorum` document speaks for that key, and a faithful copy signed by anybody else is
+  refused with the sentence that says so (exit 6, not a silent discount). This is why the
+  worked example files it with `--key owner`: the same key that published the change and
+  tallied its rounds. A bystander's copy is not a weaker claim about the same round; it is
+  somebody else's assertion about a round they did not run.
 
 ### Filing it: superseded, never edited
 
@@ -1128,7 +1135,22 @@ cargo test -p gitiup --test quorum_dispute_cli -- --nocapture
 cargo test -p gitiup --test quorum_retry_cli -- --nocapture
 cargo test -p gitiup-quorum --test quarantine -- --nocapture
 cargo test -p gitiup --test participant_quarantine_cli -- --nocapture
+cargo test -p gitiup --test volunteer_loop_cli -- --nocapture
 ```
+
+`volunteer_loop_cli` is the loop itself rather than a slice of it — the epic's acceptance
+criterion run as the binary, one command line at a time: five volunteers register, the
+owner publishes a policy that demands the quorum tier and submits a change that opens the
+round, each volunteer then runs `gitiup work` in its own process with its own key and its
+own sandboxed build, and the owner's `quorum verdict --publish --attest store` turns those
+five attestations into a verdict and a `tier: quorum` attestation that `gitiup verify
+change` accepts. It is the one test where the digests are not handed to the code by a
+fixture: five independent runs either agree or the test says they did not. It also shows
+the quieter half — five empty seats and three volunteers out of five are `insufficient` at
+exit 6, with no attestation written and `n` unlowered. Those runs are *executed*, so on a
+machine that can confine nothing they are reported and skipped rather than passed; `gitiup
+doctor --sandbox` says whether this box may serve a stranger's job, and says what to change
+if it may not.
 
 The end-to-end test is the acceptance criterion as code: seven volunteers in the roster,
 five seats filled, each publishing into its own slot, and the verdict coming out

@@ -122,7 +122,7 @@ reported by the confined process:
 | `fs-write-outside` | create a file in a host directory the job was not given | whether the file appeared |
 | `tcp-egress` | connect to a port the runner is listening on | whether a connection arrived |
 | `ptrace` | `ptrace` the runner and read its memory | whether either succeeded |
-| `fork-bomb` | exceed the process cap | the cap the confined process was *given*, read from inside it |
+| `fork-bomb` | exceed the process cap | the cap the confined process was *given*, read from inside it, judged against the process count the runner had when it set the limit |
 
 Three properties keep it honest, and they are the reason it is worth the process
 spawns:
@@ -133,7 +133,16 @@ spawns:
   nothing is tested that production does not use;
 * the fork check judges the limit, not the load: `RLIMIT_NPROC` is per-uid, so on a
   busy machine a hundred forks can succeed under a cap of thirty-two, and a suite that
-  called that an escape would be reporting on the host rather than the sandbox.
+  called that an escape would be reporting on the host rather than the sandbox. The
+  limit is installed as "this uid's processes right now, plus the slack the job asked
+  for", so the reading of the cap is compared against **that** count — the runner's, not
+  one taken inside the sandbox. A sandbox can hide processes from a count and cannot
+  invent them: a pid namespace (`bwrap`, `docker`, `podman`, `unshare`) shows only its
+  own tree, and Landlock's filesystem rules refuse `/proc/*` reads, so a confined
+  process can count none. Subtracting a number that is too small manufactures slack the
+  sandbox never granted and reports every busy container as an escape — a refusal of
+  the machine, not a finding about the sandbox. Both counts are printed, and the larger
+  is what binds ([`escape::cap_is_as_asked`](../crates/gitiup-sandbox/src/escape.rs)).
 
 On a machine with no isolation backend at all — a locked-down container, a kernel
 without Landlock — the suite says so rather than passing silently, and the matching

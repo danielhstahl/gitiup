@@ -15,7 +15,8 @@
 //!                                    └─► VerdictRecord::evaluate again ─► it matches
 //!
 //! and then: a document whose evidence has moved — a revoked seat, a tampered digest, a
-//! round that is not in this store — is refused, with the exit code a gate branches on.
+//! round that is not in this store, a copy signed by a hand that did not open the round —
+//! is refused, with the exit code a gate branches on.
 //! ```
 
 use gitiup_attest::{AttestationDoc, Digest, GitOid, SigningKey, Tier, Trust};
@@ -225,6 +226,60 @@ fn a_document_that_only_labels_itself_quorum_is_refused_with_exit_6() {
     // An unsigned one is refused too: nobody said it, so nobody is believed.
     let unsigned = QuorumAttestation::from_verdict(&scene.round, &scene.verdict()).unwrap();
     assert_eq!(unsigned.verify(&scene.trust).unwrap_err().exit_code(), 6);
+}
+
+/// The selector's signature is not decoration. `gitiup change submit` opens its rounds
+/// with the submitter's key, so the round is that hand's claim about who was invited,
+/// and a `tier: quorum` document is the same claim carried to a gate. A copy of the right
+/// answer, signed by anybody else, is an assertion about a round that person did not run.
+#[test]
+fn only_the_hand_that_opened_the_round_can_attest_what_it_decided() {
+    let scene = Scene::honest();
+    // A bystander with a key of its own, no seat in any round, and the best of intentions:
+    // it copies the honest document and signs it faithfully.
+    let bystander = sample::verifier_key(63);
+    let mut copied =
+        QuorumAttestation::from_verdict(&scene.round, &scene.verdict()).expect("attestable");
+    copied.sign(&bystander).expect("the bystander asserts it");
+
+    let differences = copied.differences(&scene.round, &scene.verdict());
+    assert!(
+        differences.iter().any(|(code, why)| {
+            *code == "trust" && why.message().contains("did not open the round")
+        }),
+        "{differences:?}"
+    );
+
+    // And believed by a machine that trusts that key: the refusal is not "who are you", it
+    // is "you did not open this round", which is the sentence a gate reports.
+    let trust = Trust::KeyIds(
+        [
+            scene.owner.public_key().key_id(),
+            bystander.public_key().key_id(),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let rederived = rederive(
+        scene.host(),
+        &copied,
+        &trust,
+        &Evaluation::at(sample::clock()),
+    )
+    .expect("the round and its evidence still read back clean");
+    let error = copied
+        .matches(&rederived.round, &rederived.verdict)
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 6, "{error}");
+    assert!(
+        error.message().contains("did not open the round"),
+        "{error}"
+    );
+
+    // The owner's own signature on the same bytes is believed, which is the difference
+    // between this refusal and a refusal of the document.
+    let honest = scene.attestation();
+    scene.rederive(&honest).expect("the selector's copy stands");
 }
 
 #[test]

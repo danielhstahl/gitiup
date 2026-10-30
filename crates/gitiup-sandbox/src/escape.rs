@@ -446,6 +446,19 @@ pub fn ptrace_escape(backend: &dyn Sandbox, spec: &Spec) -> Result<Outcome> {
 /// The honest caveat belongs in the note too: a per-uid rlimit is a shared resource, so
 /// the strong version of this control is a pid namespace or a cgroup, which `unshare`
 /// and the container backends provide and Landlock cannot.
+///
+/// # Why the "how many were already running" number is taken outside
+///
+/// The limit is installed as *"this uid's process count right now, plus the slack the job
+/// asked for"* — [`nproc_floor`](crate::linux::nproc_floor) — so that is the only count
+/// the reading of the cap can honestly be compared against. The count a *confined*
+/// process takes is frequently smaller, and always in the same direction: a pid
+/// namespace (`bwrap`, `docker`, `podman`, `unshare`) hides every host process, and a
+/// backend whose filesystem rules refuse `/proc/*` reads sees none at all. Subtracting
+/// that smaller number manufactures slack the sandbox never granted, so a busy host
+/// would be reported as an escape on every container backend there is — a refusal of
+/// the machine, not a finding about the sandbox. The confined count is still read, and
+/// the larger of the two is what the comparison uses.
 pub fn fork_bomb(backend: &dyn Sandbox, spec: &Spec) -> Result<Outcome> {
     let program = match canary_program(spec) {
         Some(program) => program,
@@ -480,29 +493,60 @@ pub fn fork_bomb(backend: &dyn Sandbox, spec: &Spec) -> Result<Outcome> {
             Outcome::Unavailable(format!("the canary reported nothing: {}", text.trim()))
         });
     };
-    if cap == u64::MAX {
+    // The count the cap was built from. The canary's own reading is kept in `inside`
+    // and printed, but it can only ever be too small to subtract — see the module note.
+    let inside = running;
+    let outside = crate::linux::current_nproc();
+    if let Some(refusal) = cap_is_as_asked(cap, inside, outside, spec.limits.processes) {
         return Ok(Outcome::Escaped(format!(
-            "the confined process has no process cap at all ({counted} of {FORK_ATTEMPT} \
-             children started)"
-        )));
-    }
-    // How many more processes the confined process may start than were already running.
-    let slack = cap.saturating_sub(running);
-    let asked = spec.limits.processes;
-    if let Some(asked) = asked
-        && slack > asked + CAP_COUNT_NOISE
-    {
-        return Ok(Outcome::Escaped(format!(
-            "the confined process may start {slack} more processes, but the job asked for a \
-             cap of {asked} ({running} processes of this uid were already running)"
+            "{refusal} ({counted} of {FORK_ATTEMPT} children started)"
         )));
     }
     Ok(Outcome::Denied(format!(
         "{counted} of {FORK_ATTEMPT} children started; the confined process is capped at \
-         {cap} for a uid already running {running} — a per-uid rlimit is shared with \
-         everything else running as this user, so a pid namespace or a cgroup is the \
-         strong version of this control"
+         {cap} for a uid already running {}{} — a per-uid rlimit is shared with everything \
+         else running as this user, so a pid namespace or a cgroup is the strong version of \
+         this control",
+        outside.max(inside),
+        if inside < outside {
+            format!(
+                " ({outside} counted here, {inside} from inside the sandbox, which hides the \
+                 rest: a pid namespace, or /proc reads refused)"
+            )
+        } else {
+            String::new()
+        }
     )))
+}
+
+/// The verdict on the cap the confined process reports, as a refusal when there is one.
+///
+/// `cap` is `RLIMIT_NPROC` as the confined process reads it; `inside` is the process
+/// count the confined process saw; `outside` the count the runner saw at the moment it
+/// set the limit; `asked` the *extra* processes the job allowed. The comparison uses the
+/// larger of the two counts, because a sandbox can hide processes from the count and can
+/// never invent them, and because the limit was installed against `outside`.
+pub fn cap_is_as_asked(cap: u64, inside: u64, outside: u64, asked: Option<u64>) -> Option<String> {
+    // A job that asked for no cap cannot be refused for not having one: there is nothing
+    // to check about a limit nobody asked for. Every job this build runs does ask for one,
+    // and the default is in [`Limits`].
+    let asked = asked?;
+    if cap == u64::MAX {
+        return Some(format!(
+            "the confined process has no process cap at all, and the job asked for {asked} \
+             extra processes"
+        ));
+    }
+    let running = inside.max(outside);
+    let slack = cap.saturating_sub(running);
+    if slack > asked + CAP_COUNT_NOISE {
+        return Some(format!(
+            "the confined process may start {slack} more processes, but the job asked for a \
+             cap of {asked} ({running} processes of this uid were already running: {outside} \
+             counted by the runner, {inside} counted inside the sandbox)"
+        ));
+    }
+    None
 }
 
 /// All four checks, as `(name, outcome)`, in the order the ticket lists them.
@@ -604,5 +648,56 @@ mod tests {
         assert!(!Outcome::Denied("x".into()).escaped());
         assert!(!Outcome::Unavailable("x".into()).checked());
         assert_eq!(Outcome::Escaped("x".into()).state(), "ESCAPED");
+    }
+
+    // The process cap is judged against the count taken where the limit was installed,
+    // and a sandbox is allowed to hide processes from the count taken inside it. These
+    // four cases are the difference between a check about the sandbox and a check about
+    // how busy the host happens to be.
+    #[test]
+    fn a_cap_of_exactly_what_was_asked_is_not_an_escape() {
+        let outside = 92;
+        let asked = 256;
+        assert_eq!(
+            cap_is_as_asked(outside + asked, outside, outside, Some(asked)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sandbox_that_hides_the_process_count_is_not_blamed_for_it() {
+        // Landlock with `/proc/*` reads refused, and every pid-namespaced backend:
+        // the confined process counts fewer processes than the runner did, which is a
+        // fact about namespaces and not about the cap. Reading this the other way round
+        // refuses a job on any machine running more processes than the noise margin.
+        let outside = 92;
+        let asked = 256;
+        assert_eq!(
+            cap_is_as_asked(outside + asked, 0, outside, Some(asked)),
+            None
+        );
+        assert_eq!(
+            cap_is_as_asked(outside + asked, 2, outside, Some(asked)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cap_wider_than_the_job_asked_for_is_an_escape() {
+        let outside = 92;
+        let asked = 256;
+        // The limit a backend failed to lower, or lowered to something of its own
+        // choosing: off by thousands, not by the few the machine moved in between.
+        let refusal = cap_is_as_asked(outside + asked + 4000, 0, outside, Some(asked))
+            .expect("a cap nobody asked for is a finding");
+        assert!(refusal.contains("4256 more processes"), "{refusal}");
+        assert!(refusal.contains("counted inside the sandbox"), "{refusal}");
+    }
+
+    #[test]
+    fn no_cap_at_all_is_always_an_escape() {
+        assert!(cap_is_as_asked(u64::MAX, 0, 92, Some(256)).is_some());
+        // …and a job that asked for no cap is not refused for not having one.
+        assert_eq!(cap_is_as_asked(u64::MAX, 0, 92, None), None);
     }
 }
