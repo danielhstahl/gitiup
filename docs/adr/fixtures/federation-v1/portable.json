@@ -1,0 +1,174 @@
+{
+  "adr": "ADR-0005",
+  "budgets": {
+    "bytes": 1073741824,
+    "depth": 8,
+    "policy_chain": 64,
+    "records": 4096
+  },
+  "kinds": {
+    "abandon": "proof",
+    "advertisement": "state",
+    "attestation": "proof",
+    "change": "proof",
+    "code": "code",
+    "commitment": "proof",
+    "lease": "state",
+    "merge": "proof",
+    "policy": "proof",
+    "reveal": "proof",
+    "revocation": "proof",
+    "roster": "proof",
+    "round": "proof",
+    "signup": "state",
+    "verdict": "proof",
+    "withdrawal": "proof"
+  },
+  "principle": "the portable set is the verification closure; arbitration state and anything whose meaning is 'as of now' never travels",
+  "rows": [
+    {
+      "class": "proof",
+      "display": "`refs/attestations/<subject>/<digest>` \u2192 `kv/attestation/<hex>`",
+      "kind": "attestation",
+      "note": "the proof itself; its subject must be reachable or excused",
+      "portable": true
+    },
+    {
+      "class": "proof",
+      "display": "`refs/changes/<id>/attempt/<n>` \u2192 `kv/change/<hex>`",
+      "kind": "change",
+      "note": "immutable, create-only, and `chg-\u2026` re-derives identically anywhere",
+      "portable": true
+    },
+    {
+      "class": "pointer",
+      "display": "`refs/changes/<id>/head`",
+      "kind": null,
+      "note": "the current attempt is an as-of-now fact; resolve it, do not copy it",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "proof",
+      "display": "`refs/changes/<id>/{merged,abandoned}` \u2192 `kv/merge\\|abandon/<hex>`",
+      "kind": "merge",
+      "note": "a state that is a signed record plus one create-only ref",
+      "portable": true
+    },
+    {
+      "class": "foreign",
+      "display": "`refs/heads/**`",
+      "kind": null,
+      "note": "code travels by git; a merge is the base owner's CAS and cannot happen at a mirror",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/roster/<epoch:08x>`",
+      "kind": "roster",
+      "note": "immutable epoch; a round is auditable only against the epoch it pinned",
+      "portable": true
+    },
+    {
+      "class": "pointer",
+      "display": "`refs/gitiup/roster` (no epoch)",
+      "kind": null,
+      "note": "which epoch is live now is live state; the anti-rollback guard is a live-store rule",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "state",
+      "display": "`refs/gitiup/signup/<slot>`",
+      "kind": "signup",
+      "note": "a request awaiting a human; anyone approved is already inside an epoch",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/withdrawal/<slot>`, `refs/gitiup/revocation/<slot>`",
+      "kind": "revocation",
+      "note": "must travel with the epoch they affect, or the mirror serves an uncompromised-looking roster",
+      "portable": true
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/round/<change>/<job>/<attempt>`",
+      "kind": "round",
+      "note": "evidence only: the record travels, the arbitration does not",
+      "portable": true
+    },
+    {
+      "class": "state",
+      "display": "`refs/gitiup/job/<change>/<job>`",
+      "kind": "advertisement",
+      "note": "an invitation to arbitrate at a store that cannot seat anyone",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "state",
+      "display": "`refs/gitiup/lease/<change>/<job>/<slot>`",
+      "kind": "lease",
+      "note": "the purest as-of-now record in the system; there is no honest copy of it",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/commit/\u2026`, `refs/gitiup/reveal/\u2026`",
+      "kind": "reveal",
+      "note": "a reveal without its commitment is worth nothing, so both travel or neither",
+      "portable": true
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/verdict/<change>/<job>`",
+      "kind": "verdict",
+      "note": "with the round, epoch, reveals, commitments and policy it cites",
+      "portable": true
+    },
+    {
+      "class": "proof",
+      "display": "`refs/gitiup/policy/history/<rev>`",
+      "kind": "policy",
+      "note": "the chain walk answers which rules were in force, from bytes in hand",
+      "portable": true
+    },
+    {
+      "class": "pointer",
+      "display": "`refs/gitiup/policy/current`",
+      "kind": null,
+      "note": "which rules are live now; D6 of ADR-0004 already refuses to guess a history",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "local",
+      "display": "`refs/gitiup/kv/**` (the chain commits)",
+      "kind": null,
+      "note": "one store's private topology; the mirror appends the records to its own chain",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "local",
+      "display": "`kv/import/<digest>`, `kv/gc/<digest>`",
+      "kind": null,
+      "note": "how *this* store got and dropped what it has; evidence to a human, never an instruction",
+      "portable": false,
+      "token": "not_portable"
+    },
+    {
+      "class": "local",
+      "display": "ref caches, tombstones, pack layout, `host.json`, trust roots, `gitiup.toml`",
+      "kind": null,
+      "note": "transport furniture and local authority; a trust root that arrives over a wire is an attack",
+      "portable": false,
+      "token": "not_portable"
+    }
+  ],
+  "unit": "record + advertisement, bytes first (D1, D8)"
+}

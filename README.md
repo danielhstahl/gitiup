@@ -46,6 +46,15 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   vectors — two digests, five real signatures, a two-revision chain and 32 refusals —
   are reproduced in Rust by
   [`docs/adr/fixtures/policy-v1/`](docs/adr/fixtures/policy-v1/).
+* [ADR-0005 — what a mirror may carry, and what a copy is worth](docs/adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md) —
+  decided before anyone writes a sync command, because import is one `for` loop away from
+  laundering: a copy transfers bytes and never trust, the portable set is the verification
+  closure (and leases, pending sign-ups and every "as of now" pointer are not in it), a
+  mirror may serve bytes but may not attest to freshness it did not witness, and one
+  store's `gc` is not allowed to destroy another's only copy. Its portability table and
+  closure cases are generated vectors in
+  [`docs/adr/fixtures/federation-v1/`](docs/adr/fixtures/federation-v1/), and the ADR's
+  own tables are checked against them.
 * [The sandbox](docs/sandbox.md) — what `provenance.sandbox` is allowed to claim, the
   ladder (`docker`/`podman` → `bwrap` → Landlock → `unshare` → opt-in `plain`), what each
   rung denies and what it does not, how egress is refused by default, and what the escape

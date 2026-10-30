@@ -1,0 +1,526 @@
+{
+  "cases": [
+    {
+      "adr": "D1",
+      "already": [],
+      "case": "local-attestation",
+      "imported": [
+        "att:local",
+        "code:C1",
+        "pol:1"
+      ],
+      "note": "attestation + the policy revision in force + its subject",
+      "refused": [],
+      "start": [
+        "att:local"
+      ]
+    },
+    {
+      "adr": "D1",
+      "already": [],
+      "case": "quorum-attestation-complete",
+      "imported": [
+        "att:quorum",
+        "cmt:1",
+        "cmt:2",
+        "cmt:3",
+        "cmt:4",
+        "code:C1",
+        "pol:1",
+        "pol:2",
+        "rev:1",
+        "rev:2",
+        "rev:3",
+        "rev:4",
+        "revo:key:dead",
+        "rnd:0",
+        "ros:7",
+        "ver:0"
+      ],
+      "note": "the verdict, the round, the epoch, four reveals and their commitments, both policy revisions and the revocation",
+      "objects": 16,
+      "refused": [],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "missing-policy-revision",
+      "imported": [],
+      "note": "a cited revision absent at the source is a closure gap",
+      "refused": [
+        {
+          "detail": "policy_revision",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "closure_incomplete"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "missing-subject",
+      "imported": [],
+      "note": "`.3`'s --allow-missing-subject is the only excuse",
+      "refused": [
+        {
+          "detail": "subject",
+          "exit": 6,
+          "ref": "att:local",
+          "token": "subject_missing"
+        }
+      ],
+      "start": [
+        "att:local"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "subject-excused",
+      "imported": [
+        "att:local",
+        "pol:1"
+      ],
+      "note": "explicit, and reported",
+      "refused": [],
+      "start": [
+        "att:local"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "verdict-only-rumour",
+      "imported": [],
+      "note": "a verdict without its round is the rumour `.3` names",
+      "refused": [
+        {
+          "detail": "round",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "closure_incomplete"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "reveal-without-commitment",
+      "imported": [],
+      "note": "sealed: a reveal that cannot open its promise",
+      "refused": [
+        {
+          "detail": "the promise it must open",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "no_commitment"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "stale-roster-epoch",
+      "imported": [],
+      "note": "the epoch the round pinned, or nothing was verified",
+      "refused": [
+        {
+          "detail": "roster_epoch",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "closure_incomplete"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "revocation-carried",
+      "imported": [],
+      "note": "a roster without the revocations naming its keys",
+      "refused": [
+        {
+          "detail": "revocation",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "closure_incomplete"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D9",
+      "already": [],
+      "case": "policy-chain-broken",
+      "imported": [],
+      "note": "a present revision whose predecessor is missing is ADR-0004 D6's refusal, reached through a copy",
+      "refused": [
+        {
+          "detail": "pol:1",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "policy_history_missing"
+        }
+      ],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D2",
+      "already": [],
+      "case": "non-portable-in-listing",
+      "imported": [
+        "att:local",
+        "code:C1",
+        "pol:1"
+      ],
+      "note": "leases, pending sign-ups and advertisements are skipped by name, and the report says so",
+      "refused": [
+        {
+          "detail": "lease",
+          "exit": 6,
+          "ref": "lease:1",
+          "token": "not_portable"
+        },
+        {
+          "detail": "signup",
+          "exit": 6,
+          "ref": "signup:1",
+          "token": "not_portable"
+        },
+        {
+          "detail": "advertisement",
+          "exit": 6,
+          "ref": "job:1",
+          "token": "not_portable"
+        }
+      ],
+      "start": [
+        "att:local",
+        "lease:1",
+        "signup:1",
+        "job:1"
+      ]
+    },
+    {
+      "adr": "D7",
+      "already": [
+        "att:quorum"
+      ],
+      "case": "already-imported",
+      "collision": "already",
+      "imported": [],
+      "note": "re-running a fetch writes nothing",
+      "refused": [],
+      "start": [
+        "att:quorum"
+      ]
+    },
+    {
+      "adr": "D7",
+      "already": [],
+      "case": "head-resolves",
+      "imported": [],
+      "note": "a fast-forward: the reader resolves head and moves it under CAS",
+      "pointer": "resolved \u2192 attempt/3",
+      "refused": []
+    },
+    {
+      "adr": "D7",
+      "already": [],
+      "case": "head-diverged",
+      "imported": [],
+      "note": "a mirror reports a divergence, it never resolves one",
+      "pointer": "diverged",
+      "refused": [
+        {
+          "detail": "target holds attempt 4, source's newest is 3",
+          "exit": 6,
+          "ref": "refs/changes/chg-x/head",
+          "token": "diverged"
+        }
+      ]
+    },
+    {
+      "adr": "D7",
+      "already": [],
+      "case": "legacy-ref-respelled",
+      "expected_ref": "refs/attestations/code:C1/sha256:9f1c",
+      "imported": [],
+      "note": "respelled",
+      "refused": [],
+      "written_ref": "refs/attestations/code:C1/sha256:9f1c"
+    },
+    {
+      "adr": "D8",
+      "already": [],
+      "case": "age-gc-on-a-mirror",
+      "imported": [],
+      "note": "`claimed_at_us` is identical on every copy, so age pruning in lockstep is the real last-copy hazard",
+      "refused": [
+        {
+          "detail": "1 import records name an origin",
+          "exit": 6,
+          "ref": "--max-age 120d",
+          "token": "mirror_may_not_prune_by_age"
+        }
+      ]
+    },
+    {
+      "adr": "D8",
+      "allowed": true,
+      "already": [],
+      "case": "age-gc-at-the-origin",
+      "imported": [],
+      "note": "the vault prunes on policy",
+      "pruned": true,
+      "refused": []
+    },
+    {
+      "adr": "D8",
+      "already": [],
+      "case": "evict-without-source",
+      "imported": [],
+      "note": "no import record, so no re-fetch source, so this store is the only copy and has not earned the decision",
+      "refused": [
+        {
+          "detail": "sha256:9f1c",
+          "exit": 6,
+          "ref": "sha256:9f1c",
+          "token": "eviction_needs_source"
+        }
+      ]
+    },
+    {
+      "adr": "D8",
+      "allowed": true,
+      "already": [],
+      "case": "evict-with-source",
+      "evicted": true,
+      "imported": [],
+      "note": "a cache may forget what it can go and get again",
+      "refused": []
+    },
+    {
+      "adr": "D5",
+      "age_from_arrival_us": 3600000000,
+      "age_from_claim_us": 7200000000,
+      "already": [],
+      "case": "copy-is-fine-by-default",
+      "imported": [],
+      "note": "age is 2 h from the claim and 1 h from arrival: measuring from arrival is the freshness laundering D5 forbids",
+      "provenance": {
+        "age_basis": "claimed_at_us",
+        "age_us": 7200000000,
+        "arrived_at_us": 1793343600000000,
+        "arrived_from": "https://mirror.example.org/repo.git",
+        "closure": "complete",
+        "origin_seen": false,
+        "read_at_us": 1793347200000000,
+        "store": "copy",
+        "store_url": "https://mirror.example.org/repo.git"
+      },
+      "refused": []
+    },
+    {
+      "adr": "D5",
+      "already": [],
+      "case": "origin-provenance-required",
+      "imported": [],
+      "provenance": {
+        "age_basis": "claimed_at_us",
+        "age_us": 7200000000,
+        "arrived_at_us": 1793343600000000,
+        "arrived_from": "https://mirror.example.org/repo.git",
+        "closure": "complete",
+        "origin_seen": false,
+        "read_at_us": 1793347200000000,
+        "store": "copy",
+        "store_url": "https://mirror.example.org/repo.git"
+      },
+      "refused": [
+        {
+          "detail": "require_origin_seen is set and this is a copy",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "origin_provenance_required"
+        }
+      ]
+    },
+    {
+      "adr": "D5",
+      "already": [],
+      "case": "unlisted-mirror",
+      "imported": [],
+      "provenance": {
+        "age_basis": "claimed_at_us",
+        "age_us": 7200000000,
+        "arrived_at_us": 1793343600000000,
+        "arrived_from": "https://mirror.example.org/repo.git",
+        "closure": "complete",
+        "origin_seen": false,
+        "read_at_us": 1793347200000000,
+        "store": "copy",
+        "store_url": "https://mirror.example.org/repo.git"
+      },
+      "refused": [
+        {
+          "detail": "https://mirror.example.org/repo.git",
+          "exit": 6,
+          "ref": "att:quorum",
+          "token": "unlisted_mirror"
+        }
+      ]
+    },
+    {
+      "adr": "D5",
+      "already": [],
+      "case": "listed-mirror",
+      "imported": [],
+      "note": "an allowlist is a staleness statement, never a trust statement",
+      "provenance": {
+        "age_basis": "claimed_at_us",
+        "age_us": 7200000000,
+        "arrived_at_us": 1793343600000000,
+        "arrived_from": "https://mirror.example.org/repo.git",
+        "closure": "complete",
+        "origin_seen": false,
+        "read_at_us": 1793347200000000,
+        "store": "copy",
+        "store_url": "https://mirror.example.org/repo.git"
+      },
+      "refused": []
+    }
+  ],
+  "clock_us": 1793347200000000,
+  "genesis_previous": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "refusals": [
+    {
+      "exit": 6,
+      "token": "closure_budget_bytes"
+    },
+    {
+      "exit": 6,
+      "token": "closure_budget_depth"
+    },
+    {
+      "exit": 6,
+      "token": "closure_budget_records"
+    },
+    {
+      "exit": 6,
+      "token": "closure_incomplete"
+    },
+    {
+      "exit": 6,
+      "token": "diverged"
+    },
+    {
+      "exit": 6,
+      "token": "eviction_needs_source"
+    },
+    {
+      "exit": 6,
+      "token": "expired"
+    },
+    {
+      "exit": 6,
+      "token": "field_unknown"
+    },
+    {
+      "exit": 6,
+      "token": "gc_record_not_instruction"
+    },
+    {
+      "exit": 6,
+      "token": "mirror_may_not_prune_by_age"
+    },
+    {
+      "exit": 6,
+      "token": "no_arbitration_here"
+    },
+    {
+      "exit": 6,
+      "token": "no_commitment"
+    },
+    {
+      "exit": 6,
+      "token": "not_portable"
+    },
+    {
+      "exit": 6,
+      "token": "origin_provenance_required"
+    },
+    {
+      "exit": 6,
+      "token": "policy_chain_too_long"
+    },
+    {
+      "exit": 6,
+      "token": "policy_history_missing"
+    },
+    {
+      "exit": 6,
+      "token": "read_only"
+    },
+    {
+      "exit": 6,
+      "token": "revoked_key"
+    },
+    {
+      "exit": 6,
+      "token": "same_ref"
+    },
+    {
+      "exit": 6,
+      "token": "signer_untrusted"
+    },
+    {
+      "exit": 6,
+      "token": "subject_missing"
+    },
+    {
+      "exit": 6,
+      "token": "tier_not_allowed"
+    },
+    {
+      "exit": 6,
+      "token": "unlisted_mirror"
+    },
+    {
+      "exit": 7,
+      "token": "bad_signature"
+    },
+    {
+      "exit": 8,
+      "token": "binding_mismatch"
+    },
+    {
+      "exit": 8,
+      "token": "digest_mismatch"
+    },
+    {
+      "exit": 8,
+      "token": "not_canonical"
+    }
+  ]
+}
