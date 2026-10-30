@@ -82,6 +82,7 @@ mod digest;
 mod dispute;
 mod doctor;
 mod env;
+mod fetch;
 mod hook;
 mod keys;
 mod normalise;
@@ -131,6 +132,12 @@ COMMANDS:
     change checkout <ID> [OPTS]    the reviewer's side: fetch one change's commits and
                                    every proof filed for them into a clone as one thin
                                    pack, and say what arrived (the store is never written)
+    fetch [OPTIONS]                pull a copy of another store's proofs and changes into
+                                   one of your own: refs/attestations/**, refs/changes/**
+                                   and refs/gitiup/**, each host's own pack/CAS path, and
+                                   nothing that marks them trusted (ADR-0005)
+    push [OPTIONS]                 the same copy the other way round, from this store out
+                                   to a mirror; a mirror never pushes back
     verify attestation [DOC|-] [OPTIONS]
                                    is this attestation good enough to act on?
                                    (0 accepted · 6 refused · 7 bad signature ·
@@ -281,6 +288,8 @@ Try:
     gitiup change submit --record change.json --store ./store --json
     gitiup change list --store ./store --state open --json
     gitiup change show chg-6a6a8eab778ba4d0 --store ./store --json
+    gitiup fetch --remote upstream --store ./mirror --proofs-only --json   # evidence, no code
+    gitiup push  --remote mirror   --store ./store --change chg-6a6a8eab778ba4d0
     gitiup verify attestation proof.json --policy gitiup-policy.json     # the verdict
     gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
     gitiup verify change chg-6a6a8eab778ba4d0 --store ./store --json     # the merge gate
@@ -456,6 +465,8 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         "digest" => digest::run(&args[1..]),
         "attest" => attest::attest(&args[1..]),
         "change" => change::change(&args[1..]),
+        "fetch" => fetch::fetch(&args[1..]),
+        "push" => fetch::push(&args[1..]),
         "verify" => verify::verify(&args[1..]),
         "env" => env::run(&args[1..]),
         "normalise" => normalise::run(&args[1..]),

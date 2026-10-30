@@ -6,7 +6,7 @@
 * **Blocks**: `giti-g5c.2` (`gitiup fetch|push`: D1, D2, D6, D7, D8), `giti-g5c.3` (`gitiup attest import`: D3, D4, D9, D10), `giti-g5c.4` (`gitiup migrate repo`: D1, D6, D7), `giti-g5c.5` (anonymous read and credential scoping: D1's privacy row, D6's write direction); and it grows [ADR-0004](0004-published-policy-format-signing-and-resolution.md)'s field set by one optional member (`provenance`, D5), which `giti-91m`'s `.3`/`.4` readers have to accept before a mirror is useful
 * **Depends on**: [ADR-0001](0001-attestation-encoding-hash-and-signature.md) — canonical bytes and the digest that names them (D1, D2), the signature framing that makes byte identity load-bearing (D3), *freshness is policy, not a property of the document* (D6 — the whole of D5 below rests on it), the verification order and the exit-code taxonomy (D7), the volatile-field register as the template for "as of now" (D5), limits (D7); [ADR-0002](0002-roster-verifier-selection-and-sybil-resistance.md) — signed-record framing, roster epochs and the anti-rollback guard (D8), revocation voiding at verdict time (D9), `refs/gitiup/**` + hex slots as the record layout (D10), "the store's CAS *is* the arbitration" (D10, and the reason a copy cannot arbitrate); [ADR-0003](0003-change-record-format-and-merge-semantics.md) — the content-derived `chg-` id a copy re-derives identically (D3), two digests with different jobs (D4), refs and bytes-first write order (D5), attempts as create-only refs (D6), states derived from which refs exist (D7), a merge as a CAS fast-forward that cannot happen anywhere but the base's owner (D8); [ADR-0004](0004-published-policy-format-signing-and-resolution.md) — trust roots are local config and never travel in the document (C3, D3 below), the policy chain and `policy_history_missing` (D6), `policy/current` + `policy/history/**` (D7), "unknown fields refused" as the fail-closed reading rule (D10 below), the `protects` asymmetry that keeps `refs/attestations/**` and `refs/gitiup/**` open (C8); [host abstraction](../host-abstraction.md) — the CAS contract, bytes-then-ref publication, `referenced`-is-not-a-knob retention, `purge_cas` as the only honest forgetting, dumb HTTP as a legitimate read-only mirror, and `refs/gitiup/kv` as a per-store commit chain
 * **Reference vectors**: [`fixtures/federation-v1/`](fixtures/federation-v1/) — `generate.py` is a stdlib-only second implementation of the portability table (D1, D2) and the closure walk (D9); `portable.json` is the namespace table with a token for every `no`, `cases.json` is the closure cases and the refusal table. `--check-ad` fails if this document's tables and the generated data disagree
-* **Implemented by**: **nothing yet — deliberately.** The ticket's whole point is that the rules are written before the transport, so this row is a promise, not a report: `giti-g5c.2` lands D1/D2/D6/D7/D8 as `gitiup fetch|push`, `giti-g5c.3` lands D3/D4/D9/D10 as `gitiup attest import`, and D5's `provenance` member lands in `giti-91m`'s policy readers. What is *already* true of the code today is a real subset and it is worth naming, because those are the invariants this ADR extends rather than invents: `attest::publish` writes bytes before it writes the ref and is create-only, `attest::referenced` makes a live ref an un-prunable pin, `put_cas` refuses bytes that do not hash to the name they are filed under, `store::same_ref` refuses a record filed under the wrong ref, `gc` separates `plan` from `apply` and writes a `kv/gc/` record for what it decided, and the plain-git host already treats a dumb HTTP endpoint as a read-only mirror. What does not exist: `fetch`, `push`, `attest import`, `kv/import/`, the `provenance` policy member, and any refusal token named below that no code prints yet — see each decision's *status* line.
+* **Implemented by**: **`giti-g5c.2`, for the transport half — `gitiup fetch | gitiup push`** ([`crates/gitiup/src/fetch.rs`](../../crates/gitiup/src/fetch.rs) for the verbs, [`gitiup-host::federation`](../../crates/gitiup-host/src/federation.rs) for the rules, [`tests/federation.rs`](../../crates/gitiup-host/tests/federation.rs) and [`tests/fetch_cli.rs`](../../crates/gitiup/tests/fetch_cli.rs) for the proofs): D1's table as Rust rows asserted against the generated fixture by [`tests/federation_vectors.rs`](../../crates/gitiup-host/tests/federation_vectors.rs), the forge as both ends of a copy over the mock forge ([`gitiup-host-github/tests/federation.rs`](../../crates/gitiup-host-github/tests/federation.rs)), D2's refusals per ref by token, D6's one-way shape and the `read_only` refusal, D7's create-only collision semantics, pointer rule and legacy respelling, and D8 rule 1's write order with `kv/import/**` arrival records for every digest that lands. What is *still* not built belongs to the tickets named above: `gitiup attest import`'s verify ladder and closure walk (D4, D9), the `provenance` block in a verify report and the `provenance` policy member (D5), the mirror's capacity eviction and `mirror_may_not_prune_by_age` (D8 rule 2 — now buildable, since a store can at last tell it is a mirror), and any refusal token below that no code prints yet. `federation::REFUSALS` registers all 27 so an exit code is never guessed at, and `federation::knows_token` is what a test asserts against.
 
 > A copy is the easiest feature in this product to build: the bytes are signed, the
 > names are content-derived, and git already moves packs for a living. That is exactly
@@ -82,7 +82,13 @@ what is left).
 
 ## D1 — The portable set: the verification closure
 
-**Status: decided, not built — `giti-g5c.2` writes the ref filters, `giti-g5c.3` the walk.**
+**Status: built for the copy.** `gitiup fetch|push` carries this table as
+[`federation/portable.rs`](../../crates/gitiup-host/src/federation/portable.rs), one row
+per line of the table below, asserted against `fixtures/federation-v1/portable.json` by
+`crates/gitiup-host/tests/federation_vectors.rs`. The closure *walk* — following a
+record's citations instead of listing a namespace, which is what makes a `--proofs-only`
+mirror a closure rather than a prefix — is `giti-g5c.3`'s, and `--proofs-only` here is the
+scope filter, not the walk.
 
 **Decision.** A record is portable when a reader needs it in order to re-verify
 something this store serves, and is not portable otherwise. That is one principle with
@@ -138,7 +144,12 @@ whichever pack protocol shortcut was cheapest.
 
 ## D2 — The register of what may not be copied
 
-**Status: decided; `giti-g5c.2` refuses each row by token.**
+**Status: built.** Every non-portable ref in scope is refused by name in the report —
+`refused[]` per ref with its token, `refused_by` and `skipped_by_class` as the tallies —
+so "we did not copy that" is a sentence and never a silence. The pointer rule is built
+too: `refs/changes/<id>/head` is resolved on the reader's side, the attempt it names is
+what travels, and the pointer move is reported (`resolved head → attempt/3`) rather than
+copied.
 
 **Decision.** The non-portable rows above are one category, and it is worth stating
 separately because the category, not the list, is what the code should check:
@@ -186,7 +197,12 @@ ways* is D6.
 
 ## D3 — A copy transfers bytes and never trust
 
-**Status: decided; `giti-g5c.3` implements it and `giti-g5c.2` must not grow the flag.**
+**Status: decided; `giti-g5c.3` implements it, and `giti-g5c.2` must not grow the flag —
+and has not.** The transport surface has no trust flag of any spelling (its CLI test
+asserts the four forbidden spellings each exit 2), its report's only trust field is the
+constant `trust: "none"`, and it writes no `kv/**` mark, no manifest and no mirror
+signature. There is no capability bit for it either: `Capabilities` is unchanged by this
+ticket.
 
 **Decision.** The three questions a reader asks about a proof stay in three different
 places, and no code path is allowed to substitute one for another:
@@ -297,9 +313,13 @@ integrity becomes a rumour. *"Verify once and mark it"* is D3 clause 3.
 
 ## D5 — Authority, availability, and how a stale copy is marked
 
-**Status: decided. `kv/import/` and the report's `provenance` block land with `giti-g5c.3`;
-the `provenance` *policy* member lands with `giti-91m`'s readers and is a compatibility
-change to [ADR-0004 D5](0004-published-policy-format-signing-and-resolution.md).**
+**Status: decided in full; built for the copy's half of it.** `kv/import/<digest>` is
+written by `gitiup fetch|push` for every digest that lands (`gitiup-import-1`: the
+source, `arrived_at_us`, the refs it was advertised under, and `closure: "not-walked"`
+until `.3` walks it), and the copy report prints `age_basis: "claimed_at_us"` as clause
+1's checkable invariant. The `provenance` block in a *verify* report and the *policy*
+member land with `giti-g5c.3` and `giti-91m`'s readers respectively; the latter is a
+compatibility change to [ADR-0004 D5](0004-published-policy-format-signing-and-resolution.md).
 
 **Decision.** A mirror's promise is availability: *the bytes will still be here when the
 origin is not.* The thing it is forbidden to promise is freshness. Three clauses.
@@ -418,7 +438,13 @@ merge depends on while still claiming to be a faithful copy.
 
 ## D6 — Direction: an origin pushes to a mirror
 
-**Status: decided; `giti-g5c.2` implements both verbs and the refusal.**
+**Status: built.** `gitiup push --remote mirror` is origin → mirror and `gitiup fetch
+--remote upstream` is a reader pulling a copy in, and the two verbs are one function with
+its arguments swapped (`gitiup-host::federation::copy`) — which is the structural reason
+the rules cannot drift between directions. There is no `sync` and no bidirectional remote;
+a read-only store is refused at the boundary with `read_only`, and a write that would
+require the store to arbitrate is refused with `no_arbitration_here` by the same table
+that decides scope.
 
 **Decision.** Copies travel **one way: from an origin to a mirror.** `gitiup push
 --remote mirror` is origin → mirror; `gitiup fetch --remote upstream` is what a *reader*
@@ -469,8 +495,14 @@ to stop reading them.
 
 ## D7 — Republish: same digest, same ref name, `already`
 
-**Status: decided; `giti-g5c.2`'s write path and `gitiup attest import`'s collision
-handling.**
+**Status: built for `gitiup fetch|push`.** Bytes are written with the *destination's* own
+`put_cas`, so a name that already stands against the same digest reports `already` and
+writes nothing, and a name that stands against a **different** digest is
+`digest_mismatch` (8) with nothing written — never a suffix, never an overwrite. Pointer
+moves are `Expect::Is` only, and a non-fast-forward is the report `diverged`. A legacy
+single-level attestation ref is read, re-spelled as `<subject>/<digest>`, reported
+`respelled`, and never re-created in the old shape. `gitiup attest import` inherits all of
+it by calling the same write path.
 
 **Decision.**
 
@@ -891,12 +923,13 @@ work this ADR creates and is not free. `provenance` is a new field in a signed d
 older builds will refuse to read *when it is used*, which is the intended fail-closed
 behaviour and will still read as a bug report once. And D5's "no code path may compute age
 from arrival" is the kind of rule that wants a lint: without one it survives by review, and
-review is weakest exactly where a timestamp looks innocuous. One more cost is owed
-forward: the vectors in [`fixtures/federation-v1/`](fixtures/federation-v1/) are run by
-nothing but themselves until the transport exists, so `giti-g5c.2` owes a CI line running
-`generate.py --check`, `--check-ad` and `--selftest` alongside the Rust consumers it
-inherits — an unrun vector rots, and a rotted vector is worse than none because it is
-believed.
+review is weakest exactly where a timestamp looks innocuous. One more cost was owed
+forward and `giti-g5c.2` has paid it: the vectors in
+[`fixtures/federation-v1/`](fixtures/federation-v1/) are run by
+[`host-conformance.yml`](../../.github/workflows/host-conformance.yml) (`generate.py
+--check`, `--check-ad`, `--selftest`) alongside the Rust consumer it inherits,
+`crates/gitiup-host/tests/federation_vectors.rs` — an unrun vector rots, and a rotted
+vector is worse than none because it is believed.
 
 **Explicitly out of scope, decided elsewhere.** *Who may write* — credentials, anonymous
 read scoping, deploy keys (`giti-g5c.5`); *how a mirror is discovered* — there is no

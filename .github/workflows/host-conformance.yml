@@ -90,6 +90,20 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy -p gitiup-host-tests --features s3,github --all-targets -j 3
 
+      # ADR-0005's portability table and closure rules are generated data, and the ADR's
+      # own cost section says an unrun vector rots: `portable.json` and `cases.json` are
+      # what `gitiup fetch|push` and `gitiup attest import` are not allowed to disagree
+      # with, so the generator re-derives them from the ADR's prose rules (`--check`),
+      # checks the ADR's tables against them (`--check-ad`), and re-implements the closure
+      # walk independently (`--selftest`). The Rust side is checked against the same files
+      # by `gitiup-host`'s `federation_vectors` test.
+      - name: ADR-0005 federation vectors
+        run: |
+          python3 docs/adr/fixtures/federation-v1/generate.py --check
+          python3 docs/adr/fixtures/federation-v1/generate.py --check-ad
+          python3 docs/adr/fixtures/federation-v1/generate.py --selftest
+          cargo test -p gitiup-host -j 3 --test federation_vectors
+
       # The same repositories the suite would serve itself, but served the way an
       # operator serves them: `git-http-backend` behind a CGI, rooted at a
       # directory, with anonymous pushes enabled per repository (which the suite's

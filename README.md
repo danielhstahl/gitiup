@@ -55,6 +55,13 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   closure cases are generated vectors in
   [`docs/adr/fixtures/federation-v1/`](docs/adr/fixtures/federation-v1/), and the ADR's
   own tables are checked against them.
+* [Federation — moving proofs between stores](docs/federation.md) — `gitiup fetch | push`:
+  the two verbs that carry `refs/attestations/**`, `refs/changes/**` and the quorum records
+  a proof leans on between any two hosts (a directory store, a bucket, a repository, a
+  forge) using each host's own pack and CAS paths; what travels, what is refused out loud
+  and by which token, why a pointer is resolved rather than copied, what an arrival record
+  at `kv/import/<digest>` answers, and why the report says `trust none` on every run of
+  every host pair.
 * [The sandbox](docs/sandbox.md) — what `provenance.sandbox` is allowed to claim, the
   ladder (`docker`/`podman` → `bwrap` → Landlock → `unshare` → opt-in `plain`), what each
   rung denies and what it does not, how egress is refused by default, and what the escape

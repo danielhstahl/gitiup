@@ -91,6 +91,8 @@ pub mod change;
 pub mod config;
 pub mod conformance;
 pub mod error;
+/// Federation: what a store may copy out of itself, and how (ADR-0005).
+pub mod federation;
 pub mod hosts;
 pub mod oid;
 pub mod pack;
@@ -105,6 +107,7 @@ pub use config::{
     Config, CredentialProfile, Credentials, RemoteConfig, RemoteScheme, RemoteUrl, canonical_json,
 };
 pub use error::{HostError, HostErrorExt, HostErrorKind, HostResult};
+pub use federation::{CopyReport, Refusal, copy as federation_copy};
 pub use hosts::fs::FsHost;
 pub use hosts::s3::bucket::{
     Bucket, BucketError, BucketFacts, BucketInfo, MemoryBucket, MemoryBucketConfig, Object,
