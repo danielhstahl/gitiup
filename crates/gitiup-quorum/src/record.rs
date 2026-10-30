@@ -39,6 +39,8 @@ pub const WITHDRAWAL_PAYLOAD_TYPE: &str = "application/vnd.gitiup.withdrawal+jso
 pub const ROUND_PAYLOAD_TYPE: &str = "application/vnd.gitiup.round+json";
 /// A verdict record (giti-msi.7).
 pub const VERDICT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.verdict+json";
+/// A `tier: quorum` attestation — the verdict, in an attestation's clothes (giti-zp1.5).
+pub const QUORUM_ATTESTATION_PAYLOAD_TYPE: &str = "application/vnd.gitiup.quorum-attestation+json";
 /// A job advertisement (giti-zp1.1): the round's invitation, published where a
 /// volunteer looking for work can find it.
 pub const ADVERTISEMENT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.job-advertisement+json";
@@ -270,6 +272,17 @@ impl Record for crate::verdict::VerdictRecord {
     /// "the store said so" bug, so `store::verdict_at` takes the trust and does it.
     fn load(bytes: &[u8]) -> crate::error::Result<Self> {
         let record: crate::verdict::VerdictRecord = from_canonical_bytes(bytes)?;
+        record.validate()?;
+        require_same_bytes(&record, bytes)?;
+        Ok(record)
+    }
+}
+
+impl Record for crate::attestation::QuorumAttestation {
+    /// Loads and structurally validates; the trust list is the caller's, as it is for
+    /// a verdict.
+    fn load(bytes: &[u8]) -> crate::error::Result<Self> {
+        let record: crate::attestation::QuorumAttestation = from_canonical_bytes(bytes)?;
         record.validate()?;
         require_same_bytes(&record, bytes)?;
         Ok(record)

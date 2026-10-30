@@ -76,6 +76,7 @@ use gitiup_host::attest;
 use gitiup_host::change as change_host;
 use gitiup_host::refs::ns;
 use gitiup_host::{Oid, RefQuery};
+use gitiup_quorum::attestation::{QuorumAttestation, rederive};
 use gitiup_quorum::policy::{self, PolicyError, Purpose, ResolvedPolicy};
 use gitiup_quorum::store as quorum_store;
 use gitiup_quorum::verdict::{QuorumState, VerdictRecord};
@@ -261,6 +262,15 @@ pub(crate) struct Section {
     pub(crate) reference: String,
     /// `doc`, when the bytes were a document this build speaks.
     pub(crate) doc: Option<AttestationDoc>,
+    /// The bytes were a `tier: quorum` attestation: a statement about *other*
+    /// attestations, judged by re-deriving the verdict it states rather than by
+    /// checking a run's own bindings.
+    pub(crate) quorum: Option<QuorumAttestation>,
+    /// The rendered rows of what a quorum attestation says (`Facts` describes a run,
+    /// and this is not one).
+    pub(crate) quorum_text: Vec<String>,
+    /// The `quorum` block of this section's JSON.
+    pub(crate) quorum_json: Option<Value>,
     /// What the document says, when there was a document to ask.
     pub(crate) facts: Option<Facts>,
     /// The attestation's own report — the `verify attestation` shape, unchanged.
@@ -277,6 +287,9 @@ impl Section {
             digest,
             reference,
             doc: None,
+            quorum: None,
+            quorum_text: Vec::new(),
+            quorum_json: None,
             facts: None,
             report: VerdictReport::refusing(code, error),
             policy: None,
@@ -314,6 +327,17 @@ impl Section {
 
     /// The key ids on this proof that the policy applied to it would trust.
     pub(crate) fn signers(&self) -> Vec<String> {
+        if let Some(quorum) = &self.quorum {
+            // The seats are the certifying identities. A quorum attestation counts the
+            // way a verdict does — because it *is* the verdict, restated at the tier the
+            // policy asks for — so `min_signatures` is measured against the agreement the
+            // round reached and not against the one key that filed the summary.
+            return quorum
+                .counted
+                .iter()
+                .map(|seat| seat.key_id.clone())
+                .collect();
+        }
         let Some(doc) = &self.doc else {
             return Vec::new();
         };
@@ -340,12 +364,18 @@ impl Section {
     }
 
     pub(crate) fn result_digest(&self) -> Option<String> {
+        if let Some(quorum) = &self.quorum {
+            return Some(quorum.result_digest.to_string());
+        }
         self.facts
             .as_ref()
             .and_then(|facts| facts.result_digest().map(str::to_string))
     }
 
     pub(crate) fn job(&self) -> Option<&str> {
+        if let Some(quorum) = &self.quorum {
+            return Some(quorum.job_id.as_str());
+        }
         self.facts.as_ref().and_then(|facts| facts.job())
     }
 
@@ -373,6 +403,9 @@ impl Section {
             "attestation".into(),
             self.facts.as_ref().map(Facts::json).unwrap_or(Value::Null),
         );
+        if let Some(quorum) = &self.quorum_json {
+            out.insert("quorum".into(), quorum.clone());
+        }
         Value::Object(out)
     }
 
@@ -394,6 +427,9 @@ impl Section {
         let mut rows: Vec<Row> = Vec::new();
         if let Some(facts) = &self.facts {
             facts.rows(now, &mut rows);
+        }
+        for row in &self.quorum_text {
+            out.push_str(&format!("      {}", row.trim_start()));
         }
         for row in &rows {
             out.push_str(&format!("      {}", row.render().trim_start()));
@@ -1658,12 +1694,42 @@ pub(crate) fn read_proofs(
             ));
             continue;
         }
+        if QuorumAttestation::looks_like(&bytes) {
+            // A `tier: quorum` attestation lives in this same namespace, beside the
+            // individual proofs it summarises. It is not a run attestation and does not
+            // go near the run ladder: its evidence is a round's, and `rederive` is the
+            // only thing allowed to decide whether it says true.
+            match <QuorumAttestation as gitiup_quorum::record::Record>::load(&bytes) {
+                Ok(quorum) => sections.push(Section {
+                    digest: entry.digest,
+                    reference,
+                    doc: None,
+                    quorum: Some(quorum),
+                    quorum_text: Vec::new(),
+                    quorum_json: None,
+                    facts: None,
+                    report: VerdictReport::default(),
+                    policy: None,
+                    policy_error: None,
+                }),
+                Err(error) => sections.push(Section::unread(
+                    entry.digest,
+                    reference,
+                    "structure",
+                    verify::quorum_error(error),
+                )),
+            }
+            continue;
+        }
         match AttestationDoc::from_canonical_bytes(&bytes) {
             Ok(doc) => sections.push(Section {
                 digest: entry.digest,
                 reference,
                 facts: Some(Facts::of(&doc)),
                 doc: Some(doc),
+                quorum: None,
+                quorum_text: Vec::new(),
+                quorum_json: None,
                 // Filled in below, once the policy for this proof's timestamp is known.
                 report: VerdictReport::default(),
                 policy: None,
@@ -1678,6 +1744,97 @@ pub(crate) fn read_proofs(
     // 5. each proof is judged by the revision in force when its run happened (D6), with
     //    the change head as the commit binding and the reader's clock for freshness.
     let mut resolved_cache: BTreeMap<i64, Result<ResolvedPolicy, PolicyError>> = BTreeMap::new();
+    // A `tier: quorum` attestation is judged by re-deriving the verdict it states, and
+    // that needs the store, the trust roots and the clock — so it happens here, beside the
+    // individual proofs it summarises, under the same D6 rule about which revision was in
+    // force when the claim was made.
+    for section in sections.iter_mut() {
+        let Some(quorum) = section.quorum.clone() else {
+            continue;
+        };
+        let at = question
+            .at
+            .unwrap_or(gitiup_attest::TimeUs(quorum.claimed_at_us));
+        let entry = resolved_cache
+            .entry(at.0)
+            .or_insert_with(|| question.resolve(at, "run-claim"));
+        let resolved = match entry {
+            Ok(resolved) => resolved.clone(),
+            Err(error) => {
+                section.policy_error = Some(error.clone());
+                section.report = VerdictReport::refusing(
+                    "structure",
+                    AttestError::new(
+                        ErrorKind::Policy,
+                        "policy",
+                        format!("{}: {}", error.token(), error.detail),
+                    ),
+                );
+                continue;
+            }
+        };
+        let mut judged = resolved.clone();
+        judged.policy.now = Some(question.now);
+        judged.policy.expected_commit = Some(head.clone());
+        let store = question
+            .store
+            .map(|opened| opened.what.clone())
+            .unwrap_or_else(|| "no store".to_string());
+        let derivation = match question.store {
+            None => verify::Derivation::NoStore,
+            Some(opened) => {
+                match rederive(
+                    &*opened.host,
+                    &quorum,
+                    &question.roots,
+                    &verify::quorum_evaluation(&judged.policy),
+                ) {
+                    Err(gitiup_quorum::Error::Store(error)) => {
+                        return Err(CliError::io(format!(
+                            "read the quorum's evidence: {}: {}",
+                            error.context, error.detail
+                        )));
+                    }
+                    Err(error) => verify::Derivation::Failed(error),
+                    Ok(rederived) => verify::Derivation::Done(Box::new(rederived)),
+                }
+            }
+        };
+        // Same deal as the run ladder: `min_signatures` is a question about the set of
+        // proofs a change carries, and `combine` is where it is answered.
+        let demanded = judged.policy.min_signatures;
+        let (report, rows, json) = verify::quorum_ladder(
+            &quorum,
+            &verify::QuorumLadder {
+                tier_allowed: judged.policy.allowed_tiers.contains(&Tier::Quorum),
+                trust: &question.roots,
+                min_signatures: demanded.min(1),
+                freshness: &judged.policy,
+                derivation,
+                store: Some(store),
+            },
+        );
+        section.report = report;
+        section.quorum_text = rows.iter().map(|row| row.render()).collect();
+        section.quorum_json = Some(json);
+        section.policy = Some(judged);
+        if demanded > 1 {
+            if let Some(check) = section
+                .report
+                .checks
+                .iter_mut()
+                .find(|check| check.code == "min_signatures")
+            {
+                check.outcome = CheckOutcome::NotAsked;
+            }
+            notes.push(format!(
+                "{}: the policy requires {demanded} distinct signatures; a quorum attestation \
+                 carries the seats that agreed, so they are counted with the other proofs for \
+                 this change, not against this document alone",
+                short(&section.digest.hex())
+            ));
+        }
+    }
     for section in sections.iter_mut() {
         let Some(doc) = section.doc.clone() else {
             continue;
@@ -1874,6 +2031,29 @@ fn judge_quorum(
         outcome: CheckOutcome::NotAsked,
     };
     if verdicts.is_empty() {
+        // A `tier: quorum` attestation is the verdict restated at the tier a policy can ask
+        // for, and it was judged among the sections below — re-derived from the round, not
+        // read. When one of those carried the change, the quorum question *was* answered,
+        // and reporting `not_asked` because no verdict *record* was filed would understate
+        // what the gate actually rested on.
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.quorum.is_some() && section.accepted())
+        {
+            let seats = section
+                .quorum
+                .as_ref()
+                .map(|quorum| quorum.counted.len())
+                .unwrap_or_default();
+            call.outcome = CheckOutcome::Passed;
+            call.notes.push(format!(
+                "no verdict record is filed for this change: the quorum answer came from the \
+                 `tier: quorum` attestation {}, whose {seats} counted seats were re-derived \
+                 from the round and its submissions rather than read from the document",
+                short(&section.digest.hex())
+            ));
+            return call;
+        }
         // No verdict in the store is only a refusal where the owner's policy asks for a
         // quorum proof and nothing else about the change can pay for the merge: a policy
         // whose tiers include `local` is normally satisfied by one good attestation, and
@@ -2299,6 +2479,66 @@ mod tests {
             let error = CliError::scored(code, "fault", None);
             assert!(verdictly(&error).is_err(), "exit {code} is a fault");
         }
+    }
+
+    /// A `tier: quorum` attestation is a proof about other proofs, and the merge gate has
+    /// to read it that way: what it contributes to `min_signatures` is the seats that
+    /// agreed, and what it binds is the round's own job and result — not the one key that
+    /// filed the summary, and not a run's manifest (it has none).
+    #[test]
+    fn a_quorum_section_counts_the_seats_and_binds_the_rounds_result() {
+        use gitiup_quorum::attestation::QuorumAttestation;
+        use gitiup_quorum::derive::SelectionSecret;
+        use gitiup_quorum::prelude::Round;
+        use gitiup_quorum::sample;
+        use gitiup_quorum::verdict::Evaluation;
+
+        let owner = sample::owner_key();
+        let roster = sample::roster_of(&owner, 7, 41);
+        let inputs = sample::round_inputs(&roster, "chg-000000000000f00d", "build");
+        let secret = SelectionSecret::from_signing_key(&owner);
+        let mut round = Round::open(&inputs, &roster, &secret).expect("the round opens");
+        round.sign(&owner).expect("the selector signs");
+        let seats = sample::indices_of(&round);
+        let docs = sample::attest(&round, &seats, sample::claimed_at_us(), |_| None);
+        let verdict = VerdictRecord::evaluate(
+            &round,
+            &roster,
+            &docs,
+            &[],
+            &Evaluation::at(sample::clock()),
+        )
+        .expect("the tally runs");
+        let attestation = QuorumAttestation::from_verdict(&round, &verdict).expect("attestable");
+        let section = Section {
+            digest: Oid::hash_bytes(b"a quorum attestation"),
+            reference: "refs/attestations/deadbeef/cafe".to_string(),
+            doc: None,
+            quorum: Some(attestation.clone()),
+            quorum_text: Vec::new(),
+            quorum_json: None,
+            facts: None,
+            report: gitiup_attest::VerdictReport::default(),
+            policy: None,
+            policy_error: None,
+        };
+        assert_eq!(
+            section.signers(),
+            attestation
+                .counted
+                .iter()
+                .map(|seat| seat.key_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(section.job(), Some(attestation.job_id.as_str()));
+        assert_eq!(
+            section.result_digest().as_deref(),
+            Some(attestation.result_digest.to_string().as_str())
+        );
+        // A run attestation's ladder would have had nothing to say about it: there is no
+        // manifest here, and the section says so instead of pretending.
+        assert!(section.facts.is_none());
+        assert_eq!(attestation.counted.len(), verdict.agreeing);
     }
 
     #[test]

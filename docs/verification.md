@@ -93,6 +93,53 @@ correctly at all" are different incidents with different responses. An entry tha
 claims a famous fingerprint while carrying a different key fails at `signature` and
 is never asked about trust.
 
+## The quorum ladder (`tier: quorum`)
+
+A `tier: quorum` attestation is not a run's proof. It is a signed statement about a
+round: the round it names, the roster epoch and digest it was tallied under, the
+`ResultDigest` the seats agreed on, and the seats that agreed
+([`gitiup_quorum::attestation`](../crates/gitiup-quorum/src/attestation.rs),
+[giti-zp1.5](quorum.md#attesting-it-gitiup-quorum-verdict--attest)). It is produced by
+`gitiup quorum verdict --attest` and by nothing else — `QuorumAttestation::from_verdict`
+is the only constructor and it refuses a verdict that is not `verified`.
+
+Because it summarises other attestations rather than describing a run, it is judged on a
+ladder of its own, and the difference is one question: **can the verdict be re-derived
+from the evidence still in the store?** The document is never believed because of what it
+says.
+
+```sh
+# a document handed over, checked against the store that ran the round
+gitiup verify attestation quorum.json --tier quorum --evidence ./store --trust owner
+
+# a document read out of the store, where the same store holds its evidence
+gitiup verify attestation --store ./store --digest <hex> --tier quorum --trust owner
+```
+
+| code | what it establishes | fails as |
+|------|---------------------|----------|
+| `structure`, `digest` | the bytes are a canonical, self-consistent quorum attestation (its own digest re-hashes) | 6, or 8 |
+| `tier` | the policy in force accepts `quorum` at all | 6 |
+| `signature`, `trust`, `min_signatures` | the key that *asserts* the statement is trusted, is the selector that opened the round, and enough of them did | 7, 6 |
+| `commit` | with a commit binding, it speaks about that commit | 8 |
+| `round`, `roster` | the round it names is in the store, the selector's signature holds, and the roster epoch and digest match it | 8 |
+| `verdict` | re-running `VerdictRecord::evaluate` over the round, the published submissions and the revocations yields the state, reason and result the document states | 6, or 8 for the result digest |
+| `seats` | the seats it lists are the seats the tally counted, at the tier the roster qualifies them for | 6 |
+| `freshness` | the claim is inside `max-age` of the clock, and not expired | 6 |
+
+Three consequences are deliberate. A quorum attestation with **no store to re-derive
+from** is refused (`verdict`, exit 6) even when its signature is perfect: a file can
+always be labelled quorum, which proves nothing. A **seat revoked after the fact** undoes
+the attestation, because the re-derivation applies revocation as of now, exactly as the
+tally did. And a document whose `result_digest` is not the one the evidence produces is a
+digest mismatch (**8**), not a policy refusal — a gate branches on those two differently
+and should.
+
+The same ladder runs inside `gitiup verify change`: a quorum attestation advertised for
+the change's head is a section of its own, judged under the revision in force when the
+claim was made, and it counts as the **seats** it lists for `min_signatures` — not as the
+one key that filed the summary.
+
 ## The machine-readable verdict
 
 `--json` prints one line, keys sorted, and the shape is pinned by a test:
@@ -139,11 +186,18 @@ Two blocks earn their place there:
   environment requirement and the clock used are all printed. A gate that logs this
   can be audited afterwards; a bare `0` cannot.
 * **`attestation`** — printed for refusals too, because a rejected proof is exactly
-  when a human needs to see its tier, its signers and its age. It is `null` only when
-  the bytes were not a document at all. `source` names where the bytes came from, and
-  `stored` carries the store's content address when they came from one — so a verdict
-  can be tied to the exact object that was read, not just to the digest someone asked
-  for.
+  when a human needs to see its tier, its signers and its age. It is `null` when the
+  bytes were not a document at all, and when they were a `tier: quorum` attestation:
+  that document describes no run, so it has no run to describe. `source` names where the
+  bytes came from, and `stored` carries the store's content address when they came from
+  one — so a verdict can be tied to the exact object that was read, not just to the
+  digest someone asked for.
+* **`tier` and `quorum`** — present together, and only for a `tier: quorum` document:
+  the tier the ladder judged, and what the document claims about its round (state,
+  reason, agreement, seats) next to `rederived` — what the store's own evidence tallies
+  to now, or `null` when nothing could re-derive it. A gate reading `--json` should look
+  at `tier` first: the two documents are judged on different ladders and a check code
+  means something different on each.
 
 `-q` is the one-word form for a shell that only tests the exit code: `ok`, or the code
 of the reason that decided the verdict (`freshness`, `trust`, `signature`, …).

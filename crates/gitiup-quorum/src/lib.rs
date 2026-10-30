@@ -90,6 +90,7 @@
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
+pub mod attestation;
 pub mod capability;
 pub mod derive;
 pub mod error;
@@ -107,6 +108,10 @@ pub mod verdict;
 
 pub mod sample;
 
+pub use attestation::{
+    QUORUM_ATTESTATION_SCHEMA_VERSION, QUORUM_ATTESTATION_TYPE, QUORUM_TIER, QuorumAttestation,
+    QuorumSeat, Rederived, rederive,
+};
 pub use capability::{Capabilities, Exclusion, Requirements, RosterTier, exclusion_of};
 pub use derive::{ROUND_KIND, SelectionSecret};
 pub use error::{Error, Result};

@@ -501,6 +501,36 @@ Five rules, each of which is a line of code rather than a paragraph of advice:
   canonical signed bytes and keeps the report off stdout entirely (it refuses to share
   the stream with `--json`, since one would corrupt the other).
 
+### Attesting it: `gitiup quorum verdict --attest`
+
+A verdict is the store's own record. A `tier: quorum` **attestation** is the same
+conclusion in the currency a policy can ask for — `allowed_tiers: ["quorum"]` means
+something only if there is a document that carries that tier
+([`QuorumAttestation`](../crates/gitiup-quorum/src/attestation.rs), giti-zp1.5):
+
+```sh
+# state the verdict as a quorum attestation, filed among the attestations of the head
+# the round was run on
+gitiup quorum verdict chg-6a6a --store ./store --job build --attest store --key owner
+
+# …or hand the signed bytes to someone who is not going to be given the store
+gitiup quorum verdict chg-6a6a --store ./store --attest ./quorum.json --key owner
+```
+
+It binds the round id and digest, the roster epoch and digest, the agreeing
+`ResultDigest` and the seats that produced the verdict, and it re-summarises none of
+their bytes: the seats are *named*, their attestations are still fetched from the store.
+There are two rules and both are in the library, not the CLI:
+
+* **only a verdict makes one.** `QuorumAttestation::from_verdict` is the only way to build
+  one, and it refuses a verdict that is not `verified` — a `failed` tally has no
+  `ResultDigest` to carry and an `insufficient` one has no quorum. `--attest` on a round
+  that did not verify writes nothing and exits with the verdict's own code.
+* **only re-derivation believes one.** `gitiup verify attestation --tier quorum` re-runs
+  `VerdictRecord::evaluate` — the same call, on the same records, as this command just
+  made — and refuses anything the evidence does not back. See
+  [the quorum ladder](verification.md#the-quorum-ladder-tier-quorum).
+
 ### Filing it: superseded, never edited
 
 `--publish` signs the verdict with this machine's key and CAS-writes it at

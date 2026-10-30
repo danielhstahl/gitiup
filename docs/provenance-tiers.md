@@ -65,10 +65,26 @@ policy: a single-run manifest may not carry tier `quorum`
 * The CLI has nothing to say: there is no flag for it, and `gitiup run --tier quorum` is
   an unknown-option error (exit 2) whose text explains why.
 
-When giti-msi.7 computes agreement across verifiers, the thing it produces is a record
-*about* attestations; whether that record itself carries `tier: quorum` or is a separate
-signed object is that ticket's decision. What this ticket settles is that no amount of
-local running gets a single run to claim it.
+What giti-msi.7 computes across verifiers is a *verdict*, and giti-zp1.5 settled how it
+reaches the tier vocabulary: a `tier: quorum` attestation is a **separate signed object**
+([`gitiup_quorum::attestation`](../crates/gitiup-quorum/src/attestation.rs)), not a run
+manifest wearing a better label. It is a record about attestations — it names the round, the
+roster epoch and digest, the agreeing `ResultDigest` and the seats that produced them, and
+re-summarises none of their bytes — so there is nothing in it for a single run to claim.
+
+Two rules keep it honest, and both are enforced outside the CLI:
+
+* **Only a verdict makes one.** `QuorumAttestation::from_verdict` is the sole constructor,
+  and it refuses a `VerdictRecord` that is not `verified`: a `failed` tally has no
+  `ResultDigest` to carry, and an `insufficient` one has no quorum. `gitiup run --tier
+  quorum` is still an unknown-option error (exit 2); `gitiup quorum verdict --attest` is
+  the only command line that writes one.
+* **Only re-derivation believes one.** `gitiup verify attestation <doc> --tier quorum
+  --evidence <store>` re-runs `VerdictRecord::evaluate` over the round, the published
+  submissions and the revocations in that store and compares the answer to the claim. A
+  document with no store to re-derive from is refused (exit 6) however well it is signed:
+  a label is not evidence. See
+  [the quorum ladder](verification.md#the-quorum-ladder-tier-quorum).
 
 ## What each tier may say about its sandbox
 

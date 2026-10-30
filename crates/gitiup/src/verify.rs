@@ -69,11 +69,13 @@ use std::collections::BTreeSet;
 use gitiup_attest::{
     AttestationDoc, CheckOutcome, Digest, Error as AttestError, ErrorKind, GitOid, OidAlgorithm,
     POLICY_PATH_ENV, Policy, PolicyFile, Reason, ResultDigest, Tier, TimeUs, Trust, VerdictReport,
-    human_duration_us,
+    check_freshness, human_duration_us,
 };
-use gitiup_host::Oid;
 use gitiup_host::attest::{self, Entry};
+use gitiup_host::{FsHost, Oid};
 use gitiup_host::{HostError, HostErrorKind};
+use gitiup_quorum::attestation::{QuorumAttestation, rederive};
+use gitiup_quorum::verdict::Evaluation as QuorumEvaluation;
 use serde_json::{Map, Value, json};
 
 use crate::CliError;
@@ -113,6 +115,14 @@ WHERE THE DOCUMENT COMES FROM:
     --expect-result <digest>     refuse unless the ResultDigest is exactly this
     --expect-challenge <digest>  refuse unless this quorum challenge is the one named
 
+WHERE THE EVIDENCE FOR A `tier: quorum` ATTESTATION IS:
+    --evidence <dir>             the store holding the round and the submissions the
+                                 document summarises. A quorum attestation is believed
+                                 only by re-deriving its verdict, so `--tier quorum`
+                                 needs this (or a document read from that store with
+                                 --store); a file that only labels itself quorum is
+                                 refused (exit 6)
+
 WHO TO TRUST:
     --trust <key>                repeatable: a SHA256:… key id or a keystore name
     --policy <path>              gitiup-policy.json: tiers, trust_key_ids, freshness,
@@ -135,6 +145,15 @@ WHAT THE POLICY MUST ACCEPT:
     --now <time>                 pin the clock: RFC 3339 UTC or integer microseconds.
                                  For replaying an old decision, not for cheating freshness
 
+A `tier: quorum` DOCUMENT is a different kind of proof.
+It is a verdict restated as an attestation, and it is accepted only when this command can
+re-derive that verdict — the round, the roster epoch it pinned, every seat's submission
+and every revocation, tallied by the same code `gitiup quorum verdict` runs. So it needs
+`--store` or `--remote`: a file on its own can always be *labelled* quorum, and a label is
+refused with exit 6 and the sentence that says why. `--tier quorum` (or the policy's
+`allowed_tiers`) is what makes the tier acceptable at all; the votes a verdict counted are
+still judged as the single runs they are, which `--tier` never restates for them.
+
 OUTPUT:
     -j, --json                   one line, keys sorted: the verdict, every check with
                                  its outcome, every reason, and what it was checked
@@ -155,6 +174,7 @@ Try:
     gitiup verify attestation proof.json --policy gitiup-policy.json
     gitiup verify attestation --store ./store --commit $(git rev-parse HEAD) --json
     gitiup verify attestation proof.json --trust ada --tier local --max-age 24h -q
+    gitiup verify attestation quorum.json --tier quorum --evidence ./store --trust owner
 ";
 
 /// Valued flags `gitiup verify attestation` accepts.
@@ -176,6 +196,7 @@ const VALUED: &[&str] = &[
     "--require",
     "--require-env-match",
     "--now",
+    "--evidence",
 ];
 
 /// Switches `gitiup verify attestation` accepts.
@@ -605,6 +626,13 @@ pub(crate) fn commit_id(text: &str) -> Result<GitOid, CliError> {
 /// is a verdict a script can branch on and a line on stderr is not.
 pub(crate) struct Input {
     pub(crate) doc: Option<AttestationDoc>,
+    /// Set when the bytes are a `tier: quorum` attestation rather than a run one.
+    ///
+    /// The two share a name, a store namespace and an exit taxonomy, and share nothing
+    /// else: a run attestation is signed evidence about one run, and this is a signed
+    /// statement about *other* attestations, which is why it is a separate arm and not
+    /// a flag on the same one.
+    pub(crate) quorum: Option<QuorumAttestation>,
     pub(crate) source: String,
     /// The store's name for the record, when it came from a store.
     pub(crate) stored: Option<String>,
@@ -620,6 +648,7 @@ impl Input {
     ) -> Input {
         Input {
             doc: None,
+            quorum: None,
             source,
             stored,
             failure: Some((code, error)),
@@ -631,15 +660,55 @@ impl Input {
         source: String,
         stored: Option<String>,
     ) -> Result<Input, CliError> {
+        // Two attestation shapes live in the same namespace, and the difference decides
+        // every check that follows, so the first thing done with the bytes is to ask
+        // which of the two they are.
+        if QuorumAttestation::looks_like(bytes) {
+            return match <QuorumAttestation as gitiup_quorum::record::Record>::load(bytes) {
+                Ok(attestation) => Ok(Input {
+                    doc: None,
+                    quorum: Some(attestation),
+                    source,
+                    stored,
+                    failure: None,
+                }),
+                Err(error) => Ok(Input::refused(
+                    "structure",
+                    quorum_error(error),
+                    source,
+                    stored,
+                )),
+            };
+        }
         match AttestationDoc::from_canonical_bytes(bytes) {
             Ok(doc) => Ok(Input {
                 doc: Some(doc),
+                quorum: None,
                 source,
                 stored,
                 failure: None,
             }),
             Err(error) => Ok(Input::refused("structure", error, source, stored)),
         }
+    }
+}
+
+/// A quorum-crate failure, in the format crate's taxonomy.
+///
+/// The taxonomy is the one place exit codes are decided ([ADR-0001
+/// D7](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)), and `gitiup-quorum`
+/// already wraps its errors in it rather than inventing a second one; a store failure is
+/// the only case that has to be re-expressed, and it is re-expressed as a refusal rather
+/// than a silent 3 because by the time it reaches a report the caller has already chosen
+/// to print a verdict.
+pub(crate) fn quorum_error(error: gitiup_quorum::Error) -> AttestError {
+    match error {
+        gitiup_quorum::Error::Attest(error) => error,
+        gitiup_quorum::Error::Store(store) => AttestError::new(
+            ErrorKind::Policy,
+            "store",
+            format!("{}: {}", store.context, store.detail),
+        ),
     }
 }
 
@@ -1133,11 +1202,23 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
     }
     let spec = policy_spec(&args)?;
     let input = read(&args)?;
+    let mut quorum_rows: Vec<Row> = Vec::new();
+    let mut quorum_json: Option<Value> = None;
     let report = match (&input.doc, &input.failure) {
         // A store that returned the wrong bytes has said something the verdict has
         // to lead with, whatever the document inside them would have scored.
         (_, Some((code, error))) => VerdictReport::refusing(code, error.clone()),
         (Some(doc), None) => doc.verify_report(&spec.policy),
+        (None, None) if input.quorum.is_some() => {
+            let attestation = input
+                .quorum
+                .as_ref()
+                .expect("the arm above only matches when there is one");
+            let (report, rows, json) = quorum_verdict(&args, &spec, attestation)?;
+            quorum_rows = rows;
+            quorum_json = Some(json);
+            report
+        }
         (None, None) => VerdictReport::refusing(
             "structure",
             AttestError::invalid("attestation", "no document was read"),
@@ -1173,6 +1254,12 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
                 .unwrap_or(Value::Null),
         );
         shape.insert("policy".into(), spec.json());
+        if let Some(quorum) = quorum_json {
+            // A gate reading this shape needs to know which kind of document it judged,
+            // because a `tier: quorum` document is judged on another ladder entirely.
+            shape.insert("tier".into(), Value::String("quorum".to_string()));
+            shape.insert("quorum".into(), quorum);
+        }
         shape.insert(
             "attestation".into(),
             facts.as_ref().map(Facts::json).unwrap_or(Value::Null),
@@ -1192,6 +1279,7 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
     }
     match &facts {
         Some(facts) => facts.rows(now, &mut out),
+        None if !quorum_rows.is_empty() => out.extend(quorum_rows),
         None => out.push(Row::new(
             "document",
             report
@@ -1250,6 +1338,449 @@ fn attestation(args: &[String]) -> Result<(), CliError> {
     }
     print!("{text}");
     verdict(&report)
+}
+
+// ---------------------------------------------------------------------------
+// the `tier: quorum` attestation
+// ---------------------------------------------------------------------------
+
+/// What the flags say about the *seats* of a round, which is not what they say about
+/// the document in hand.
+///
+/// `--tier` answers "what may this document be", and a quorum attestation is by
+/// definition `quorum`. The votes that produced it are single runs, and a single run may
+/// only ever be `local` (or `simulated`, if the caller insists on counting plans) — the
+/// format refuses anything else ([`Provenance::check`](gitiup_attest::Provenance)). So
+/// the tier named for the document is filtered out of the tally's list, and a list left
+/// empty falls back to the one honest single-run tier rather than to "accept anything".
+pub(crate) fn quorum_evaluation(policy: &Policy) -> QuorumEvaluation {
+    // The votes are single runs, so the tiers they may hold are the policy's tiers with
+    // `quorum` taken out: a run cannot earn it, and a document that says it did is
+    // refused on its own terms. A policy that names no single-run tier at all gets the
+    // one honest one rather than "anything".
+    let mut seats: Vec<Tier> = policy
+        .allowed_tiers
+        .iter()
+        .copied()
+        .filter(|tier| *tier != Tier::Quorum)
+        .collect();
+    if seats.is_empty() {
+        seats.push(Tier::Local);
+    }
+    QuorumEvaluation {
+        now: policy.now(),
+        allowed_sandboxes: policy.allowed_sandboxes.clone(),
+        max_age_us: policy.max_age_us,
+        max_clock_skew_us: policy.max_clock_skew_us,
+        normalisation_version: policy.normalisation_version,
+        allowed_tiers: seats,
+    }
+}
+
+/// What a `tier: quorum` attestation says, in the rows and the JSON the report prints.
+///
+/// Separate from the judgement because both commands that can print one — `verify
+/// attestation` and `verify change` — must print the *same* facts about it, and two
+/// renderings of "what the document claims" is two chances to disagree about it.
+pub(crate) fn quorum_facts(attestation: &QuorumAttestation, now: TimeUs) -> (Vec<Row>, Value) {
+    let seats: Vec<String> = attestation
+        .counted
+        .iter()
+        .map(|seat| {
+            format!(
+                "{} ({})",
+                participant::short(&seat.key_id),
+                seat.tier.as_str()
+            )
+        })
+        .collect();
+    let rows = vec![
+        Row::new(
+            "type",
+            format!(
+                "{} \u{b7} runner {}",
+                attestation.attestation_type, attestation.runner
+            ),
+        ),
+        Row::new(
+            "tier",
+            format!(
+                "{} \u{2014} a verdict's tier, never a run's",
+                attestation.tier.as_str()
+            ),
+        ),
+        Row::new(
+            "about",
+            format!(
+                "{} \u{b7} job {} \u{b7} attempt {} \u{b7} head {}",
+                attestation.change_id,
+                attestation.job_id,
+                attestation.attempt,
+                attestation.head_oid
+            ),
+        ),
+        Row::new(
+            "round",
+            format!(
+                "{} \u{b7} {}",
+                attestation.round_id, attestation.round_digest
+            ),
+        ),
+        Row::new(
+            "roster",
+            format!(
+                "epoch {} \u{b7} {} \u{b7} policy {}",
+                attestation.roster_epoch, attestation.roster_digest, attestation.policy_digest
+            ),
+        ),
+        Row::new(
+            "agreed",
+            format!(
+                "{} \u{b7} {} agreeing \u{b7} {} seats \u{b7} threshold {}",
+                attestation.result_digest,
+                attestation.agreeing,
+                attestation.seats,
+                attestation.required_agree
+            ),
+        ),
+        Row::new(
+            "seats",
+            if seats.is_empty() {
+                "none".to_string()
+            } else {
+                seats.join(", ")
+            },
+        ),
+        Row::new(
+            "signed",
+            if attestation.signatures.is_empty() {
+                "nobody: the document carries no signature".to_string()
+            } else {
+                attestation
+                    .signatures
+                    .iter()
+                    .map(|entry| participant::short(&entry.key_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
+        Row::new(
+            "claimed",
+            format!(
+                "{} ({} old)",
+                crate::attest::rfc3339(attestation.claimed_at_us),
+                human_age((now.0 - attestation.claimed_at_us).max(0))
+            ),
+        ),
+    ];
+    let json = json!({
+        "tier": attestation.tier.as_str(),
+        "change": attestation.change_id,
+        "job": attestation.job_id,
+        "attempt": attestation.attempt,
+        "head": attestation.head_oid.to_string(),
+        "round_id": attestation.round_id,
+        "round_digest": attestation.round_digest.to_string(),
+        "roster_epoch": attestation.roster_epoch,
+        "roster_digest": attestation.roster_digest.to_string(),
+        "policy_digest": attestation.policy_digest.to_string(),
+        "result_digest": attestation.result_digest.to_string(),
+        "state": attestation.state.as_str(),
+        "reason": attestation.reason.as_str(),
+        "detail": attestation.detail,
+        "seats": attestation.seats,
+        "required_agree": attestation.required_agree,
+        "agreeing": attestation.agreeing,
+        "counted": attestation
+            .counted
+            .iter()
+            .map(|seat| {
+                json!({
+                    "key_id": seat.key_id,
+                    "identity": seat.identity,
+                    "tier": seat.tier.as_str(),
+                })
+            })
+            .collect::<Vec<Value>>(),
+        "verdict_digest": attestation.verdict_digest.to_string(),
+        "claimed_at_us": attestation.claimed_at_us,
+        "rederived": Value::Null,
+    });
+    (rows, json)
+}
+
+/// What the store could say when asked to re-derive a quorum attestation's verdict.
+pub(crate) enum Derivation {
+    /// Nothing was asked: no store was named, so the claim has no evidence beside it.
+    /// That is a refusal, not an absence of opinion.
+    NoStore,
+    /// The store refused the round, the roster or the tally.
+    Failed(gitiup_quorum::Error),
+    /// The verdict the store's evidence supports *now*.
+    Done(Box<gitiup_quorum::attestation::Rederived>),
+}
+
+/// What one quorum document is judged against.
+pub(crate) struct QuorumLadder<'a> {
+    /// Whether the policy in force accepts the `quorum` tier at all.
+    pub tier_allowed: bool,
+    /// Whose signature on the document this caller believes — the same roots that decide
+    /// whose verdict and whose roster count, because a quorum attestation is a verdict
+    /// restated and must not acquire a second authority.
+    pub trust: &'a Trust,
+    /// How many such signatures the policy requires.
+    pub min_signatures: usize,
+    /// The freshness window and the clock.
+    pub freshness: &'a Policy,
+    /// What the store said.
+    pub derivation: Derivation,
+    /// Where the evidence came from, in the words the caller used.
+    pub store: Option<String>,
+}
+
+/// Judge a `tier: quorum` attestation, and render it.
+///
+/// The whole of it is one rule: the document is believed exactly as far as the store can
+/// re-derive the verdict it states. Nothing in the bytes is taken on faith — the round,
+/// the roster epoch, every seat's submission and every revocation are fetched and
+/// re-checked by [`gitiup_quorum::attestation::rederive`] through
+/// [`VerdictRecord::evaluate`](gitiup_quorum::verdict::VerdictRecord) — *the same call*
+/// `gitiup quorum verdict` runs, which is the only reason the two commands cannot
+/// disagree about what a quorum decided.
+///
+/// A document with no store to answer for it is refused (6), and so is one the store no
+/// longer supports: a revoked seat, a submission gone stale, a round re-tallied under a
+/// different digest. A label is not a quorum.
+pub(crate) fn quorum_ladder(
+    attestation: &QuorumAttestation,
+    judge: &QuorumLadder<'_>,
+) -> (VerdictReport, Vec<Row>, Value) {
+    let (rows, mut json) = quorum_facts(attestation, judge.freshness.now());
+    let mut report = VerdictReport::default();
+    // The loader refused bytes that were not canonical, not this shape, or not
+    // self-consistent, so arriving here *is* passing those two.
+    report.record("structure", CheckOutcome::Passed);
+    report.record("digest", CheckOutcome::Passed);
+    let mut stopped = false;
+
+    // 1. the tier, before any evidence is fetched: if the policy in force does not name
+    //    the quorum tier, no amount of quorum answers the question being asked.
+    if judge.tier_allowed {
+        report.record("tier", CheckOutcome::Passed);
+        report.record("sandbox", CheckOutcome::NotAsked);
+    } else {
+        report.add_reason(
+            "tier",
+            AttestError::new(
+                ErrorKind::Policy,
+                "policy",
+                format!(
+                    "tier '{}' is not accepted by the policy in force here",
+                    Tier::Quorum
+                ),
+            )
+            .with_hint(
+                "a verdict is the only thing that can carry this tier, and the owner decides \
+                 whether it counts: publish a revision whose `allowed_tiers` names `quorum`",
+            ),
+        );
+        stopped = true;
+    }
+
+    // 2. the commit binding, when the caller named one. The ref an attestation is
+    // advertised under already ties it to a commit; saying so out loud is what keeps
+    // `gitiup verify change` from accepting a proof about somebody else's head that was
+    // parked in this namespace. A wrong binding is a digest mismatch, not a refusal: the
+    // document is not lying about this commit, it is not about it at all.
+    if let Some(expected) = judge.freshness.expected_commit.as_ref() {
+        if *expected != attestation.head_oid {
+            report.add_reason(
+                "commit",
+                AttestError::new(
+                    ErrorKind::DigestMismatch,
+                    "quorum",
+                    format!(
+                        "the quorum attestation is drawn against {}, not {expected}",
+                        attestation.head_oid
+                    ),
+                )
+                .with_hint("a verdict is bound to the head it was computed from"),
+            );
+            stopped = true;
+        } else {
+            report.record("commit", CheckOutcome::Passed);
+        }
+    } else {
+        report.record("commit", CheckOutcome::NotAsked);
+    }
+
+    // 3. who asserted it. That is a different question from who voted, which the
+    //    re-derivation below asks about every seat.
+    if !stopped {
+        match attestation.verify(judge.trust) {
+            Ok(signers) => {
+                report.record("signature", CheckOutcome::Passed);
+                report.record("trust", CheckOutcome::Passed);
+                if signers.len() < judge.min_signatures {
+                    report.add_reason(
+                        "min_signatures",
+                        AttestError::new(
+                            ErrorKind::Policy,
+                            "policy",
+                            format!(
+                                "{} trusted signature(s), policy requires {}",
+                                signers.len(),
+                                judge.min_signatures
+                            ),
+                        ),
+                    );
+                    stopped = true;
+                } else {
+                    report.record("min_signatures", CheckOutcome::Passed);
+                }
+            }
+            Err(error) => {
+                let code = match error.exit_code() {
+                    7 => "signature",
+                    8 => "digest",
+                    _ => "trust",
+                };
+                report.add_reason(code, quorum_error(error));
+                stopped = true;
+            }
+        }
+    }
+
+    // 4. the claim itself, re-derived from the evidence the store still holds.
+    if !stopped {
+        match &judge.derivation {
+            Derivation::NoStore => report.add_reason(
+                "verdict",
+                AttestError::new(
+                    ErrorKind::Policy,
+                    "quorum",
+                    "nothing here can re-derive the verdict this attestation states: tier: \
+                     quorum is believed only against the round and the seat submissions \
+                     that produced it, and no store was named",
+                )
+                .with_hint(
+                    "add --store or --remote for the store that ran the round; a file on its \
+                     own can always be *labelled* quorum, which proves nothing",
+                ),
+            ),
+            Derivation::Failed(error) => {
+                report.add_reason("verdict", quorum_error(error.clone()));
+                stopped = true;
+            }
+            Derivation::Done(rederived) => {
+                report.record("round", CheckOutcome::Passed);
+                report.record("roster", CheckOutcome::Passed);
+                json["rederived"] = json!({
+                    "state": rederived.verdict.state.as_str(),
+                    "reason": rederived.verdict.reason.as_str(),
+                    "agreeing": rederived.verdict.agreeing,
+                    "required_agree": rederived.verdict.required_agree,
+                    "seats": rederived.verdict.seats,
+                    "result_digest": rederived
+                        .verdict
+                        .result_digest
+                        .as_ref()
+                        .map(|digest| digest.to_string()),
+                    "detail": rederived.verdict.detail,
+                    "store": judge.store,
+                });
+                let before = report.reasons.len();
+                for (code, error) in attestation.differences(&rederived.round, &rederived.verdict) {
+                    report.add_reason(code, quorum_error(error));
+                }
+                if report.reasons.len() == before {
+                    report.record("verdict", CheckOutcome::Passed);
+                    report.record("seats", CheckOutcome::Passed);
+                } else {
+                    stopped = true;
+                }
+            }
+        }
+    }
+
+    // 5. the claim's own clock, which is the verdict's issue time.
+    if !stopped {
+        match check_freshness(attestation.claimed_at_us, judge.freshness) {
+            Ok(_) => report.record("freshness", CheckOutcome::Passed),
+            Err(error) => report.add_reason("freshness", error),
+        }
+    }
+    if stopped {
+        for check in &mut report.checks {
+            if check.outcome == CheckOutcome::NotRun {
+                check.outcome = CheckOutcome::NotAsked;
+            }
+        }
+    }
+    if report.reasons.is_empty() {
+        report.accept_document();
+    }
+    (report, rows, json)
+}
+
+/// Where the round and the submissions a `tier: quorum` attestation speaks about are
+/// read from.
+///
+/// Two answers, because there are two ways to bring a document:
+///
+/// * `--evidence <dir>`, for a document handed over as a file or on stdin — the store is
+///   named as *the evidence*, not as where the document lives, which is the difference
+///   between checking a claim and re-reading a copy of it;
+/// * otherwise the store the document itself came from (`--store`/`--remote`), which is
+///   the same place and needs no second flag.
+fn evidence_from(args: &Args) -> Result<Option<participant::Opened>, CliError> {
+    if let Some(dir) = args.get("--evidence") {
+        let host = FsHost::open_or_create(dir)
+            .map_err(|e| CliError::io(format!("evidence store '{dir}': {e}")))?;
+        return Ok(Some(participant::Opened {
+            host: Box::new(host),
+            what: format!("fs store {}", std::path::Path::new(dir).display()),
+        }));
+    }
+    participant::store_from(args)
+}
+
+/// Read the store, re-derive, and judge: the `gitiup verify attestation` path.
+fn quorum_verdict(
+    args: &Args,
+    spec: &PolicySpec,
+    attestation: &QuorumAttestation,
+) -> Result<(VerdictReport, Vec<Row>, Value), CliError> {
+    let (derivation, store) = match evidence_from(args)? {
+        None => (Derivation::NoStore, None),
+        Some(opened) => {
+            let what = opened.what.clone();
+            let derivation = match rederive(
+                &*opened.host,
+                attestation,
+                &spec.policy.trust,
+                &quorum_evaluation(&spec.policy),
+            ) {
+                Err(gitiup_quorum::Error::Store(store)) => {
+                    return Err(CliError::io(format!("{}: {}", store.context, store.detail)));
+                }
+                Err(error) => Derivation::Failed(error),
+                Ok(rederived) => Derivation::Done(Box::new(rederived)),
+            };
+            (derivation, Some(what))
+        }
+    };
+    Ok(quorum_ladder(
+        attestation,
+        &QuorumLadder {
+            tier_allowed: spec.policy.allowed_tiers.contains(&Tier::Quorum),
+            trust: &spec.policy.trust,
+            min_signatures: spec.policy.min_signatures,
+            freshness: &spec.policy,
+            derivation,
+            store,
+        },
+    ))
 }
 
 /// The report in its machine-readable shape: `verdict`, `exit`, `accepted`, `reasons`,

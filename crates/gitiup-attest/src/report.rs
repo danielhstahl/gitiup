@@ -147,8 +147,14 @@ pub struct VerdictReport {
     /// Every reason found, most important first: `reasons[0]` is what `verify`
     /// returns and what [`Self::exit_code`] describes.
     pub reasons: Vec<Reason>,
-    /// Present exactly when `reasons` is empty.
+    /// Present exactly when the document was accepted *and* is a run manifest.
     pub verdict: Option<Verdict>,
+    /// Set when the document was accepted but has no run-manifest facts to hand back —
+    /// a `tier: quorum` attestation, whose facts are a round's and a tally's, not a
+    /// run's. Kept separate from [`Self::verdict`] so that field keeps meaning exactly
+    /// what [ADR-0001 D4](../../../docs/adr/0001-attestation-encoding-hash-and-signature.md)
+    /// says it means.
+    accepted_document: bool,
 }
 
 impl VerdictReport {
@@ -164,7 +170,28 @@ impl VerdictReport {
                 .collect(),
             reasons: Vec::new(),
             verdict: None,
+            accepted_document: false,
         }
+    }
+
+    /// Record the outcome of a check that a caller *outside this crate* performed.
+    ///
+    /// A `tier: quorum` attestation is checked by `gitiup-quorum` — the round, the
+    /// roster, the tally — and its verdict is printed with the same ladder, the same
+    /// codes and the same exit taxonomy as a run manifest's. This is the seam that lets
+    /// one report type carry both without either crate pretending to know the other's
+    /// checks.
+    pub fn record(&mut self, code: &'static str, outcome: CheckOutcome) {
+        self.set(code, outcome);
+    }
+
+    /// Accept a document whose facts are not a run manifest's.
+    ///
+    /// The exit code stays `0` and [`Self::verdict`] stays `None` — nothing here pretends
+    /// a quorum attestation has a `RunDigest` — while [`Self::accepted`] answers the only
+    /// question a gate asks.
+    pub fn accept_document(&mut self) {
+        self.accepted_document = true;
     }
 
     /// A report that refuses before the document could be put through the checks at
@@ -237,7 +264,7 @@ impl VerdictReport {
 
     /// Was the document accepted?
     pub fn accepted(&self) -> bool {
-        self.verdict.is_some()
+        self.verdict.is_some() || self.accepted_document
     }
 
     /// The outcome of one check.

@@ -71,6 +71,18 @@
 //! over the old one, and "the evidence moved" is answered by attempt + 1 with a fresh
 //! seed — not by an edit.
 //!
+//! # `--attest`: the verdict, at the tier a policy can ask for
+//!
+//! A verdict says what the quorum decided; a `tier: quorum` **attestation** is the same
+//! fact stated in the one vocabulary a merge gate's `allowed_tiers` speaks. It is not a
+//! second opinion and cannot be a first one: the document is built
+//! [`QuorumAttestation::from_verdict`] out of a `verified` verdict — round id and digest,
+//! roster epoch and digest, the agreed `ResultDigest`, the seats that carried it — and
+//! nothing else can build it ([`gitiup_quorum::attestation`](../gitiup_quorum/attestation/index.rs)).
+//! `--attest store` files it in the attestation store for the round's head; `--attest
+//! <path|->` hands you the canonical signed bytes. A verdict that is not `verified`
+//! produces no document and says why: there is no agreement to attest.
+//!
 //! # What this command will not do
 //!
 //! * **re-open a round.** If the seats are wrong, that is `gitiup select`; if they are
@@ -85,6 +97,7 @@ use std::collections::BTreeMap;
 
 use gitiup_attest::{Tier, TimeUs, Trust};
 use gitiup_host::attest;
+use gitiup_quorum::attestation::QuorumAttestation;
 use gitiup_quorum::prelude::*;
 use gitiup_quorum::verdict::Evaluation;
 use gitiup_quorum::{store, verdict};
@@ -126,6 +139,11 @@ WHAT IT LEAVES BEHIND
     --publish                         sign the verdict with this key and file it at
                                       refs/gitiup/verdict/<change>/<job>; a verdict is
                                       superseded by a later attempt, never edited
+    --attest <store|path|->           also emit the `tier: quorum` attestation this verdict
+                                      earns: `store` files it among the attestations of
+                                      the round's head, a path (or -) gets the canonical
+                                      signed bytes. Only a `verified` verdict produces
+                                      one, and it is signed with the same key
     --key <selector>                  which key signs (default: the current identity)
     --out <path|->                    the canonical signed verdict bytes
     -j, --json                        one line: every field of the record, plus the store,
@@ -144,6 +162,7 @@ Try:
     gitiup quorum verdict chg-6a6a --store ./store --json
     gitiup quorum verdict chg-6a6a --store ./store --job build/matrix/linux-x86_64
     gitiup quorum verdict chg-6a6a --store ./store --publish --key owner
+    gitiup quorum verdict chg-6a6a --store ./store --attest store --key owner
     gitiup quorum verdict chg-6a6a --store ./store --now 2026-10-24T00:01:01Z
 ";
 
@@ -161,6 +180,7 @@ const VALUED: &[&str] = &[
     "--max-skew",
     "--key",
     "--out",
+    "--attest",
 ];
 
 /// Switches: the two acts, and the two output modes.
@@ -192,7 +212,7 @@ pub fn verdict(args: &[String]) -> Result<(), CliError> {
     let evaluation = evaluation_from(&args)?;
     let tally = tally(&args, &opened, trust, &trusted_by, &evaluation, handle)?;
 
-    if participant::only_bytes(&args) {
+    if participant::only_bytes(&args) || args.get("--attest").is_some_and(|sink| sink == "-") {
         if args.on("--json") {
             return Err(CliError::usage(
                 "--out - and --json cannot share stdout: one is the record's bytes, the \
@@ -270,8 +290,22 @@ struct RoundTally {
     signed_by: Vec<String>,
     /// What `--publish` did, when `--publish` was given.
     filing: Option<store::Filing>,
+    /// Where the `tier: quorum` attestation went, when `--attest` was given.
+    attestation: Option<Emitted>,
     /// Where the verdict went, for the human line.
     filed_at: Option<String>,
+}
+
+/// What emitting a `tier: quorum` attestation did.
+struct Emitted {
+    /// The document's own digest — its name in the store.
+    digest: String,
+    /// Where the bytes went: `store`, or the path they were written to.
+    sink: String,
+    /// The attestation ref, when they went to a store.
+    reference: Option<String>,
+    /// Whether that ref already held exactly these bytes (a retry, not a change).
+    already: bool,
 }
 
 impl RoundTally {
@@ -315,6 +349,18 @@ impl RoundTally {
                 out["superseded_attempt"] = json!(previous_attempt);
             }
             map.insert("publish".into(), out);
+        }
+        if let Some(attestation) = &self.attestation {
+            map.insert(
+                "attestation".into(),
+                json!({
+                    "tier": "quorum",
+                    "digest": attestation.digest,
+                    "sink": attestation.sink,
+                    "ref": attestation.reference,
+                    "already": attestation.already,
+                }),
+            );
         }
         body
     }
@@ -400,6 +446,25 @@ impl RoundTally {
                 Some(reason) => println!("  publish refused: {}", one_line(reason)),
                 None => println!("  verdict {} at {where_}", filing.token()),
             }
+        }
+        if let Some(attestation) = &self.attestation {
+            println!(
+                "  tier: quorum attestation {} \u{b7} {}{}",
+                short_digest(&attestation.digest),
+                attestation.sink,
+                attestation
+                    .reference
+                    .as_ref()
+                    .map(|reference| format!(
+                        " \u{b7} {reference}{}",
+                        if attestation.already {
+                            " (already there)"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .unwrap_or_default(),
+            );
         }
     }
 
@@ -567,6 +632,8 @@ struct Runner<'a> {
     revocations: Option<Vec<Revocation>>,
     /// `Some` only when a sink (`--publish`, `--out`) asked for bytes to be signed.
     signing: Option<gitiup_keys::signer::Key>,
+    /// `--attest`: where the `tier: quorum` attestation goes, when one is earned.
+    attest: Option<String>,
     notes: Vec<String>,
     /// The verdicts, in `(job, attempt)` order.
     tallies: Vec<RoundTally>,
@@ -582,7 +649,10 @@ impl<'a> Runner<'a> {
         // Opening a key is an act, so it happens only for a run that will sign
         // something: a read-only tally needs no keystore at all, which is what lets an
         // auditor with an empty home reach the same answer.
-        let signing = if args.on("--publish") || args.get("--out").is_some() {
+        let signing = if args.on("--publish")
+            || args.get("--out").is_some()
+            || args.get("--attest").is_some()
+        {
             Some(participant::signing_key(args, &participant::keystore()?)?)
         } else {
             None
@@ -595,6 +665,7 @@ impl<'a> Runner<'a> {
             rosters: BTreeMap::new(),
             revocations: None,
             signing,
+            attest: args.get("--attest").map(str::to_string),
             notes: Vec::new(),
             tallies: Vec::new(),
         })
@@ -640,6 +711,7 @@ impl<'a> Runner<'a> {
         let signed_by = self.sign(&mut record)?;
         self.write_out(&record)?;
         let filing = self.file(&record)?;
+        let attestation = self.emit(round, &record)?;
         let filed_at = filing.as_ref().map(|_| {
             format!(
                 "{}{}",
@@ -660,6 +732,7 @@ impl<'a> Runner<'a> {
             record,
             signed_by,
             filing,
+            attestation,
             filed_at,
         })
     }
@@ -721,6 +794,70 @@ impl<'a> Runner<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    /// `--attest`: turn the verdict into the `tier: quorum` attestation it earns.
+    ///
+    /// There is no path here that invents a quorum. The document comes out of
+    /// [`QuorumAttestation::from_verdict`], which refuses a verdict that is not
+    /// `verified`, and a refused verdict is a note and not a second failure: the tally
+    /// already exited 6 because the quorum did not agree, and saying so twice with two
+    /// different numbers is how a log becomes unreadable.
+    fn emit(
+        &mut self,
+        round: &Round,
+        record: &verdict::VerdictRecord,
+    ) -> Result<Option<Emitted>, CliError> {
+        let Some(sink) = self.attest.clone() else {
+            return Ok(None);
+        };
+        let attestation = match QuorumAttestation::from_verdict(round, record) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                self.notes.push(format!(
+                    "no quorum attestation for {}: {}",
+                    record.job_id,
+                    one_line(&error.message())
+                ));
+                return Ok(None);
+            }
+        };
+        let key = self.signing.as_ref().ok_or_else(|| {
+            CliError::refused(
+                "a quorum attestation has to be signed by the key that asserts it",
+                "`--attest` signs with this machine's key; `--key <name>` names one",
+            )
+        })?;
+        let mut attestation = attestation;
+        attestation.sign(key)?;
+        let bytes = attestation.canonical_bytes()?;
+        let digest = attestation.digest()?.to_string();
+        if sink == "store" {
+            let subject = gitiup_host::Oid::from_hex(&record.head_oid.hex())
+                .map_err(|e| CliError::io(format!("the round's head is not an oid: {e}")))?;
+            let actor = gitiup_host::Actor::from(
+                participant::short(&attestation.signatures[0].key_id).as_str(),
+            );
+            let published = attest::publish(&*self.opened.host, &subject, &bytes, actor)
+                .map_err(|e| CliError::io(format!("publish the quorum attestation: {e}")))?;
+            return Ok(Some(Emitted {
+                digest,
+                sink: "store".to_string(),
+                reference: Some(published.reference.as_str().to_string()),
+                already: published.already,
+            }));
+        }
+        participant::write_out(&sink, &bytes)?;
+        Ok(Some(Emitted {
+            digest,
+            sink: if sink == "-" {
+                "stdout".to_string()
+            } else {
+                sink
+            },
+            reference: None,
+            already: false,
+        }))
     }
 }
 

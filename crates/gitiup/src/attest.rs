@@ -480,6 +480,32 @@ fn parse(store: &dyn gitiup_host::Host, entry: &attest::Entry) -> Result<Parsed,
                 Some("a ref that names a missing object is a broken store, not a missing proof"),
             )
         })?;
+    if gitiup_quorum::attestation::QuorumAttestation::looks_like(&bytes) {
+        let quorum =
+            <gitiup_quorum::attestation::QuorumAttestation as gitiup_quorum::record::Record>::load(
+                &bytes,
+            )
+            .map_err(|e| CliError::io(format!("{}: {}", entry.digest.short_default(), e)))?;
+        // It is a proof about proofs: its own digest stands where a `RunDigest` would,
+        // and the result the quorum agreed on is the `ResultDigest` a reader cares about.
+        return Ok(Parsed {
+            tier: quorum.tier,
+            signers: quorum
+                .signatures
+                .iter()
+                .map(|signature| signature.key_id.clone())
+                .collect(),
+            claimed_at_us: quorum.claimed_at_us,
+            run_digest: quorum
+                .digest()
+                .map(|digest| digest.to_string())
+                .unwrap_or_default(),
+            result_digest: quorum.result_digest.to_string(),
+            runner: quorum.runner.clone(),
+            sandbox: None,
+            size: bytes.len() as u64,
+        });
+    }
     let doc = AttestationDoc::from_canonical_bytes(&bytes)?;
     Ok(Parsed {
         tier: doc.manifest.result.provenance.tier,
@@ -667,6 +693,27 @@ fn show(args: &Args) -> Result<(), CliError> {
                 Oid::hash_bytes(&bytes).short_default()
             ),
             Some("this host is not storing blobs verbatim"),
+        ));
+    }
+    // A `tier: quorum` attestation lives in this namespace too, and it is not a run's
+    // proof: it has no manifest, no steps and no DSSE payload of its own. Say what it is
+    // and where it is read, rather than failing to parse it.
+    if gitiup_quorum::attestation::QuorumAttestation::looks_like(&bytes) {
+        if args.on("--bytes") && !args.on("--dsse") {
+            std::io::stdout()
+                .write_all(&bytes)
+                .map_err(|e| CliError::io(format!("write stdout: {e}")))?;
+            return Ok(());
+        }
+        return Err(CliError::refused(
+            format!(
+                "{} is a `tier: quorum` attestation: a verdict about other attestations, \
+                 not a run's own proof",
+                short(&digest.hex())
+            ),
+            "read it with `gitiup verify attestation <digest> --tier quorum --store <dir>`, \
+             which re-derives the verdict it states; `--bytes` still hands over the exact \
+             signed bytes",
         ));
     }
     let doc = AttestationDoc::from_canonical_bytes(&bytes)?;
