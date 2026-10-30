@@ -228,7 +228,13 @@ pub const REQUIRED_POLICY_FIELDS: &[&str] = &[
 ];
 
 /// The members of the `quorum` block (D5).
-pub const QUORUM_FIELDS: &[&str] = &["by_job", "default", "requirements", "reveal_mode"];
+pub const QUORUM_FIELDS: &[&str] = &[
+    "by_job",
+    "default",
+    "max_attempts",
+    "requirements",
+    "reveal_mode",
+];
 /// The members of one selection: `SelectionPolicy` verbatim (D2).
 pub const SELECTION_FIELDS: &[&str] = &[
     "max_per_identity",
@@ -352,10 +358,14 @@ pub mod token {
     /// `n` of 0, or `max_per_identity` of 0 (D5).
     pub const SELECTION_SHAPE: &str = "selection_shape";
     /// The `quorum` block carries a member that is not one of
-    /// `default`/`by_job`/`requirements`/`reveal_mode`.
+    /// `default`/`by_job`/`requirements`/`reveal_mode`/`max_attempts`.
     pub const QUORUM_SHAPE: &str = "quorum_shape";
     /// `quorum.reveal_mode` names a reveal mode this build cannot enforce (giti-zp1.6).
     pub const QUORUM_REVEAL_MODE: &str = "quorum_reveal_mode";
+    /// `quorum.max_attempts` is not a number of attempts this build will run (giti-zp1.7):
+    /// 0 would allow no attempt, and a value above [`crate::escalate::MAX_MAX_ATTEMPTS`]
+    /// is a way of saying "never stop" in the one field that exists to say "stop".
+    pub const QUORUM_ATTEMPTS: &str = "quorum_attempts";
     /// `quorum` is an allowed tier with nothing to decide it (D5).
     pub const QUORUM_WITHOUT_RULES: &str = "quorum_without_rules";
     /// Quorum numbers published while the tier refuses quorum (D5).
@@ -576,6 +586,17 @@ pub struct QuorumBlock {
     /// every policy published before it exists keeps its bytes and its digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reveal_mode: Option<String>,
+    /// How many attempts one job may have: `1` is the first round alone, `3` (the default)
+    /// is the first round plus two retries, and exhausting the cap is terminal
+    /// ([`crate::escalate`], giti-zp1.7).
+    ///
+    /// Owner-signed for the same reason as every other number here: the person re-running a
+    /// flaky test at midnight must not be the one who decides how many times it may be
+    /// re-run, because the cost of each attempt is paid by a roster of volunteers. Absent
+    /// means [`crate::escalate::DEFAULT_MAX_ATTEMPTS`], and the field is skipped when
+    /// absent so every policy published before it exists keeps its bytes and its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
 }
 
 impl QuorumBlock {
@@ -593,6 +614,17 @@ impl QuorumBlock {
         self.reveal_mode
             .as_deref()
             .unwrap_or(crate::round::REVEAL_MODE_OPEN)
+    }
+
+    /// How many attempts a job of this policy may have: the block's, or
+    /// [`crate::escalate::DEFAULT_MAX_ATTEMPTS`] when it says nothing.
+    ///
+    /// An absent field means the default and nothing else; a value that was checked on the
+    /// way in ([`crate::escalate::validate_max_attempts`], which `publish` runs) is used
+    /// verbatim.
+    pub fn effective_max_attempts(&self) -> u32 {
+        self.max_attempts
+            .unwrap_or(crate::escalate::DEFAULT_MAX_ATTEMPTS)
     }
 
     /// The selection for a job id: the longest `by_job` glob that matches, else the
@@ -1675,6 +1707,29 @@ fn check_quorum(value: &Value, rules: &Value) -> PolicyResult<()> {
     }
     if let Some(default) = object.get("default") {
         check_selection("quorum.default", default)?;
+    }
+    // The attempt cap, checked when it is written: a policy that says `0` or `10^9` is a
+    // policy that does not mean what its owner typed, and finding that out after a hundred
+    // volunteer-builds is not checking it.
+    if let Some(attempts) = object.get("max_attempts").filter(|v| !v.is_null()) {
+        let attempts = attempts.as_u64().ok_or_else(|| {
+            PolicyError::new(
+                token::QUORUM_ATTEMPTS,
+                "`quorum.max_attempts` is a whole number of attempts (1 means \"no retry\")",
+            )
+        })?;
+        let attempts = u32::try_from(attempts).map_err(|_| {
+            PolicyError::new(
+                token::QUORUM_ATTEMPTS,
+                format!("`quorum.max_attempts` is {attempts}, which is not a count of anything"),
+            )
+        })?;
+        crate::escalate::validate_max_attempts(attempts).map_err(|error| {
+            PolicyError::new(
+                token::QUORUM_ATTEMPTS,
+                format!("`quorum.max_attempts`: {}", error.message()),
+            )
+        })?;
     }
     let by_job = object.get("by_job").filter(|v| !v.is_null());
     if let Some(by_job) = by_job {

@@ -84,8 +84,91 @@ pub struct Round {
     pub selected: Vec<Seat>,
     /// The reserve order, as advice (promotion is the re-run).
     pub reserves: Vec<Reserve>,
+    /// The attempt this one escalates from, and the evidence it replaces (giti-zp1.7).
+    ///
+    /// `None` on a first attempt. The superseded round is never edited or deleted — it
+    /// stays at its own ref with its reveals, commitments and verdict — and this field is
+    /// what makes the chain readable from the records: an escalation that nobody can trace
+    /// back to the disagreement that caused it is a rerun, and a rerun is what a flaky test
+    /// eats a roster's afternoon for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_from: Option<Escalation>,
     /// The selector's signature over the record's body.
     pub signatures: Vec<SignatureEntry>,
+}
+
+/// One round's pointer at the attempt it replaces (giti-zp1.7).
+///
+/// A digest and a sentence, not a copy: the evidence it refers to is already in the store,
+/// and duplicating it here would be a second copy of the thing for somebody to disagree
+/// about. `reason` is the one word of prose, because a chain of rounds that does not say
+/// *why* it grew is indistinguishable from a loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Escalation {
+    /// The attempt number it replaces. Always exactly one less than this round's: attempts
+    /// are dense, the way roster epochs are, so "attempt 4 exists" answers "were there
+    /// three before it" without a search.
+    pub from_attempt: u64,
+    /// The round record it replaces, by digest.
+    pub from_round_digest: Digest,
+    /// The verdict that prompted it, when one was filed. Optional because a round can be
+    /// escalated before anybody tallied it — an unfilled round is escalated on its own
+    /// `sufficient: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_verdict_digest: Option<Digest>,
+    /// Why, in the selector's words: usually the tally's own sentence
+    /// (`irreconcilable_digests: …`), and required, because "again" is not a reason.
+    pub reason: String,
+}
+
+impl Escalation {
+    /// A new escalation record naming what it replaces.
+    pub fn new(
+        from: &Round,
+        from_verdict_digest: Option<Digest>,
+        reason: impl Into<String>,
+    ) -> Result<Escalation> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(Error::invalid(
+                "escalation",
+                "an escalation has to say why the last attempt was not enough",
+            ));
+        }
+        Ok(Escalation {
+            from_attempt: from.inputs.attempt,
+            from_round_digest: from.digest()?,
+            from_verdict_digest,
+            reason,
+        })
+    }
+
+    /// Is this a reason a person could read two months from now?
+    fn validate(&self, attempt: u64) -> Result<()> {
+        if self.reason.trim().is_empty() {
+            return Err(Error::invalid(
+                "escalation",
+                "an escalation has to say why the last attempt was not enough",
+            ));
+        }
+        if self.from_attempt.saturating_add(1) != attempt {
+            return Err(Error::invalid(
+                "escalation",
+                format!(
+                    "this round is attempt {attempt} and points at attempt {}; attempts are \
+                     dense, so the only round one may escalate from is the one before it",
+                    self.from_attempt
+                ),
+            )
+            .with_hint(
+                "escalate `gitiup quorum retry`, which opens attempt + 1 from the highest \
+                 attempt the store holds; a gap would mean an attempt nobody has the evidence \
+                 for",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What a verified round established, for the caller that has to record it.
@@ -158,10 +241,33 @@ impl Round {
             sufficient: selection.sufficient,
             selected: selection.selected.clone(),
             reserves: selection.reserves.clone(),
+            escalated_from: None,
             signatures: Vec::new(),
         };
         round.validate()?;
         Ok(round)
+    }
+
+    /// Point this round at the attempt it replaces, before anything signs it.
+    ///
+    /// Refused once the record is signed, exactly as [`Round::set_reveal_mode`] is: the
+    /// reference is inside what the selector signs, so adding it afterwards would be editing
+    /// a signed record — and a round that could gain a justification after the fact is a
+    /// round whose escalation was never justified.
+    pub fn set_escalation(&mut self, from: &Escalation) -> Result<()> {
+        if !self.signatures.is_empty() {
+            return Err(Error::invalid(
+                "round",
+                format!(
+                    "this round is signed; its escalation is inside what {} signed, so \
+                     pointing it at a different attempt means re-deriving and re-signing it",
+                    crate::record::short_key(&self.signatures[0].key_id)
+                ),
+            ));
+        }
+        from.validate(self.inputs.attempt)?;
+        self.escalated_from = Some(from.clone());
+        self.validate()
     }
 
     /// Restate the reveal mode, before anything signs the record.
@@ -233,6 +339,9 @@ impl Round {
                 "round",
                 "seat ranks must be 1..=n with no gaps",
             ));
+        }
+        if let Some(escalation) = &self.escalated_from {
+            escalation.validate(self.inputs.attempt)?;
         }
         Ok(())
     }

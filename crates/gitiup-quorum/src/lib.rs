@@ -105,6 +105,7 @@ pub mod capability;
 pub mod commit;
 pub mod derive;
 pub mod error;
+pub mod escalate;
 pub mod gate;
 pub mod job;
 pub mod ledger;
@@ -127,6 +128,10 @@ pub use capability::{Capabilities, Exclusion, Requirements, RosterTier, exclusio
 pub use commit::{Commitment, Filed};
 pub use derive::{ROUND_KIND, SelectionSecret};
 pub use error::{Error, Result};
+pub use escalate::{
+    AttemptCap, DEFAULT_MAX_ATTEMPTS, EXIT_ATTEMPTS_EXHAUSTED, Exhausted, MAX_MAX_ATTEMPTS,
+    TOKEN_EXHAUSTED, attempts_run, latest_attempt,
+};
 pub use gate::{admit, approval};
 pub use gitiup_attest::{Digest, GitOid};
 pub use job::{Advertisement, Lease, LeaseRequest, Taken, ttl_text};
@@ -139,7 +144,7 @@ pub use policy::{
 pub use roster::{
     EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
 };
-pub use round::{Round, RoundFacts};
+pub use round::{Escalation, Round, RoundFacts};
 pub use select::{
     CandidateRow, Greedy, ProposerExclusion, Reserve, RoundInputs, Seat, Selection,
     SelectionPolicy, proposer_family, proposer_family_exclusions,
@@ -162,7 +167,7 @@ pub mod prelude {
     pub use crate::roster::{
         EpochWindow, Revocation, RevocationReason, Roster, RosterEntry, SignUp, Withdrawal,
     };
-    pub use crate::round::Round;
+    pub use crate::round::{Escalation, Round};
     pub use crate::select::{ProposerExclusion, RoundInputs, Seat, Selection, SelectionPolicy};
     pub use crate::verdict::{Evaluation, QuorumState, ReasonCode, VerdictRecord};
     pub use gitiup_attest::{SigningKey, TimeUs, Trust};

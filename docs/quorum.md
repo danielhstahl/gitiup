@@ -9,8 +9,9 @@ asks for a quorum ([`quorum`](../crates/gitiup/src/quorum.rs)). The
 store side of jobs and leases exists too — an advertised round, a paged listing of open
 rounds, and TTL leases on seats ([`store`](../crates/gitiup-quorum/src/store.rs),
 [`job`](../crates/gitiup-quorum/src/job.rs)) — and so do both ends of the loop: `gitiup
-work` serves a seat end to end, and `gitiup quorum verdict` tallies one, publishes it and
-exits on it. Dispute reports and bounded escalation are the open tickets.
+work` serves a seat end to end, `gitiup quorum dispute` reads a tallied round's evidence
+out loud, `gitiup quorum retry` escalates it under an attempt cap the policy signs, and
+`gitiup quorum verdict` tallies one, publishes it and exits on it.
 Decided by [ADR-0002](adr/0002-roster-verifier-selection-and-sybil-resistance.md),
 implemented in [`crates/gitiup-quorum`](../crates/gitiup-quorum), attested in the format
 [ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md) decides.
@@ -689,9 +690,99 @@ opened is a refusal that lists the jobs it did open, because that is the whole d
 between a typo and a wrong answer.
 
 What the command will not do is as deliberate: it does not open, re-open or void a round
-(that is `gitiup select`, and escalation in giti-zp1.7), and it does not decide what a
+(that is [`gitiup select`](#selecting-from-the-command-line) and
+[`gitiup quorum retry`](#escalating-it-the-attempt-cap)), and it does not decide what a
 vote is worth from a flag. A verdict is an opinion about evidence, signed. That is the
 whole job.
+
+## Reading a disagreement: `gitiup quorum dispute`
+
+`gitiup quorum verdict` answers the merge gate's question — one state, one exit code — and
+in answering it leaves out the half a human needs. Five machines disagreed; which five,
+what did each actually sign, and what did the logs look like? The losing digests are
+named and counted in the verdict and the logs that produced them are still in the
+volunteers' terminals. [`gitiup quorum dispute`](../crates/gitiup/src/dispute.rs) prints
+the evidence behind that state, and decides nothing ([`crates/gitiup/tests/quorum_dispute_cli.rs`](../crates/gitiup/tests/quorum_dispute_cli.rs)):
+
+* **the distinct `ResultDigest`s and their counts**, most-voted first, each marked `counted`
+  (the group the verdict used), `would have reached` (a group big enough on its own that the
+  threshold still went to somebody else) or `losing`;
+* **the seats involved** — rank, key, identity, tier, and what the tally made of them
+  (`counted` · `diverging` · `rejected` with its refusal code · `silent`);
+* **the sandbox rung each used**: what confined the run (`provenance.sandbox`) next to what
+  that promise is worth (the `x-sandbox-guarantees` annotation the runner filed), and the
+  rung the box is registered at against the rung the round demanded;
+* **each machine's environment fingerprint**, the [`EnvironmentFingerprint`](capability.md)
+  the run reported — two boxes disagreeing while reporting one fingerprint is a different
+  report from two boxes disagreeing while reporting two.
+
+### The two diffs, printed together
+
+A divergence that **survives normalisation** is a fact about the build: a test that ran
+differently, a version that moved. A divergence that does not survive it is a fact about the
+machine — a timestamp, a temp directory, a duration — and it proves only that two machines
+exist. Both kinds make the digests differ and they need opposite responses, so with logs
+handed over (`--logs <dir>`, one file per seat named after its slot) the report prints the
+raw diff and the normalised diff side by side and labels every hunk with
+[`Change::survives_normalisation`](../crates/gitiup-normalise/src/diff.rs). A dispute whose
+every hunk normalises away is a normalisation bug and not a broken change, and saying that
+is cheaper than five more attempts.
+
+The logs are evidence, so they are checked: a file is hashed the way its seat hashed it
+(with the `normalisation_version` that attestation declares) and refused at exit 8 if it
+does not match. A dispute argued from somebody else's log is worse than no report, because
+it is a confident wrong answer about a change somebody is trying to merge. Without `--logs`
+the report prints everything the store can give it and says plainly that the log half is
+missing.
+
+Its exit code is the verdict's — 0 nothing to dispute · 6 `failed`/`insufficient` · 7 a
+signature that does not verify · 8 a digest that is not what it names — computed by the same
+[`store::tally`](../crates/gitiup-quorum/src/store.rs) call on the same records. The report
+cannot disagree with the gate, because it is the gate read out loud.
+
+## Escalating it: the attempt cap
+
+A disagreement is an invitation to look, not permission to loop.
+[`gitiup quorum retry`](../crates/gitiup/src/retry.rs) opens `attempt + 1` of every job of a
+change whose latest attempt did not come out clean
+([`crates/gitiup/tests/quorum_retry_cli.rs`](../crates/gitiup/tests/quorum_retry_cli.rs)):
+
+* **a fresh round id, seed and selection.** The attempt number is inside the seed message
+  ([ADR-0002 D2](adr/0002-roster-verifier-selection-and-sybil-resistance.md)), so the next
+  attempt cannot seat the jury it is replacing; the command refuses at exit 8 if its own
+  derivation ever says otherwise. The roster is re-read, so a pool that grew since is a
+  pool the second attempt can use.
+* **wider, never looser**: [`SelectionPolicy::escalated`] — `n + 2` seats, `reserves + 1`,
+  `required_agree + 1`. More machines and a higher bar is the only direction a second
+  chance moves in; `--same-policy` is there for a job whose seat count is already its whole
+  roster.
+* **the previous attempt's evidence kept, and cited.** Nothing is edited or deleted: the
+  superseded round, its commitments, its reveals and its filed verdict stay at their refs,
+  and the new round carries [`Escalation`](../crates/gitiup-quorum/src/round.rs) — the
+  attempt and round digest it replaces, the verdict digest that prompted it when one was
+  filed, and the reason in a sentence. This is the other half of
+  [filing a verdict](#filing-it-superseded-never-edited): a verdict cannot be improved over
+  by re-running the tally, so the way out of a disagreement is a new attempt that can be
+  traced back to it.
+* **the author stays out.** The exclusions carry forward and are re-checked with
+  [`ProposerExclusion::check`] against the new pool, which may have grown that contributor a
+  second box since.
+
+### The cap is data the owner signed
+
+Attempts per `(change, job)` are capped by `quorum.max_attempts` in the published policy
+([`QuorumBlock`](../crates/gitiup-quorum/src/policy.rs)), default
+[`DEFAULT_MAX_ATTEMPTS`] = 3. `--max-attempts` may tighten it and never loosen it: how much
+patience a repository has is the owner's to sign, and every attempt is paid for by a roster
+of strangers. The count comes from the store's own refs — `1 +` the highest attempt number
+that exists — so it cannot be escaped by losing a local log.
+
+Running out is **terminal and has its own exit code**: 9, with the token
+`attempt_cap_exhausted` ([`escalate.rs`](../crates/gitiup-quorum/src/escalate.rs)). "One
+attempt left" and "no attempts left" are different operational facts and only one of them is
+worth waiting for, and the refusal says what to do instead of a fourth attempt: a flaky test
+that survived three verifications is a bug to fix and re-submit as a new change attempt,
+which is a different head and starts its own count.
 
 ## Deferred, with the reason
 
@@ -700,8 +791,11 @@ that already exists:
 
 * **policy engine and status reporting** ([giti-msi.7](../README.md)) — `VerdictRecord`
   is the input; `SelectionPolicy` is the knob.
-* **disagreement handling** ([giti-msi.8](../README.md)) — `divergent`, `rejected` and
-  `missing` are the dispute report's body; an escalation is `attempt + 1`, a fresh seed.
+* **disagreement handling** ([giti-msi.8](../README.md)) — built as giti-zp1.7:
+  [`gitiup quorum dispute`](#reading-a-disagreement-gitiup-quorum-dispute) is `divergent`,
+  `rejected` and `missing` read out loud, with the logs, and
+  [`gitiup quorum retry`](#escalating-it-the-attempt-cap) is the escalation — `attempt + 1`,
+  a fresh seed, a cap the policy signed.
 * **the rest of the CLIs** ([giti-msi.3](../README.md), [giti-msi.5](../README.md)) —
   every command in ADR-0002's "storage" sketch is a function in this crate already, and
   `store` is the layer they call; `gitiup participant` (giti-msi.2) is the first of them,
@@ -717,6 +811,8 @@ cargo test -p gitiup-quorum --test quorum_end_to_end -- --nocapture
 cargo test -p gitiup-quorum --test job_leases -- --nocapture
 cargo test -p gitiup-quorum --test verdict_filing -- --nocapture
 cargo test -p gitiup --test quorum_verdict_cli -- --nocapture
+cargo test -p gitiup --test quorum_dispute_cli -- --nocapture
+cargo test -p gitiup --test quorum_retry_cli -- --nocapture
 ```
 
 The end-to-end test is the acceptance criterion as code: seven volunteers in the roster,

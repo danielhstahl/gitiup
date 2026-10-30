@@ -490,6 +490,7 @@ selection run all need, and nothing else. Grouped by who consumes it:
 | **the quorum, when the tier allows it** | `quorum.default` and `quorum.by_job[<glob>]`: `n`, `required_agree`, `reserves`, `tier_floor`, `tier_caps`, `max_per_identity` — `SelectionPolicy` verbatim | `giti-zp1.2`, `giti-msi.7`, `.4` |
 | **what a verifier must be able to do** | `quorum.requirements`: `arch`, `ram_mb`, `disk_mb`, `image_digests`, `sandboxes`, `min_sandbox_level` — `Requirements` verbatim | `gitiup select` (ADR-0002 D7's filter), `gitiup-sandbox`'s `admit` |
 | **how a seat submits** *(added with giti-p1.6, below)* | `quorum.reveal_mode`: `open` (absent means this) \| `sealed` | `gitiup change submit` (it opens the round), `gitiup work` (it follows it), `store::tally` |
+| **how many attempts a job gets** *(added with giti-zp1.7, below)* | `quorum.max_attempts`: attempts per `(change, job)`, `1`…`32`, absent means `3` | `gitiup quorum retry` (it opens the next one, and refuses past the cap at exit 9) |
 
 **Amendment (giti-p1.6, commit-reveal).** `quorum.reveal_mode` is the first addition to
 the `quorum` block since this ADR was accepted, and it is an *additive optional field*:
@@ -503,6 +504,25 @@ whoever submits a change must not choose how independent its verification is, an
 must not be able to un-seal an upstream's rounds. What the mode means, and the list of
 things it does not buy, is [ADR-0002 D11](0002-roster-verifier-selection-and-sybil-resistance.md)
 and [docs/quorum.md](../docs/quorum.md).
+
+**Amendment (giti-zp1.7, the attempt cap).** `quorum.max_attempts` is the second addition to
+the `quorum` block, and it is the same shape of field for the same reasons: additive and
+optional, so a document published before it keeps its bytes and its `body_digest`; refused
+as an unknown field by a build that does not know it; absent means the default (three
+attempts — the first round plus two retries), and out of range (`0`, or above `32`) is
+refused at publish time rather than guessed at apply time.
+
+It belongs to the policy and not to a flag because an attempt is paid for by other people's
+machines. Every escalation is a fresh round advertised to a roster, so "how much patience
+does this repository have with a disputed change" is exactly the owner's question to answer
+in signed data — the same answer `n` and `required_agree` give for one round, extended over
+the attempts a job may have. `gitiup quorum retry --max-attempts <n>` may *tighten* what the
+policy says and never loosen it: a caller may spend less of the roster's time than it was
+given, and may not spend more. Attempts are counted from the store's own refs (`1 +` the
+highest attempt number that exists for that `(change, job)`), so the cap is a fact about the
+record and not about anybody's local log. Running out is terminal and has its own exit code;
+see [ADR-0001 D7](0001-attestation-encoding-hash-and-signature.md) and
+[docs/quorum.md](../docs/quorum.md).
 | **scope** | `protects` (globs inside `refs/heads/**`) | `.5`, `.4` |
 
 That is the set the ticket asked for — required tier, trust anchors, `required_agree`/`n`

@@ -348,6 +348,18 @@ verification is always over the **received** bytes, and the bytes must equal the
 own re-canonicalisation, so an attacker cannot add a field without breaking a
 signature and an honest reader cannot quietly "fix up" formatting (exit 8 instead).
 
+**Amendment (giti-zp1.7, bounded escalation).** Exit **9** is outside this table and
+outside the quorum verdict's 6/7/8: it means *the attempt cap is exhausted*, and it is not
+a `6` deliberately. A `6` is "refused, and something about the evidence or the policy would
+have to change" — the code a caller retries after, once the awkward verifier comes home.
+A cap that has run out is the one answer a retry cannot improve: every attempt happened, each
+was checked, and the last of them disagreed too. Folding it into `6` would make the code that
+means "ask again" also mean "asking again is what is out of budget", which is exactly the
+confusion a bounded escalation exists to remove. Nothing about a digest is wrong either, so
+it is not an `8`; the token beside it (`attempt_cap_exhausted`) is the machine-readable form.
+See [docs/quorum.md](../docs/quorum.md) and
+[`gitiup_quorum::escalate`](../../crates/gitiup-quorum/src/escalate.rs).
+
 Limits are part of the format, because a volunteer parses strangers' claims (C7):
 1 MiB per canonical document, 32 containers of nesting, 4096 entries per list/map,
 4096 steps, 16 KiB per string, 64 signatures per document. Unknown fields are refused

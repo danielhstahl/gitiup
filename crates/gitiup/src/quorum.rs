@@ -113,15 +113,35 @@ COMMANDS:
                                 it at refs/gitiup/verdict/<change>/<job>.
                                 (0 verified · 6 refused or not yet · 7 bad signature ·
                                  8 digest mismatch)
+    dispute <CHANGE> [OPTIONS]  the evidence behind that state, read out: the distinct
+                                ResultDigests and their counts, every seat with the
+                                sandbox rung it ran at and the environment fingerprint it
+                                reported, and -- for logs handed over with --logs -- the
+                                raw diff and the same diff after gitiup-normalise, side by
+                                side, saying per hunk whether the difference is about the
+                                build or about the machine. Reads; decides nothing; exits
+                                with the verdict's own code
+    retry <CHANGE> [OPTIONS]    one attempt more, with a last time: opens attempt + 1 of
+                                every job that did not come out clean, with a fresh round
+                                id, a fresh seed and a fresh selection over the roster as
+                                it is now, wider by default (n + 2 seats, threshold + 1),
+                                citing the round and verdict it supersedes and leaving that
+                                evidence untouched. The cap is the published policy's
+                                `quorum.max_attempts` (default 3) and running out is
+                                terminal: 9
+                                (0 opened · 6 nothing to escalate or a refusal · 7 bad
+                                 signature · 8 digest mismatch · 9 attempts exhausted)
     help                        this text
 
 `gitiup quorum verdict help` lists the flags: which store, which job and attempt, whose
 signature counts, which clock to judge freshness by, and what to accept as a tier.
+`dispute` takes the same ones, so a dispute is about exactly the evidence a verdict would
+count; `retry` takes them too, because whether there is anything to escalate is the
+verdict's question.
 
-The other two questions a quorum raises are not here yet: a dispute report and a bounded
-escalation (`gitiup quorum dispute|retry`, giti-zp1.7) are the next tickets, and they are
-the ones that *move* a round. Nothing under `verdict` changes a round, a roster or a
-seat: a verdict is an opinion about evidence, signed, and that is the whole job.
+`verdict` and `dispute` change nothing: a verdict is an opinion about evidence, signed, and
+a dispute is that opinion read out loud. `retry` is the one command here that moves a
+round, and it is bounded by data the owner signed rather than by a flag.
 
 Try:
     gitiup quorum verdict chg-6a6a8eab778ba4d0 --store ./store
@@ -141,6 +161,8 @@ pub fn quorum(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         "verdict" => verdict::verdict(&args[1..]),
+        "dispute" => crate::dispute::dispute(&args[1..]),
+        "retry" => crate::retry::retry(&args[1..]),
         other => Err(CliError::usage(format!(
             "unknown `gitiup quorum` command '{other}'; `gitiup quorum help` lists what exists"
         ))),
@@ -156,7 +178,7 @@ const ARM_MARKER: &str = "matrix";
 
 /// A policy refusal that means "no rule of ours applies here", not "this store is broken":
 /// nothing published, nothing we trust, nothing currently in force.
-fn policy_is_not_ours(error: &policy::PolicyError) -> bool {
+pub(crate) fn policy_is_not_ours(error: &policy::PolicyError) -> bool {
     matches!(
         error.token(),
         token::NO_POLICY_PUBLISHED

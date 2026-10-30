@@ -39,6 +39,15 @@
 //! gitiup quorum verdict <ID>            what the quorum decided: re-verify every seat's
 //!                                      attestation and print the tally, its reasons and
 //!                                      its exit code; --publish files the signed verdict
+//! gitiup quorum dispute <ID>            the evidence behind that tally, read out: the
+//!                                      distinct ResultDigests and their counts, every seat
+//!                                      with the sandbox it ran in and the environment it
+//!                                      reported, and raw and normalised log diffs side by
+//!                                      side for the losing digests
+//! gitiup quorum retry <ID>              one attempt more, with a last time: attempt + 1
+//!                                      with a fresh seed and a fresh selection, citing the
+//!                                      round it supersedes; the attempt cap is policy, and
+//!                                      running out of it is exit 9
 //! gitiup policy publish|show            the policy a merge gate applies: publish it to
 //!                                      the store signed, and ask which one is in force
 //! gitiup policy check|explain           apply it: does this commit satisfy it, and every
@@ -63,12 +72,14 @@
 //!| 6 | refused: not a valid run report or attestation, disallowed tier, wrong machine, untrusted signer, too few signatures, stale |
 //!| 7 | a signature that does not verify |
 //!| 8 | digest mismatch: `--expect` did not match, or an attestation that is not the bytes it claims |
+//!| 9 | the attempt cap is exhausted (`quorum retry`): terminal, and asking again is what has run out — see `gitiup help` |
 
 use std::process::ExitCode;
 
 mod attest;
 mod change;
 mod digest;
+mod dispute;
 mod doctor;
 mod env;
 mod hook;
@@ -79,6 +90,7 @@ mod policy;
 mod policy_ask;
 mod quorum;
 mod remotes;
+mod retry;
 mod run;
 mod select;
 mod verdict;
@@ -141,6 +153,16 @@ COMMANDS:
                                    seat's attestation and print verified / failed /
                                    insufficient with the reason (--publish files the
                                    signed verdict: 0 · 6 · 7 · 8)
+    quorum dispute <ID> [OPTIONS]  the evidence behind that answer, read out: distinct
+                                   ResultDigests and counts, the seats, the sandbox rung
+                                   each ran at, each machine's environment fingerprint,
+                                   and the losing logs as a raw diff and a normalised one
+                                   side by side (0 · 6 · 7 · 8, the verdict's own codes)
+    quorum retry <ID> [OPTIONS]    escalate a disputed job to attempt + 1: fresh round id,
+                                   seed and selection over the roster as it is now, the
+                                   superseded round cited and left in place, the attempt
+                                   cap taken from the published policy (0 opened · 6 · 7
+                                   · 8 · 9 attempts exhausted)
     policy publish [POLICY]        the rule a merge gate applies, in the store and signed:
                                    publish checks it before it writes, and refuses what it
                                    cannot stand behind (ADR-0004)
@@ -176,6 +198,14 @@ not verify — a claim whose self-signature is broken is a different event from 
 claim you merely cannot parse. `gitiup key help` and `gitiup identity help` list
 their flags; both are scriptable end to end, with `--passphrase-file -` for a
 passphrase and `--json` on anything a script reads.
+
+`quorum retry` adds exit 9, and it is not a 6 with a new number. 6 means refused — something
+about the evidence or the policy would have to change — which is the code a caller retries
+after. 9
+means the attempt cap is exhausted: every attempt ran, each was checked, the last one
+disagreed too, and asking again is precisely what has run out. A caller that retried on 6
+would loop on it forever, which is the failure the cap exists to prevent; the machine-readable
+form of the same fact is the token `attempt_cap_exhausted` in the report.
 
 `participant` is the roster side of the optional quorum network (docs/quorum.md):
 `register` publishes what your machine can honestly do, `withdraw` leaves at an epoch you
@@ -447,7 +477,7 @@ mod tests {
     #[test]
     fn the_usage_text_documents_the_exit_codes_it_uses() {
         // The table in this module's docs and the text users see must not drift.
-        for code in ["0", "2", "3", "6", "7", "8"] {
+        for code in ["0", "2", "3", "6", "7", "8", "9"] {
             assert!(
                 USAGE.contains(code),
                 "exit code {code} is missing from the usage text"

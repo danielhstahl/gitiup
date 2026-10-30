@@ -87,6 +87,7 @@
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
+mod diff;
 mod grammar;
 mod log;
 mod manifest;
@@ -97,6 +98,7 @@ mod run;
 mod term;
 mod values;
 
+pub use diff::{Change, DiffRow, DiffStats, RowKind, TextDiff, diff_text};
 pub use grammar::{PROFILE_NAME, PROFILE_VERSION, RULE_ORDER, Rule, Rules};
 // The diff type is the format crate's: one record for "something was rewritten" and
 // "two runs disagree", carried by the manifest, printed by the CLI, and defined once.

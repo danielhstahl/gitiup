@@ -785,6 +785,9 @@ fn a_glob_scope_question_has_one_answer() {
         by_job: Some(table),
         requirements: None,
         reveal_mode: None,
+        // No attempt cap: the block is about seats and requirements, and a policy that
+        // says nothing about retries means the default, not zero retries.
+        max_attempts: None,
     });
     assert_eq!(
         with_quorum

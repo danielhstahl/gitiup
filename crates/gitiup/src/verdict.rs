@@ -240,7 +240,7 @@ pub fn verdict(args: &[String]) -> Result<(), CliError> {
 /// flags may change is *what an attestation has to be* (tier, sandbox, freshness, the
 /// clock); what they may never change is *who was asked and how many must agree*, which
 /// is the round's and not the caller's to restate.
-fn evaluation_from(args: &Args) -> Result<Evaluation, CliError> {
+pub(crate) fn evaluation_from(args: &Args) -> Result<Evaluation, CliError> {
     let mut evaluation = Evaluation::default();
     if let Some(text) = args.get("--now") {
         evaluation.now =
@@ -501,7 +501,7 @@ impl RoundTally {
 /// policy. So a submission that did not hash to what it names (8), or whose signature
 /// did not verify (7), decides the code even when the remaining votes carried the tally
 /// — a broken thing in the evidence is not made whole by being outvoted.
-fn code_of(record: &verdict::VerdictRecord) -> u8 {
+pub(crate) fn code_of(record: &verdict::VerdictRecord) -> u8 {
     let state = if record.state.mergeable() { 0 } else { 6 };
     record
         .rejected
@@ -516,7 +516,7 @@ fn code_of(record: &verdict::VerdictRecord) -> u8 {
 /// ADR-0001 D7's precedence, expressed as "which of two codes survives": 8 over 7 over 6
 /// over 0. Numeric order would put 6 over 0 and 8 over 6 by accident and neither is the
 /// rule, so the ranking is written out.
-fn worst(one: u8, other: u8) -> u8 {
+pub(crate) fn worst(one: u8, other: u8) -> u8 {
     if rank(other) > rank(one) { other } else { one }
 }
 
@@ -950,7 +950,10 @@ fn no_rounds(args: &Args, opened: &Opened, change: &str) -> CliError {
 
 /// Which rounds to tally: the latest attempt per job by default, `--attempt` to pin one,
 /// `--job` to name one.
-fn select_rounds<'a>(args: &Args, rounds: &'a [Round]) -> Result<Vec<&'a Round>, CliError> {
+pub(crate) fn select_rounds<'a>(
+    args: &Args,
+    rounds: &'a [Round],
+) -> Result<Vec<&'a Round>, CliError> {
     let wanted = match_job(args, rounds)?;
     let wanted = match_attempt(args, &wanted)?;
     Ok(latest_attempt_per_job(&wanted))
@@ -1034,7 +1037,7 @@ fn latest_attempt_per_job<'a>(rounds: &[&'a Round]) -> Vec<&'a Round> {
 /// through `change submit`, and auditing *that* is the point of `gitiup select`'s audit
 /// mode). So the store's round index is tried first, verbatim; only a handle with no
 /// rounds there gets the prefix treatment.
-fn change_id(host: &dyn gitiup_host::Host, handle: &str) -> Result<String, CliError> {
+pub(crate) fn change_id(host: &dyn gitiup_host::Host, handle: &str) -> Result<String, CliError> {
     if !store::rounds_for(host, handle)?.is_empty() {
         return Ok(handle.to_string());
     }
