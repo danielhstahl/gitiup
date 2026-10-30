@@ -33,11 +33,27 @@ pub const ROUND_RECORD_TYPE: &str = "gitiup-round-record-1";
 /// The schema version this crate writes.
 pub const ROUND_SCHEMA_VERSION: u32 = 1;
 
-/// The v1 reveal mode: the selection is public from advertisement onward.
+/// The default reveal mode: the selection is public from advertisement onward, and a
+/// seat publishes its attestation and nothing before it.
 pub const REVEAL_MODE_OPEN: &str = "open";
-/// The sealed mode: *specified, not implemented* (D11). A reader must refuse it,
-/// not treat it as `open`.
+/// Commit-reveal submission ([giti-zp1.6](../../../README.md)): every seat publishes
+/// `H(attestation bytes ‖ slot ‖ challenge)` before it publishes the bytes, and a reveal
+/// that does not open its commitment is refused and counted against the seat.
+///
+/// What the mode is *not* is worth saying here, because the name invites the wrong
+/// guess: sealing buys **independence between the seats**, not secrecy from the store. The
+/// round record publishes the seed and the selection, so the seats are public from
+/// advertisement onward either way ([ADR-0002 D11](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)),
+/// and everything a sealed round contains is readable by anyone who can read the store
+/// once the round closes. See [`crate::commit`] and
+/// [docs/quorum.md](../../../docs/quorum.md).
 pub const REVEAL_MODE_SEALED: &str = "sealed";
+
+/// Every reveal mode this build can enforce.
+///
+/// A mode outside this list is a refusal, never a downgrade to `open`: a rule you cannot
+/// check is a rule that must not be voted under.
+pub const REVEAL_MODES: [&str; 2] = [REVEAL_MODE_OPEN, REVEAL_MODE_SEALED];
 
 /// A published round.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,9 +113,33 @@ impl Round {
         Round::from_selection(inputs, &selection)
     }
 
+    /// Open a round in [`REVEAL_MODE_SEALED`]: the same selection, and every seat must
+    /// commit before it reveals ([`crate::commit`]).
+    pub fn open_sealed(
+        inputs: &RoundInputs,
+        roster: &Roster,
+        secret: &crate::derive::SelectionSecret,
+    ) -> Result<Round> {
+        let selection = Selection::select(roster, inputs, secret)?;
+        Round::from_selection_in(inputs, &selection, REVEAL_MODE_SEALED)
+    }
+
     /// Build the record around an already-derived selection (the selector's path when
     /// it wants the audit table first).
     pub fn from_selection(inputs: &RoundInputs, selection: &Selection) -> Result<Round> {
+        Round::from_selection_in(inputs, selection, REVEAL_MODE_OPEN)
+    }
+
+    /// Build the record around an already-derived selection, in a chosen reveal mode.
+    ///
+    /// The mode goes in before the record is validated, so a mode this build cannot
+    /// enforce is refused at the point the round is made rather than at the point
+    /// somebody volunteers for it.
+    pub fn from_selection_in(
+        inputs: &RoundInputs,
+        selection: &Selection,
+        reveal_mode: &str,
+    ) -> Result<Round> {
         selection.validate()?;
         if selection.policy_digest != inputs.policy.digest()? {
             return Err(Error::digest_mismatch(
@@ -113,7 +153,7 @@ impl Round {
             inputs: inputs.clone(),
             seed: selection.seed.clone(),
             policy_digest: selection.policy_digest.clone(),
-            reveal_mode: REVEAL_MODE_OPEN.to_string(),
+            reveal_mode: reveal_mode.to_string(),
             eligible: selection.eligible,
             sufficient: selection.sufficient,
             selected: selection.selected.clone(),
@@ -122,6 +162,25 @@ impl Round {
         };
         round.validate()?;
         Ok(round)
+    }
+
+    /// Restate the reveal mode, before anything signs the record.
+    ///
+    /// Refused once the round is signed: the mode is inside the body a selector's
+    /// signature covers, so editing it afterwards is editing a signed record.
+    pub fn set_reveal_mode(&mut self, reveal_mode: &str) -> Result<()> {
+        if !self.signatures.is_empty() {
+            return Err(Error::invalid(
+                "round",
+                format!(
+                    "this round is signed; its reveal mode is inside what {} signed, so \
+                     changing it means re-deriving and re-signing the round, not editing it",
+                    crate::record::short_key(&self.signatures[0].key_id)
+                ),
+            ));
+        }
+        self.reveal_mode = reveal_mode.to_string();
+        self.validate()
     }
 
     /// Structural checks, including the ones that stop a v2 record being read as v1.
@@ -141,7 +200,7 @@ impl Round {
                 format!("unknown round record type '{}'", self.round_type),
             ));
         }
-        if self.reveal_mode != REVEAL_MODE_OPEN {
+        if !REVEAL_MODES.contains(&self.reveal_mode.as_str()) {
             return Err(Error::unsupported(
                 "round",
                 format!(
@@ -150,8 +209,9 @@ impl Round {
                 ),
             )
             .with_hint(format!(
-                "this build implements \"{REVEAL_MODE_OPEN}\"; \"{REVEAL_MODE_SEALED}\" needs a \
-                 sealed grant path (ADR-0002 D11) and must be refused, not downgraded"
+                "this build implements \"{REVEAL_MODE_OPEN}\" and \"{REVEAL_MODE_SEALED}\"; a \
+                 mode it cannot enforce is refused rather than quietly read as \"{REVEAL_MODE_OPEN}\", \
+                 because a rule you cannot check is a rule you can be cheated under"
             )));
         }
         self.inputs.validate()?;
@@ -274,6 +334,11 @@ impl Round {
             selectors,
             selection,
         })
+    }
+
+    /// Must every seat commit before it reveals? (`reveal_mode = "sealed"`.)
+    pub fn is_sealed(&self) -> bool {
+        self.reveal_mode == REVEAL_MODE_SEALED
     }
 
     /// The seat occupied by `key_id`, if it has one.
@@ -538,8 +603,38 @@ mod tests {
         let roster = signed_roster(&owner, 6);
         let secret = crate::derive::SelectionSecret::from_signing_key(&owner);
         let mut round = Round::open(&inputs(&roster), &roster, &secret).unwrap();
-        round.reveal_mode = REVEAL_MODE_SEALED.into();
+        // `sealed` is implemented (giti-zp1.6), so the refusal is demonstrated with a
+        // mode this build genuinely cannot enforce: the hazard is identical, and the
+        // point of the check is that *nothing* outside `REVEAL_MODES` is read as `open`.
+        round.reveal_mode = "commit-reveal-v2".into();
         let err = round.validate().unwrap_err();
-        assert!(err.to_string().contains("sealed"), "{err}");
+        assert!(err.to_string().contains("commit-reveal-v2"), "{err}");
+        assert_eq!(err.exit_code(), 6, "{err}");
+    }
+
+    #[test]
+    fn a_sealed_round_is_the_same_round_with_a_different_promise() {
+        let owner = key(8);
+        let roster = signed_roster(&owner, 6);
+        let trust = Trust::KeyIds([owner.public_key().key_id()].into_iter().collect());
+        let secret = crate::derive::SelectionSecret::from_signing_key(&owner);
+        let open = Round::open(&inputs(&roster), &roster, &secret).unwrap();
+        let mut sealed = Round::open_sealed(&inputs(&roster), &roster, &secret).unwrap();
+        // Same seed, same seats: sealing changes what a seat must do, not who is picked.
+        assert_eq!(sealed.seed, open.seed);
+        assert_eq!(sealed.selected, open.selected);
+        assert!(sealed.is_sealed() && !open.is_sealed());
+        assert_ne!(
+            sealed.digest().unwrap(),
+            open.digest().unwrap(),
+            "and the mode is part of what the round digest identifies, so a sealed round is \
+             not the same round as an open one"
+        );
+        sealed.sign(&owner).unwrap();
+        sealed
+            .verify(&trust, &roster)
+            .expect("a sealed round verifies");
+        // The mode is inside the signature: editing it after the fact is refused.
+        assert!(sealed.set_reveal_mode(REVEAL_MODE_OPEN).is_err());
     }
 }

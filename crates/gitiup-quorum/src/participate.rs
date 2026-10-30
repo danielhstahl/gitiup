@@ -28,6 +28,7 @@ use gitiup_attest::{AttestationDoc, Digest, RunManifest, Signer, TimeUs, Trust};
 use gitiup_host::Host;
 
 use crate::capability::Requirements;
+use crate::commit::Commitment;
 use crate::error::Result;
 use crate::ledger::RosterLedger;
 use crate::roster::Roster;
@@ -208,6 +209,10 @@ pub struct Served {
     pub oid: gitiup_host::Oid,
     /// The seat it occupied.
     pub seat: Seat,
+    /// The phase-1 commitment, when the round was `sealed` and one was published ahead of
+    /// the attestation ([`Commitment::for_document`]). `None` in an open round: there was
+    /// nothing to promise before there was an answer.
+    pub commitment: Option<Commitment>,
 }
 
 /// What `serve_once` decided.
@@ -226,7 +231,9 @@ pub enum ServeOutcome {
     AlreadySubmitted,
 }
 
-/// The volunteer's one call: check, produce, bind, sign, publish.
+/// The volunteer's one call: check, produce, bind, sign, commit if the round asks for it,
+/// publish.
+///
 ///
 /// `produce` is the only part gitiup-quorum does not own: it receives the job brief and
 /// returns the unsigned manifest of a run it really performed (tier `local`, sandbox
@@ -276,12 +283,39 @@ pub fn serve_once(
             let result_digest = manifest.result_digest()?;
             let mut doc = AttestationDoc::new(manifest);
             doc.sign(signer)?;
+            // A sealed round gets its promise in the store before its answer, and in that
+            // order: the store refuses a reveal into a sealed round with no commitment
+            // behind it, so a volunteer that skipped this step would simply be told to do
+            // it (here it is not skippable, which is better).
+            //
+            // The promise is made after the build and before the reveal, which is worth
+            // saying out loud because the ticket's first draft said "before it runs
+            // anything". That ordering is not implementable for these bytes: the
+            // commitment is `H(attestation bytes ‖ slot ‖ challenge)`, and the attestation
+            // names the outputs, the environment and the timings the build produced, so
+            // there is nothing to hash until the run is over. Committing to something that
+            // exists beforehand — the round and the challenge — would be a hash anyone can
+            // compute for somebody else's answer, so it would buy nothing. What the
+            // anti-copycat property needs is the ordering this achieves: the bytes are
+            // fixed and published as a digest before the seat is allowed to look at what
+            // anyone else revealed, because a copycat that waits to look must either
+            // commit to an answer it has not produced or withhold and spend the seat
+            // (`missing`). docs/quorum.md, "What sealed does not buy", names the residue.
+            let commitment = if round.is_sealed() {
+                let mut commitment = Commitment::for_document(round, &doc, trusts.now)?;
+                commitment.sign(signer)?;
+                store::publish_commitment(host, round, &commitment)?;
+                Some(commitment)
+            } else {
+                None
+            };
             let oid = store::publish_submission(host, round, &my_key_id, &doc)?;
             Ok(ServeOutcome::Ran(Box::new(Served {
                 attestation: doc,
                 result_digest,
                 oid,
                 seat,
+                commitment,
             })))
         }
     }

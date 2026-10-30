@@ -784,6 +784,7 @@ fn a_glob_scope_question_has_one_answer() {
         default: Some(default_selection(5, 4)),
         by_job: Some(table),
         requirements: None,
+        reveal_mode: None,
     });
     assert_eq!(
         with_quorum

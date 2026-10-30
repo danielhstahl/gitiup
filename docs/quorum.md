@@ -56,7 +56,7 @@ decision, and neither changes what a plain local run produces.
 | risk | how it is closed |
 |------|------------------|
 | targeted verifier / selection bias | the seed is `HMAC-SHA256(secret, round_id_fields)` and is **published** with the round, so anyone can re-derive the scores and check the published seats are the derived ones. `Round::verify` re-runs the selection and refuses a record whose seats were edited. Anyone holding the secret can pick the pool in advance, which is why the secret is the deployment's own and rotates with its key. |
-| copycat verifiers | each seat has a slot (`key_slot(key_id)`, store-assigned and unguessable) and each attestation must carry `challenge = HMAC(seed ‖ 0x00 ‖ key_id)`, so an answer cannot be replayed into another round. Commit-reveal ([giti-msi.6](../README.md)) splits the same slot into a commitment and a reveal; nothing here has to change. |
+| copycat verifiers | each seat has a slot (`key_slot(key_id)`, store-assigned and unguessable) and each attestation must carry `challenge = HMAC(seed ‖ 0x00 ‖ key_id)`, so an answer cannot be replayed into another round. A `sealed` round splits that same slot into a commitment and a reveal ([giti-p1.6](../README.md)), so a seat cannot read the running answer before it fixes its own — [committing before revealing](#committing-before-revealing-a-sealed-round) says what that buys and what it does not. |
 | sybils and ballot stuffing | membership costs an owner signature and a key-ownership proof, one *identity* casts one vote whatever it controls, the proposer's family is excluded, and the caps limit each tier. The cost model is in ADR-0002 D4–D7; `max_per_identity` is enforced in the tally as well as in selection, so a roster cannot smuggle two boxes into two votes. |
 | stale or replayed attestations | the round pins the head oid, the attestation binds the round's challenge, freshness is evaluated at verdict time, and revocation is evaluated there too — a `compromised` key voids what it signed *earlier*, which is the only useful reading of a stolen key. |
 
@@ -165,6 +165,7 @@ refs/gitiup/revocation/<slot>           the owner's revocation (or the key's own
 refs/gitiup/round/<change>/<job>/<attempt>  the round record
 refs/gitiup/job/<change>/<job>          the advertisement: this job is still open
 refs/gitiup/lease/<change>/<job>/<slot> one volunteer's TTL claim on one seat
+refs/gitiup/commit/<change>/<job>/<slot>    phase 1 of a sealed round: H(bytes ‖ slot ‖ challenge)
 refs/gitiup/reveal/<change>/<job>/<slot>    one attestation per seat, claimed CAS
 refs/gitiup/verdict/<change>/<job>      the owner's verdict
 ```
@@ -207,9 +208,13 @@ believed through it: fetch the round, [`Round::verify`](../crates/gitiup-quorum/
 It is signed anyway (by a key that signed the round — `store::advertise_round` enforces
 that, so the noticeboard cannot carry someone else's invitation) because the cheap check
 should be possible even when the expensive one is still to come. It carries the seats,
-which is what makes `store::open_rounds_for(key)` free, and that is only honest while
-`reveal_mode` is `open`: **advertising a sealed round is refused**, because for a sealed
-round the seats are the secret (giti-zp1.6 will need a sealed advertisement of its own).
+which is what makes `store::open_rounds_for(key)` free, and that is honest in both reveal
+modes: a sealed round hides *each seat's answer until it is committed*, not the seat list
+— the seats were never secret, because the advertisement is copied from a round whose
+seats become public the moment it is advertised ([ADR-0002 D11](adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
+An advertisement that names a `reveal_mode` this build cannot enforce is refused by the
+listing, so a volunteer never takes work it would do wrongly
+([commit-reveal](#committing-before-revealing-a-sealed-round)).
 A round that could not fill its seats is not advertised either — a quorum that cannot
 happen is `insufficient`, and recruiting volunteers for it is a worse answer than
 escalating.
@@ -292,9 +297,10 @@ For each advertisement addressed to this key (`store::open_rounds_for`), one pas
 6. **digest** with `gitiup_run::manifest_for`, the same call `gitiup run --attest` makes,
    and bind the round's challenge into `verifier_challenge` so the attestation is about
    *this* round and cannot be carried to another.
-7. **sign and publish** through `store::publish_attestation` into the seat the
+7. **sign and publish** through `store::publish_submission` into the seat the
    advertisement named — the slot is chosen by the round, not by the volunteer — and
-   release the lease.
+   release the lease. On a `sealed` round this is two writes in a fixed order: the
+   commitment first, then the bytes it commits to ([below](#committing-before-revealing-a-sealed-round)).
 
 Two refusals are worth naming because they are the ones a volunteer expects to argue with.
 A **build that fails is served, not skipped**: exit 3 is signed and published like any
@@ -315,6 +321,137 @@ which machine, doing what".
 What `work` has no flag for is deliberate: the quorum size, the architecture, the tier it
 votes at. Those belong to the round and to the owner's policy; a volunteer that could
 restate them would be voting on its own terms.
+
+## Committing before revealing: a sealed round
+
+An `open` round publishes each seat's attestation the moment it is ready, and the store is
+readable by everyone in the quorum. So the first volunteer to finish has, in effect, told
+every later volunteer what the answer is. A "verifier" that reads the store, agrees, and
+signs saves an hour of building and still counts as an independent vote — and
+[ADR-0002 D3/D10](adr/0002-roster-verifier-selection-and-sybil-resistance.md) assumes
+*honest-but-weak* volunteers, which is exactly a machine that takes the cheap route when
+one is offered.
+
+A `sealed` round closes that by splitting submission into two phases, so that no seat can
+read another's answer before it has fixed its own:
+
+```text
+phase 1  refs/gitiup/commit/<change>/<job>/<slot>   SHA256( canonical attestation bytes
+                                                                  ‖ slot ‖ challenge )
+phase 2  refs/gitiup/reveal/<change>/<job>/<slot>   the attestation bytes themselves
+```
+
+Both are CAS writes keyed by the seat's slot, so one promise and one reveal per seat, and
+both land before the round's deadline. The order that matters is *commit before reveal*,
+and it is what the code enforces: the commitment is computed from the bytes the volunteer
+is about to publish, so it cannot precede the build — the attestation names outputs,
+environment and timings that do not exist until the run finishes. A commitment to something
+that existed beforehand (the round, the challenge) would be a hash anyone could compute for
+somebody else's answer, so it would buy nothing; the property that survives is the one that
+counts, namely that a seat's bytes are fixed and published as a digest before that seat is
+allowed to read anybody else's reveal. The commitment is a
+[`Commitment`](../crates/gitiup-quorum/src/commit.rs) record — `gitiup-commitment-1`,
+`{round_digest, job_id, attempt, slot, key_id, challenge, algorithm, commitment}`, signed
+by the volunteer — and it is checked, not believed: the slot must be the one that round
+derives for that key, the challenge must be that round's per-key challenge, and the bytes
+must hash to what it promises. `gitiup work` does both phases in that order without being
+told, because the round says which flow it uses; `--dry-run` shows the commitment it
+would have published and writes neither.
+
+What the tally does with the two piles is the part a gate depends on:
+
+| the evidence | the tally's word | exit |
+|---|---|---|
+| a reveal that hashes to its commitment | counted as that seat's vote | — |
+| a commitment, no reveal | `missing` — a miss, like never showing up | 6 |
+| a reveal that does not open its commitment | `rejected` with `commitment_mismatch`, and the seat is counted against | **8** |
+| a reveal with no commitment at all | refused by `store::publish_submission`, and `no_commitment` in a tally that finds one anyway | **8** |
+| a commitment signed by a key that holds no seat in this round | `foreign_commitment`, and no seat is spent on it | **8** |
+| a commitment whose challenge is another round's | `stale_commitment`, and no seat is spent on it | **8** |
+
+The mismatch rule is the interesting one, and it is why the store **publishes** a reveal
+that fails to open its commitment instead of dropping it. A mismatch is the signature of
+exactly the behaviour sealing exists to catch — compute one thing, commit to another, or
+copy an answer after the fact — and a mismatch that is silently dropped is a mismatch
+nobody has to explain. So it goes into the store as evidence, `verdict` exits 8
+(ADR-0001 D7's order: integrity before authority, so a mismatch outranks even a
+threshold that was met without it), and the seat is spent: a volunteer cannot try again
+after the deadline by publishing a better answer into a slot it already filled. The two
+defences against a reveal with no commitment are deliberate doubles — the store refuses
+the write, and the tally rejects it anyway, because the store is an index, not a memory
+nor a trusted party.
+
+### What sealed does *not* buy, spelled out
+
+This is the part a design document usually leaves implicit, and it is the part a reviewer
+needs most.
+
+* **It is not secrecy from the store's readers.** Everything a sealed round contains is
+  public, to anyone with read access, from the moment the reveal lands — the store is a
+  public content-addressed index
+  ([ADR-0002 D11](adr/0002-roster-verifier-selection-and-sybil-resistance.md): *the public
+  store is not a channel*). A commitment hides nothing; it only predates the bytes. If a
+  result must be hidden *from the other verifiers*, that is encrypted submission, which
+  ADR-0002 rejects outright, and this build does not pretend otherwise.
+* **It does not hide who is in the round.** The round record and the advertisement carry the
+  seat list, by design: selection is public once a round opens so that any auditor can
+  re-derive it, and a sealed advertisement that hid the seats would cost the free
+  `open_rounds_for(key)` poll for a benefit nobody can take anyway — a copycat can list the
+  round and read the seats today. Sealing seals each seat's *answer* until every seat has
+  committed, nothing more.
+* **It cannot prove that an answer was computed before it was seen.** The residual attack is
+  worth stating plainly: volunteer X builds, commits its real answer, watches the other
+  reveals land, and — if they disagree with its own — simply withholds its reveal. Its
+  commitment then counts as `missing` and its seat is wasted; X has traded a vote for a
+  look. That is a real option, and the answer to it is not cryptography: a `missing` is a
+  miss, misses are what reputation and quarantine
+  ([giti-p1.9](../README.md)) count, and the protocol's job was never to make cheating
+  impossible but to make it cost the cheater the thing it came for. Sealing removes the
+  free copy; it does not install good faith.
+* **A commitment binds bytes, not truths.** The preimage is the canonical attestation, and
+  an attestation's claims are self-asserted ([ADR-0001 D9](adr/0001-attestation-encoding-hash-and-signature.md)).
+  Sealing a claim does not make it true; it makes it unretractable.
+* **It binds to one round, and only that one.** The challenge is inside the hash, so a
+  commitment cannot be carried from an earlier attempt or a different job — which is also
+  why a stale commitment is refused rather than counted: a volunteer that commits to round
+  A and reveals into round B is describing neither.
+
+The mode is chosen by the **owner's policy**, `quorum.reveal_mode`, in the signed
+policy document ([giti-p1.6](../README.md)) — not by a volunteer's flag, and not by a
+client default, for the same reason `n` and `required_agree` are policy: the person
+submitting a change must not get to decide how independent its verification is, and a
+fork must not be able to un-seal an upstream's rounds.
+
+```bash
+cat > policy.json <<'EOF'
+{ "name": "example/kernel", "revision": 3,
+  "quorum": { "default": { "n": 5, "required_agree": 4 },
+              "reveal_mode": "sealed",
+              "requirements": { "arch": "x86_64", "min_sandbox_level": 1 } } }
+EOF
+gitiup policy publish ./policy.json --store ./store --key ./keys/owner.key
+```
+
+Absent means `open`, and an unknown mode is refused by `policy publish`/`policy get`, by
+`gitiup select --reveal-mode`, and by `gitiup work` when it reads a round that names one —
+never downgraded to `open`, because silently running a stricter rule as a laxer one is the
+one failure mode a security protocol may not have
+— `VerdictRecord`'s own refusal is `reveal_mode_unimplemented`, kept for a mode a *future*
+build would name.
+
+Anyone can check a sealed round without trusting a volunteer or a build: the preimage is
+published, so the check is one hash.
+
+```bash
+# the reveal's raw bytes, exactly as the store holds them
+git -C "$STORE" cat-file blob "$(git -C "$STORE" rev-parse     refs/gitiup/reveal/chg-…/build/matrix/stable/<slot>)" \
+  | sha256sum    # …equals `commitment.commitment` in the commitment blob
+```
+
+That is the whole verification, and it is why the record is JSON with a plain SHA-256
+rather than a bespoke binary format: a reviewer with a shell and `sha256sum` can audit a
+round that did not go the way their project hoped
+([ADR-0001](adr/0001-attestation-encoding-hash-and-signature.md)).
 
 ## Choosing the five
 
@@ -561,13 +698,6 @@ whole job.
 The epic is the mechanism. These are its child tickets, and each has a place to plug in
 that already exists:
 
-* **commit-reveal submission** ([giti-msi.6](../README.md)) — the slot is already
-  per-seat and unguessable; `reveal_mode` is a published field and an unimplemented mode
-  is *refused*, never silently downgraded to "open". One consequence for that ticket: a
-  sealed round cannot be advertised today, because the advertisement copies the seat list
-  ([`Advertisement::new`](../crates/gitiup-quorum/src/job.rs) refuses one). Sealed needs a
-  sealed advertisement — the job and the deadline, not the seats — and the lease refs do
-  not care either way, since a lease names a slot and grants nothing.
 * **policy engine and status reporting** ([giti-msi.7](../README.md)) — `VerdictRecord`
   is the input; `SelectionPolicy` is the knob.
 * **disagreement handling** ([giti-msi.8](../README.md)) — `divergent`, `rejected` and
@@ -597,6 +727,14 @@ five seats filled, each publishing into its own slot, and the verdict coming out
 `job_leases` is the same discipline for finding work and leaning on it: an advertisement
 that pages, a lease that two volunteers race for and only one wins, a steal that leaves a
 trail, and the rule that a lease never displaces an attestation.
+
+`commit_reveal` is the same for the two-phase flow: a sealed round run end to end through
+the store and verified; a reveal with no commitment refused by the store *and* rejected by
+a tally that finds one anyway; a mismatched reveal published as evidence, counted against
+the seat, and named `commitment_mismatch` at exit 8; a commitment with no reveal tallied as
+`missing`; a commitment from a stranger's key or another round's challenge refused without
+spending the seat; and a reader who trusts nobody recomputing a reveal's hash from the two
+refs.
 
 The verdict has two. The library rule — a verdict is superseded and never edited — is
 [`crates/gitiup-quorum/tests/verdict_filing.rs`](../crates/gitiup-quorum/tests/verdict_filing.rs):

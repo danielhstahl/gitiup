@@ -106,6 +106,10 @@ POLICY (derive mode; a published round carries its own)
     --max-per-identity <n>   seats per principal (default 1)
     --tier-floor <tier>      anonymous | endorsed | trusted
     --tier-cap <tier>=<n>    repeatable · a CAP on seats per tier, never a weight
+    --reveal-mode <mode>     open (default) | sealed: a sealed round asks each seat to
+                             commit to H(attestation bytes ‖ slot ‖ challenge) before it
+                             reveals the bytes (giti-zp1.6); `gitiup change submit` takes
+                             this from the published policy, not from a flag
 
 SIGNING (derive mode)
     --key <selector>         the selector (default: this machine's current identity); the
@@ -160,6 +164,7 @@ const VALUED: &[&str] = &[
     "--max-per-identity",
     "--tier-floor",
     "--tier-cap",
+    "--reveal-mode",
     "--key",
     "--seed-file",
     "--passphrase",
@@ -188,6 +193,7 @@ const DERIVE_ONLY: &[&str] = &[
     "--max-per-identity",
     "--tier-floor",
     "--tier-cap",
+    "--reveal-mode",
     "--seed-file",
     "--require-arch",
     "--require-ram-mb",
@@ -807,6 +813,20 @@ fn derive(
     // filter happened to bite first.
     .excluding(&roster, &proposer)?;
     let mut round = Round::open(&inputs, &roster, &secret)?;
+    // Before the signature, because the mode is inside what the selector signs.
+    if let Some(mode) = args.get("--reveal-mode") {
+        round.set_reveal_mode(mode).map_err(|error| {
+            CliError::refused(
+                format!("--reveal-mode {mode}: {error}"),
+                format!(
+                    "this build enforces \"{}\" and \"{}\"; a mode it cannot check is refused \
+                     rather than opened as \"open\"",
+                    gitiup_quorum::round::REVEAL_MODE_OPEN,
+                    gitiup_quorum::round::REVEAL_MODE_SEALED,
+                ),
+            )
+        })?;
+    }
     let entry = round.sign(&selector)?;
     let selection = round.selection(&roster)?;
     let check = ProposerExclusion::check(&roster, &inputs, &selection, &proposer);

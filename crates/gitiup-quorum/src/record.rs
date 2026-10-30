@@ -48,6 +48,9 @@ pub const ADVERTISEMENT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.job-adverti
 /// nothing about a lease is authorised by the owner, so nothing about it needs their
 /// signature.
 pub const LEASE_PAYLOAD_TYPE: &str = "application/vnd.gitiup.lease+json";
+/// A phase-1 commitment in a sealed round (giti-zp1.6): one key's promise about the
+/// bytes it is about to reveal. Signed by that key alone, like a lease.
+pub const COMMITMENT_PAYLOAD_TYPE: &str = "application/vnd.gitiup.commitment+json";
 
 /// The canonical bytes of `value`, with `signatures` and `self_signature` removed.
 ///
@@ -302,6 +305,15 @@ impl Record for crate::job::Lease {
     /// or the store could invent a holder.
     fn load(bytes: &[u8]) -> crate::error::Result<Self> {
         crate::job::Lease::from_canonical_bytes(bytes)
+    }
+}
+
+impl Record for crate::commit::Commitment {
+    /// Loads and structurally validates; [`crate::Commitment::verify`] is what checks the
+    /// seat's own signature, and every reader in `store` owes it that call for the same
+    /// reason a lease does.
+    fn load(bytes: &[u8]) -> crate::error::Result<Self> {
+        crate::commit::Commitment::from_canonical_bytes(bytes)
     }
 }
 

@@ -45,6 +45,25 @@
 //!| 6/7/8 | the store refused the attestation: [`gate`]'s token and code, verbatim |
 //!| 0 | the work happened — including a *failed* build, whose attestation says so |
 //!
+//! # Two ways to submit, and the round decides which
+//!
+//! A round's `reveal_mode` says what its seats owe, and this command reads it instead of
+//! being told ([giti-zp1.6](../../../docs/quorum.md)):
+//!
+//! | `reveal_mode` | what this command writes |
+//!|---------------|--------------------------|
+//!| `open` | `refs/gitiup/reveal/<change>/<job>/<slot>` — the attestation |
+//!| `sealed` | `refs/gitiup/commit/<change>/<job>/<slot>` first — `H(attestation bytes ‖ slot ‖ challenge)` — and then the attestation |
+//!
+//! The commitment is the volunteer's **first write to the store for the round**, and the
+//! store refuses a sealed reveal with nothing committed behind it, so the order is enforced
+//! rather than hoped for. What it cannot enforce, and what this command will not pretend to,
+//! is that the hash existed before the run: `H(attestation bytes ‖ …)` is not computable
+//! before the attestation does exist. What the ordering buys is that a seat cannot change
+//! its mind once it has promised — read
+//! [docs/quorum.md](../../../docs/quorum.md) for what sealing does *not* buy. An
+//! unimplemented mode is still refused (6), never run as if it were `open`.
+//!
 //! # A red build is still a result
 //!
 //! A quorum is not a wall of green ticks; it is several machines agreeing on what
@@ -93,7 +112,7 @@ use gitiup_quorum::participate::Trusts;
 use gitiup_quorum::prelude::*;
 use gitiup_quorum::store::{Claim, Cursor};
 use gitiup_quorum::{
-    Advertisement, Exclusion, Invitation, LeaseRequest, RosterLedger, check_invitation,
+    Advertisement, Commitment, Exclusion, Invitation, LeaseRequest, RosterLedger, check_invitation,
     exclusion_of, gate, store, ttl_text,
 };
 use gitiup_run::{Execution, Plan, PlannedJob, Selector, Simulation, Workflow};
@@ -109,6 +128,8 @@ use crate::participant::{self, Opened};
 /// The `type` string this build implements, quoted so the refusal can name what it
 /// refused.
 const REVEAL_MODE_OPEN: &str = gitiup_quorum::round::REVEAL_MODE_OPEN;
+/// The other mode this build enforces: commit-reveal (giti-zp1.6).
+const REVEAL_MODE_SEALED: &str = gitiup_quorum::round::REVEAL_MODE_SEALED;
 /// How many advertisements one page of the poll fetches.
 const PAGE: usize = 32;
 
@@ -508,6 +529,8 @@ impl Volunteer {
             normalisation: None,
             result_failed: false,
             published: None,
+            commitment: None,
+            reveal_mode: advertisement.reveal_mode.clone(),
             source_date_epoch: None,
         };
         let refused = |report: &mut RoundReport, code: u8, detail: String| {
@@ -751,11 +774,72 @@ impl Volunteer {
             report.detail = "nothing was published: --dry-run leases nothing and writes \
                              nothing"
                 .to_string();
+            if report.reveal_mode == REVEAL_MODE_SEALED {
+                // Still worth printing: this is the hash a real pass would commit to
+                // first, so an operator can see the two-phase shape before writing.
+                let promise = Commitment::for_document(&round, &doc, now)?;
+                report.notes.push(format!(
+                    "a real pass would commit {} to {} before publishing this attestation",
+                    promise.commitment,
+                    store::commit_ref(&round.inputs.change_id, &round.inputs.job_id, &seat.slot)
+                        .map(|name| name.as_str().to_string())
+                        .unwrap_or_else(|_| "refs/gitiup/commit/…".to_string())
+                ));
+            }
             if let Some(path) = &self.out {
                 participant::write_out(path, &doc.manifest.canonical_bytes()?)?;
                 report.notes.push(format!("wrote the manifest to {path}"));
             }
             return Ok(report);
+        }
+        // A sealed round's phase 1: the promise goes in before the answer, and the gate is
+        // asked *first* so a doomed attestation does not leave a commitment with nothing
+        // behind it (which would spend the seat: a commitment with no reveal is a `missing`
+        // seat, and a seat is not something to spend on a write that was never going to
+        // work).
+        if round.is_sealed() {
+            if let Err(rejection) = gate::admit(&roster, &round, &doc, revocations, now) {
+                refused(
+                    &mut report,
+                    rejection.exit_code.unwrap_or(6),
+                    format!(
+                        "the store would refuse this attestation ({}: {}), so nothing was \
+                         committed either: a commitment spends the seat, and a sealed seat \
+                         that commits and reveals nothing is a silent seat",
+                        rejection.code, rejection.detail
+                    ),
+                );
+                return Ok(report);
+            }
+            let mut promise = Commitment::for_document(&round, &doc, now)?;
+            promise.sign(&self.key).map_err(CliError::from)?;
+            match store::publish_commitment(&*self.store.host, &round, &promise) {
+                Ok(oid) => {
+                    report.commitment = Some(format!(
+                        "{} · {}",
+                        store::commit_ref(
+                            &round.inputs.change_id,
+                            &round.inputs.job_id,
+                            &seat.slot,
+                        )
+                        .map(|name| name.as_str().to_string())
+                        .unwrap_or_else(|_| "refs/gitiup/commit/…".to_string()),
+                        oid.hex()
+                    ));
+                    report.notes.push(format!(
+                        "committed {} — the reveal is now bound to these bytes",
+                        promise.commitment
+                    ));
+                }
+                Err(error) => {
+                    refused(
+                        &mut report,
+                        error.exit_code(),
+                        format!("the store refused the commitment: {error}"),
+                    );
+                    return Ok(report);
+                }
+            }
         }
         match store::publish_attestation(&*self.store.host, &round, &roster, &doc, revocations, now)
         {
@@ -1168,9 +1252,10 @@ fn reveal_mode_refusal(error: &gitiup_quorum::Error) -> Option<CliError> {
     Some(CliError::refused(
         format!("an invitation this build cannot honour: {detail}"),
         format!(
-            "this build implements \"{REVEAL_MODE_OPEN}\" and nothing else; a sealed round \
-             needs the sealed grant path (ADR-0002 D11, giti-zp1.6) and is refused rather \
-             than downgraded, because a mode you cannot enforce is a mode you cannot honour"
+            "this build implements \"{REVEAL_MODE_OPEN}\" and \"sealed\" (commit-reveal: \
+             giti-zp1.6) and nothing else; a mode it cannot enforce is refused rather than \
+             downgraded to \"{REVEAL_MODE_OPEN}\", because a rule you cannot check is a rule \
+             you can be cheated under"
         ),
     ))
 }
@@ -1214,6 +1299,12 @@ pub(crate) struct RoundReport {
     normalisation: Option<u32>,
     result_failed: bool,
     published: Option<String>,
+    /// Phase 1 of a sealed round: where the promise went and what it promises (`None` in
+    /// an open round, which owes none).
+    commitment: Option<String>,
+    /// The round's `reveal_mode`, echoed: a report that says `published` means something
+    /// different in each, and the reader should not have to guess which ran.
+    reveal_mode: String,
     source_date_epoch: Option<i64>,
 }
 
@@ -1259,6 +1350,8 @@ impl RoundReport {
             "normalisation_version": self.normalisation,
             "result_failed": self.result_failed,
             "published": self.published,
+            "reveal_mode": self.reveal_mode,
+            "commitment": self.commitment,
             "source_date_epoch": self.source_date_epoch,
             "notes": self.notes,
         })
@@ -1327,6 +1420,9 @@ impl RoundReport {
                 self.tier_provenance.as_deref().unwrap_or("?"),
                 self.normalisation.unwrap_or_default(),
             ));
+        }
+        if let Some(where_) = &self.commitment {
+            out.push_str(&format!("  committed   {where_}\n"));
         }
         if let Some(where_) = &self.published {
             out.push_str(&format!("  published   {where_}\n"));

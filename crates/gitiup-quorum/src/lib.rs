@@ -26,12 +26,22 @@
 //!                    VerdictRecord: verified / failed / insufficient
 //! ```
 //!
+//! # Two ways a seat can submit
+//!
+//! A round says which flow its seats are in and the tools follow it without being told —
+//! [`store::tally`] reads the round and picks:
+//!
+//! | `reveal_mode` | what a seat publishes | the rule it buys |
+//!|---------------|---------------------|------------------|
+//!| `open` (default) | the attestation, once | nothing beyond the round's own bindings |
+//!| `sealed` | `H(bytes ‖ slot ‖ challenge)` first, then the bytes | a seat cannot change its answer after committing, and a reveal that tries is refused by name ([`commit`]) |
+//!
 //! # The risks this crate is built to design out, not document away
 //!
 //! | risk | the mechanism that closes it | here |
 //!|------|---------------------------|------|
 //!| targeted verifier / selection bias | the seed is a keyed hash of the round inputs, so the pick is derived, published and re-derivable by a stranger | [`derive`], [`select`], [`Round::verify`] |
-//!| copycat verifiers | the round publishes slots per key and the attestation is bound to a per-key challenge, which is the piece commit-reveal (giti-msi.6) needs | [`Round::challenge_for`], [`store::publish_submission`] |
+//!| copycat verifiers | each seat is bound to a per-key challenge, and in a `sealed` round each publishes `H(attestation bytes ‖ slot ‖ challenge)` before it publishes the bytes, so a reveal that does not open its commitment is refused and named | [`Round::challenge_for`], [`commit`], [`store::publish_commitment`] |
 //!| sybils and ballot stuffing | membership costs an owner signature, one *identity* casts one vote, the proposer's family is excluded, and caps limit each tier | [`roster`], [`capability`], [`verdict`] |
 //!| stale or replayed attestations | freshness is bound to the change's head oid, the round's challenge, and roster revocation evaluated at verdict time | [`Evaluation`], [`Revocation::voids`] |
 //!| roster rollback | epochs are monotone and pinned per round, and a verifier remembers the highest epoch a store has offered | [`Roster::next_epoch`], [`RosterLedger`] |
@@ -92,6 +102,7 @@
 
 pub mod attestation;
 pub mod capability;
+pub mod commit;
 pub mod derive;
 pub mod error;
 pub mod gate;
@@ -113,6 +124,7 @@ pub use attestation::{
     QuorumSeat, Rederived, rederive,
 };
 pub use capability::{Capabilities, Exclusion, Requirements, RosterTier, exclusion_of};
+pub use commit::{Commitment, Filed};
 pub use derive::{ROUND_KIND, SelectionSecret};
 pub use error::{Error, Result};
 pub use gate::{admit, approval};

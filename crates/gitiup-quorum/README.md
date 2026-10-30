@@ -24,7 +24,8 @@ Three rules hold the crate together:
   records written with compare-and-swap. There is no daemon, no queue and no
   coordinator to bribe — one attestation per seat is a CAS guarantee, not a convention.
 * **Nothing is required.** Running a verifier is a volunteer's choice
-  (`participate`), requiring a quorum is an owner's choice (`verdict`), and an
+  (`participate`), requiring a quorum is an owner's choice (`verdict`), how a seat submits
+  is the owner's too (`quorum.reveal_mode`, `open` or `sealed` — `commit`), and an
   unimplemented option (a `reveal_mode` this build cannot honour) is refused rather
   than quietly downgraded.
 * **The author never referees their own change, and the round proves it.**
@@ -75,7 +76,8 @@ assert!(verdict.state.mergeable());
 | [`capability`](src/capability.rs) | the eligibility filters, and the published order they are applied in |
 | [`select`](src/select.rs) | scoring, the greedy pass over tier and identity caps, reserves, promotion, and `explain()` |
 | [`round`](src/round.rs) | the signed record that pins epoch + roster digest + seats, and re-verifies them without a secret |
-| [`store`](src/store.rs) | the ref names and CAS writes: `refs/roster/*`, `refs/round/*`, `refs/reveal/*`, `refs/verdict/*` |
+| [`store`](src/store.rs) | the ref names and CAS writes: `refs/roster/*`, `refs/round/*`, `refs/commit/*`, `refs/reveal/*`, `refs/verdict/*`, and `store::tally`, which picks the flow the round names |
+| [`commit`](src/commit.rs) | phase 1 of a sealed round: `H(attestation bytes ‖ slot ‖ challenge)`, and the check that a reveal opens it |
 | [`participate`](src/participate.rs) | the volunteer's fail-closed checklist, and `serve_once` |
 | [`verdict`](src/verdict.rs) | the tally, every rejection with its reason, the divergent results |
 | [`ledger`](src/ledger.rs) | the anti-rollback memory: the highest epoch this store has offered |

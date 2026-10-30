@@ -17,7 +17,9 @@
 //! refs/gitiup/round/<change>/<job>/<attempt>     the round record (inputs, seed, seats)
 //! refs/gitiup/job/<change>/<job>                 the job advertisement: this round is open
 //! refs/gitiup/lease/<change>/<job>/<slot>        one volunteer's TTL claim on one seat
-//! refs/gitiup/reveal/<change>/<job>/<slot>       one verifier's submission
+//! refs/gitiup/commit/<change>/<job>/<slot>       phase 1 of a sealed round: the promise
+//! refs/gitiup/reveal/<change>/<job>/<slot>       one verifier's submission (phase 2 of a
+//!                                                sealed round: the bytes it promised)
 //! refs/gitiup/verdict/<change>/<job>             the signed verdict
 //! ```
 //!
@@ -49,12 +51,31 @@
 //! counts, and a holder that died mid-job costs the round a TTL of latency instead of an
 //! hour of a blacked-out seat. Turning a lease into permission would put the store in the
 //! path of every submission and buy nothing that the seat does not already do.
+//!
+//! # A sealed round asks for two writes, in this order
+//!
+//! `reveal_mode = "sealed"` ([giti-zp1.6](../../../README.md), [`crate::commit`]) splits a
+//! submission into a commitment and a reveal, in two refs so the store's CAS enforces the
+//! order:
+//!
+//! ```text
+//! refs/gitiup/commit/<change>/<job>/<slot>   ← Expect::Absent, one per seat, signed by it
+//! refs/gitiup/reveal/<change>/<job>/<slot>   ← Expect::Absent, the bytes it promised
+//! ```
+//!
+//! [`publish_commitment`] and then [`publish_attestation`] is the whole protocol, and
+//! [`tally`] reads both back. One thing the store deliberately does *not* do: refuse a
+//! reveal whose hash does not match its commitment. That mismatch is the evidence of the
+//! behaviour sealing exists to catch, and refusing the write would replace a named
+//! rejection in a signed verdict with a silent `missing` seat — so the bytes go in, and
+//! the verdict names them ([`crate::commit`] carries the argument).
 
 use gitiup_attest::{AttestationDoc, Signer, TimeUs};
 use gitiup_host::{
     Actor, Expect, Host, HostErrorKind, Namespace, Oid, RefDeletion, RefName, RefQuery, RefUpdate,
 };
 
+use crate::commit::{Commitment, Filed};
 use crate::error::{Error, Result};
 use crate::job::{
     Advertisement, JobAddress, Lease, LeaseRequest, Taken, record_steal, short_slot, ttl_text,
@@ -63,7 +84,7 @@ use crate::record::{Record, short_key};
 use crate::roster::{Revocation, Roster, SignUp, Withdrawal};
 use crate::round::Round;
 use crate::select::Seat;
-use crate::verdict::VerdictRecord;
+use crate::verdict::{Evaluation, VerdictRecord};
 
 /// Blob namespaces used by the quorum. `roster`, `job`, `policy` and `attestation`
 /// already exist in the host crate; the rest are the new ones ADR-0002 D10 says the
@@ -83,8 +104,12 @@ pub mod ns {
     pub const REVOCATION: Namespace = Namespace::const_new("revocation");
     /// Endorsements (advice with a signature on it — never a selection input).
     pub const ENDORSEMENT: Namespace = Namespace::const_new("endorsement");
-    /// Per-key submission slots (commit-reveal in giti-msi.6 splits this in two).
+    /// Per-key submission slots: one attestation per seat, claimed CAS. In a sealed
+    /// round this is phase 2 — the bytes the seat promised in [`COMMIT`].
     pub const REVEAL: Namespace = Namespace::const_new("reveal");
+    /// Phase-1 commitments of a sealed round (giti-zp1.6): one hash per seat, written
+    /// before the attestation it commits to.
+    pub const COMMIT: Namespace = Namespace::const_new("commit");
     /// Job advertisements and lease records (giti-zp1.1); ADR-0002 D10 calls the
     /// namespace `job`, singular, and both record kinds travel under it.
     pub const JOB: Namespace = Namespace::JOB;
@@ -140,6 +165,33 @@ pub fn reveal_ref(change: &str, job: &str, slot: &str) -> Result<RefName> {
         "reveal ref",
     )
     .and_then(|name| name.join(slot).map_err(host_error))
+}
+
+/// `refs/gitiup/commit/<change>/<job>/<slot>` — one seat's phase-1 commitment.
+///
+/// Named by the same hex slot as the seat's lease and its reveal, because "did seat 3
+/// promise something" has to be answerable by whoever is about to tally seat 3, and the
+/// slot is the only stable public name a seat has.
+pub fn commit_ref(change: &str, job: &str, slot: &str) -> Result<RefName> {
+    check_segment(change, "change id")?;
+    check_segment(job, "job id")?;
+    crate::job::check_slot(slot)?;
+    gitiup_ref(
+        &format!("commit/{}/{}", escape(change), escape(job)),
+        "commitment ref",
+    )
+    .and_then(|name| name.join(slot).map_err(host_error))
+}
+
+/// `refs/gitiup/commit/<change>/<job>` — every commitment one job has out.
+pub fn commit_prefix(change: &str, job: &str) -> Result<String> {
+    check_segment(change, "change id")?;
+    check_segment(job, "job id")?;
+    Ok(format!(
+        "refs/gitiup/commit/{}/{}",
+        escape(change),
+        escape(job)
+    ))
 }
 
 /// `refs/gitiup/verdict/<change>` — the directory every verdict for one change lives
@@ -528,6 +580,31 @@ pub fn publish_submission(
             ));
         }
     }
+    // A sealed round's reveal must have a commitment in front of it: phase 1 is not
+    // optional, and an answer with nothing promised behind it is not independent
+    // evidence. What this does *not* do is compare hashes — see the module docs: a reveal
+    // that fails to open its commitment is published, because the mismatch is the evidence
+    // and the verdict is what names it.
+    if round.is_sealed() {
+        commitment_at(host, round, key_id)?.ok_or_else(|| {
+            Error::policy(
+                "commitment",
+                format!(
+                    "{} is a seat in a sealed round and has committed to nothing, so its \
+                     reveal is refused: commit first, at {} (the promise is what makes a \
+                     reveal mean something)",
+                    short_key(key_id),
+                    commit_ref(&round.inputs.change_id, &round.inputs.job_id, &seat.slot,)
+                        .map(|name| name.as_str().to_string())
+                        .unwrap_or_else(|_| "refs/gitiup/commit/…".to_string())
+                ),
+            )
+            .with_hint(
+                "gitiup work does both phases; a hand-driven verifier publishes \
+                 Commitment::for_document first and the attestation second",
+            )
+        })?;
+    }
     let bytes = attestation.canonical_bytes()?;
     let oid = host
         .put_cas(&ns::ATTESTATION, &bytes)
@@ -542,6 +619,114 @@ pub fn publish_submission(
             ))
         })?;
     Ok(oid)
+}
+
+/// Publish a seat's phase-1 commitment: `refs/gitiup/commit/<change>/<job>/<slot>`,
+/// claimed `Expect::Absent`, one per seat per round.
+///
+/// The seal is what makes a reveal mean something, so the checks are the seal's:
+///
+/// * the commitment must be signed by the key that holds the seat (a promise made in
+///   somebody else's slot is a forgery, not a courtesy);
+/// * it must speak about *this* round — same change, job, attempt, slot, challenge and
+///   round digest — because a commitment left over from an earlier attempt opens nothing
+///   here;
+/// * the slot is taken once: a seat that wants to change its promise does not get to,
+///   which is the entire point of committing before revealing.
+pub fn publish_commitment(host: &dyn Host, round: &Round, commitment: &Commitment) -> Result<Oid> {
+    commitment.verify()?;
+    commitment.matches(round, &commitment.key_id)?;
+    let bytes = commitment.canonical_bytes()?;
+    let name = commit_ref(
+        &round.inputs.change_id,
+        &round.inputs.job_id,
+        &commitment.slot,
+    )?;
+    put_record(host, &ns::COMMIT, &name, &bytes, "commitment")
+}
+
+/// The commitment filed in one seat's slot, if it has one.
+///
+/// Checked on the way in — its own signature, and that it is about this round and this
+/// seat — so a caller can use the answer as a gate. A slot holding a commitment that
+/// does not describe the round is an error, not an absence: "nothing was promised" and
+/// "something was promised about a different round" are different accusations.
+pub fn commitment_at(host: &dyn Host, round: &Round, key_id: &str) -> Result<Option<Commitment>> {
+    let seat = round.seat(key_id).ok_or_else(|| {
+        Error::policy(
+            "commitment",
+            format!(
+                "{} holds no seat in this round, so it has no slot to commit in",
+                short_key(key_id)
+            ),
+        )
+    })?;
+    let name = commit_ref(&round.inputs.change_id, &round.inputs.job_id, &seat.slot)?;
+    let Some((_, commitment)) = read_record::<Commitment>(host, &name, "commitment")? else {
+        return Ok(None);
+    };
+    commitment.verify()?;
+    same_ref(
+        &name,
+        &commit_ref(&commitment.change_id, &commitment.job_id, &commitment.slot)?,
+        "commitment",
+    )?;
+    commitment.matches(round, key_id)?;
+    Ok(Some(commitment))
+}
+
+/// What every seat filed in phase 1, in seat order, missing seats simply absent.
+///
+/// This is the tally's input, and it deliberately does not drop what it cannot use: a
+/// commitment whose own signature is bad, or whose fields describe another round, comes
+/// back in a [`Filed`] and is refused by name in the verdict. A reader that filtered
+/// those out would be reporting "nothing was committed" about a seat that committed to
+/// something embarrassing.
+pub fn commitments(host: &dyn Host, round: &Round) -> Result<Vec<Filed>> {
+    let mut out = Vec::new();
+    for seat in &round.selected {
+        let name = commit_ref(&round.inputs.change_id, &round.inputs.job_id, &seat.slot)?;
+        if let Some((_, commitment)) = read_record::<Commitment>(host, &name, "commitment")? {
+            // A bad self-signature *is* fatal here: an unsigned promise is not evidence
+            // about this seat at all, and a tally that counted one would be believing the
+            // store about who promised what.
+            commitment.verify()?;
+            out.push(Filed {
+                seat: seat.key_id.clone(),
+                commitment,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The verdict a round's own evidence supports, with the **flow chosen by the round**.
+///
+/// The point of this function is that a caller never chooses between the open and the
+/// sealed tally: `round.reveal_mode` chooses, and a tool that works for one works for the
+/// other without a flag. An open round's tally reads the submissions; a sealed round's
+/// reads the submissions *and* every seat's commitment, because a reveal that was never
+/// committed to is refused and that refusal has to be written down somewhere.
+pub fn tally(
+    host: &dyn Host,
+    round: &Round,
+    roster: &Roster,
+    revocations: &[Revocation],
+    evaluation: &Evaluation,
+) -> Result<VerdictRecord> {
+    let attestations = submissions(host, round)?;
+    if round.is_sealed() {
+        let filed = commitments(host, round)?;
+        return VerdictRecord::evaluate_sealed(
+            round,
+            roster,
+            &attestations,
+            &filed,
+            revocations,
+            evaluation,
+        );
+    }
+    VerdictRecord::evaluate(round, roster, &attestations, revocations, evaluation)
 }
 
 /// The roster-aware submission: refuse first, write second.

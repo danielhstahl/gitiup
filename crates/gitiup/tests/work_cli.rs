@@ -13,9 +13,11 @@
 //! * `--dry-run` publishes nothing and leases nothing, and says so;
 //! * a *failing* build still produces a signed, published result: a quorum agrees on
 //!   what happened, not on green ticks;
-//! * the refusals each have their own code and sentence: no usable sandbox, a sealed
-//!   `reveal_mode`, a roster epoch below the ledger, a live lease held by somebody else,
-//!   and a revoked key refused with the gate's own token;
+//! * the refusals each have their own code and sentence: no usable sandbox, a
+//!   `reveal_mode` this build cannot enforce, a roster epoch below the ledger, a live lease
+//!   held by somebody else, and a revoked key refused with the gate's own token;
+//! * a `sealed` round — which the owner's policy asks for, never a flag — makes the
+//!   volunteer commit before it reveals, without being told ([giti-zp1.6](../../../docs/quorum.md));
 //! * the capability claim is checked against the machine, not against the roster's
 //!   memory of it;
 //! * `--max-jobs` and `--json` mean what a supervisor needs them to mean.
@@ -329,7 +331,9 @@ jobs:
 /// Note the sorted `sandboxes` list: `gitiup policy publish` normalises the document
 /// after signing it, so a list in any other order publishes as a bad signature; the
 /// sorted order is what the store keeps.
-fn quorum_block() -> Value {
+/// The same block, in a chosen reveal mode (giti-zp1.6): `sealed` asks every seat to
+/// publish `H(attestation bytes ‖ slot ‖ challenge)` before it publishes the bytes.
+fn quorum_block_in(reveal_mode: &str) -> Value {
     json!({
         "default": {
             "max_per_identity": 1,
@@ -339,6 +343,7 @@ fn quorum_block() -> Value {
             "tier_caps": { "anonymous": 1, "endorsed": 5, "trusted": 1 },
             "tier_floor": "anonymous"
         },
+        "reveal_mode": reveal_mode,
         "requirements": {
             "arch": ARCH,
             "ram_mb": 1024,
@@ -348,6 +353,10 @@ fn quorum_block() -> Value {
         }
     })
 }
+
+/// The reveal mode `gitiup work` knows how to honour, spelled from the library so a
+/// rename cannot leave these fixtures claiming something the build does not do.
+const REVEAL_MODE_OPEN: &str = gitiup_quorum::round::REVEAL_MODE_OPEN;
 
 /// The whole scene: owner, author, five volunteers on a published epoch, a published
 /// policy, and one submitted change whose round is advertised to all five.
@@ -363,6 +372,15 @@ impl Scene {
     }
 
     fn with(workflow: &str) -> Scene {
+        Scene::building(workflow, REVEAL_MODE_OPEN)
+    }
+
+    /// The same scene whose policy asks for `sealed` submission (giti-zp1.6).
+    fn sealed(workflow: &str) -> Scene {
+        Scene::building(workflow, gitiup_quorum::round::REVEAL_MODE_SEALED)
+    }
+
+    fn building(workflow: &str, reveal_mode: &str) -> Scene {
         let harness = Harness::new();
         harness.new_key("owner");
         let store = harness.store();
@@ -386,7 +404,7 @@ impl Scene {
                 "allowed_tiers": ["quorum"],
                 "trust_key_ids": [harness.key_id("owner")],
             },
-            "quorum": quorum_block(),
+            "quorum": quorum_block_in(reveal_mode),
         });
         std::fs::write(
             &policy_path,
@@ -613,6 +631,177 @@ fn max_jobs_stops_the_pass_after_that_many_rounds() {
     // Without the cap, the same volunteer serves both arms.
     let everything = ok(&scene.dry_run("v1", &["--json"]), "work uncapped");
     assert_eq!(everything["simulated"], 2, "{everything}");
+}
+
+// ---------------------------------------------------------------------------
+// sealed rounds: the volunteer commits before it reveals (giti-zp1.6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_sealed_round_is_opened_by_the_policy_and_the_round_says_so() {
+    let scene = Scene::sealed(MATRIX_WORKFLOW);
+    // The rounds the submit published are sealed, because the owner's policy said so and
+    // nobody passed a flag; the advertisement carries the mode, which is how a volunteer
+    // finds out without being told.
+    let host = scene.harness.host();
+    let rounds = store::rounds_for(&host, &scene.change_id()).expect("rounds");
+    assert_eq!(rounds.len(), 2);
+    for round in &rounds {
+        assert_eq!(round.reveal_mode, gitiup_quorum::round::REVEAL_MODE_SEALED);
+    }
+    let advertised = store::open_rounds(
+        &host,
+        gitiup_quorum::sample::clock(),
+        store::Cursor::START,
+        10,
+    )
+    .expect("the listing works");
+    assert!(
+        advertised
+            .items
+            .iter()
+            .all(|ad| ad.reveal_mode == gitiup_quorum::round::REVEAL_MODE_SEALED),
+        "an advertisement states the flow it invites: {advertised:?}"
+    );
+    // And a dry run says what it would commit to, so an operator can see the two phases
+    // before writing either.
+    let body = ok(&scene.dry_run("v1", &["--json"]), "a sealed dry run");
+    assert_eq!(body["simulated"], 2, "{body}");
+    let round = &body["rounds"][0];
+    assert_eq!(round["reveal_mode"], "sealed");
+    let notes = round["notes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(notes.contains("would commit"), "{round}");
+    assert!(notes.contains("refs/gitiup/commit/"), "{round}");
+    assert!(
+        scene.harness.refs("refs/gitiup/commit").is_empty(),
+        "and a dry run writes neither phase"
+    );
+    assert!(scene.harness.refs("refs/gitiup/reveal").is_empty());
+}
+
+#[test]
+fn a_sealed_pass_commits_then_reveals_into_the_same_slot() {
+    if !may_serve_jobs() {
+        eprintln!("skip: this machine has no sandbox that may serve a stranger's job");
+        return;
+    }
+    let scene = Scene::sealed(MATRIX_WORKFLOW);
+    let body = ok(&scene.work("v1", &["--json"]), "a sealed pass");
+    assert_eq!(body["published"], 2, "both arms: {body}");
+    let round = &body["rounds"][0];
+    assert_eq!(round["state"], "published");
+    assert_eq!(round["reveal_mode"], "sealed");
+    assert!(
+        round["commitment"]
+            .as_str()
+            .is_some_and(|where_| where_.starts_with("refs/gitiup/commit/")),
+        "phase 1 names its ref: {round}"
+    );
+
+    // Both phases are in the store, and the reveal opens the commitment — which anyone
+    // with read access can check for themselves, because the preimage is published.
+    let host = scene.harness.host();
+    let job = round["job"].as_str().unwrap();
+    let record = store::rounds_for(&host, &scene.change_id())
+        .expect("rounds")
+        .into_iter()
+        .find(|candidate| candidate.inputs.job_id == job)
+        .expect("the round this pass answered for");
+    let filed = store::commitments(&host, &record).expect("commitments");
+    assert_eq!(filed.len(), 1, "one seat, one promise");
+    let submissions = store::submissions(&host, &record).expect("submissions");
+    assert_eq!(submissions.len(), 1);
+    let commitment = &filed[0].commitment;
+    assert_eq!(commitment.key_id, scene.harness.key_id("v1"));
+    assert!(
+        commitment.opens_with(&submissions[0]).unwrap(),
+        "the bytes published are the bytes promised"
+    );
+    // The refs are the ones the ticket names, both keyed by the seat's slot.
+    let slot = record
+        .seat(&commitment.key_id)
+        .expect("a seat")
+        .slot
+        .clone();
+    assert!(
+        scene
+            .harness
+            .refs(&format!("refs/gitiup/commit/{}/{}", scene.change_id(), job))
+            .iter()
+            .any(|name| name.ends_with(&slot))
+    );
+    assert!(
+        scene
+            .harness
+            .refs(&format!("refs/gitiup/reveal/{}/{}", scene.change_id(), job))
+            .iter()
+            .any(|name| name.ends_with(&slot))
+    );
+    // The verdict follows the round's mode too, and says which flow it tallied. One vote
+    // against a required four is `insufficient` (exit 6), and that is the answer, not a
+    // fault — the point here is the two fields that name the flow.
+    let output = scene.harness.run(
+        &[
+            "quorum",
+            "verdict",
+            &scene.change_id(),
+            "--store",
+            &scene.store,
+            "--job",
+            job,
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code(&output), 6, "{}{}", stdout(&output), stderr(&output));
+    let verdict = json(&output);
+    let job_report = &verdict["jobs"][0];
+    assert_eq!(job_report["reveal_mode"], "sealed", "{verdict}");
+    assert_eq!(job_report["committed"], 1);
+    assert_eq!(job_report["state"], "insufficient");
+}
+
+/// Refused, never downgraded: a mode this build cannot enforce is not run as if it were
+/// `open`. `sealed` is enforced, so the demonstration uses a mode from a newer build.
+#[test]
+fn a_reveal_mode_this_build_cannot_enforce_is_refused_not_downgraded() {
+    let scene = Scene::new();
+    let change = scene.change_id();
+    let reference = store::job_ref(&change, "build/matrix/stable").expect("a ref name");
+    let host = scene.harness.host();
+    let rounds = store::rounds_for(&host, &change).expect("rounds");
+    let record = rounds
+        .iter()
+        .find(|round| round.inputs.job_id == "build/matrix/stable")
+        .expect("that round exists");
+    let mut advertisement = store::advertisement_at(&host, &change, "build/matrix/stable")
+        .expect("advertised")
+        .expect("advertised");
+    // The mode is refused while the record is being read — before its signature is
+    // consulted — because a rule this build cannot enforce is not a rule to volunteer
+    // under, whatever signed it.
+    advertisement.reveal_mode = "commit-reveal-v2".to_string();
+    let _ = record;
+    scene.harness.put_raw(
+        Namespace::JOB,
+        &reference,
+        &advertisement.canonical_bytes().unwrap(),
+    );
+    let output = scene.dry_run("v1", &[]);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(code(&output), 6, "{text}");
+    assert!(text.contains("cannot honour"), "{text}");
+    assert!(text.contains("commit-reveal-v2"), "{text}");
+    assert!(scene.harness.refs("refs/gitiup/reveal").is_empty());
 }
 
 #[test]

@@ -739,10 +739,11 @@ pub fn rederive(
              identified by its digest for exactly this reason",
         ));
     }
-    let attestations = crate::store::submissions(host, &round)?;
+    // `store::tally` so a sealed round is tallied by the sealed rules: a quorum
+    // attestation about a sealed round that skipped the commitment check would be a
+    // summary of an answer nobody has to stand behind.
     let revocations = crate::store::list_revocations(host, selector_trust)?;
-    let verdict =
-        VerdictRecord::evaluate(&round, &roster, &attestations, &revocations, evaluation)?;
+    let verdict = crate::store::tally(host, &round, &roster, &revocations, evaluation)?;
     Ok(Rederived {
         round,
         roster_digest: facts.roster_digest,

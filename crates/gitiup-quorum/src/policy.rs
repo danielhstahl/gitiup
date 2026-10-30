@@ -228,7 +228,7 @@ pub const REQUIRED_POLICY_FIELDS: &[&str] = &[
 ];
 
 /// The members of the `quorum` block (D5).
-pub const QUORUM_FIELDS: &[&str] = &["by_job", "default", "requirements"];
+pub const QUORUM_FIELDS: &[&str] = &["by_job", "default", "requirements", "reveal_mode"];
 /// The members of one selection: `SelectionPolicy` verbatim (D2).
 pub const SELECTION_FIELDS: &[&str] = &[
     "max_per_identity",
@@ -351,8 +351,11 @@ pub mod token {
     pub const REQUIRED_AGREE_UNREACHABLE: &str = "required_agree_unreachable";
     /// `n` of 0, or `max_per_identity` of 0 (D5).
     pub const SELECTION_SHAPE: &str = "selection_shape";
-    /// The `quorum` block carries a member that is not `default`/`by_job`/`requirements`.
+    /// The `quorum` block carries a member that is not one of
+    /// `default`/`by_job`/`requirements`/`reveal_mode`.
     pub const QUORUM_SHAPE: &str = "quorum_shape";
+    /// `quorum.reveal_mode` names a reveal mode this build cannot enforce (giti-zp1.6).
+    pub const QUORUM_REVEAL_MODE: &str = "quorum_reveal_mode";
     /// `quorum` is an allowed tier with nothing to decide it (D5).
     pub const QUORUM_WITHOUT_RULES: &str = "quorum_without_rules";
     /// Quorum numbers published while the tier refuses quorum (D5).
@@ -561,12 +564,35 @@ pub struct QuorumBlock {
     /// What a verifier must be able to do to be seated at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirements: Option<Requirements>,
+    /// How the rounds this policy opens are submitted: `"open"` (the default) or
+    /// `"sealed"`, where every seat publishes `H(attestation bytes ‖ slot ‖ challenge)`
+    /// before it publishes the bytes ([giti-zp1.6](../../../README.md),
+    /// [`crate::commit`]).
+    ///
+    /// It belongs to the *owner's* signed rules rather than to a flag for the same reason
+    /// `n` and `required_agree` do: the person submitting a change must not get to choose
+    /// how much independence its verification has, and a fork must not be able to un-seal
+    /// an upstream's rounds. Absent means `open`, and the field is skipped when absent so
+    /// every policy published before it exists keeps its bytes and its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_mode: Option<String>,
 }
 
 impl QuorumBlock {
     /// Whether the block decides nothing: no default and no per-job numbers.
     pub fn is_empty(&self) -> bool {
         self.default.is_none() && self.by_job.as_ref().is_none_or(|m| m.is_empty())
+    }
+
+    /// The reveal mode the rounds this block opens must use: the block's, or `open`
+    /// when it says nothing.
+    ///
+    /// The default is a literal, not a fall-through to `SelectionPolicy`: an absent field
+    /// has to mean exactly what an absent field meant before this one existed.
+    pub fn effective_reveal_mode(&self) -> &str {
+        self.reveal_mode
+            .as_deref()
+            .unwrap_or(crate::round::REVEAL_MODE_OPEN)
     }
 
     /// The selection for a job id: the longest `by_job` glob that matches, else the
@@ -1623,6 +1649,29 @@ fn check_quorum(value: &Value, rules: &Value) -> PolicyResult<()> {
                 QUORUM_FIELDS.join(", ")
             ),
         ));
+    }
+    if let Some(mode) = object.get("reveal_mode").filter(|v| !v.is_null()) {
+        let mode = mode.as_str().ok_or_else(|| {
+            PolicyError::new(
+                token::QUORUM_REVEAL_MODE,
+                "`quorum.reveal_mode` is a string: \"open\" or \"sealed\"",
+            )
+        })?;
+        if !crate::round::REVEAL_MODES.contains(&mode) {
+            return Err(PolicyError::new(
+                token::QUORUM_REVEAL_MODE,
+                format!(
+                    "`quorum.reveal_mode` is '{mode}', which this build cannot enforce; it \
+                     implements {}",
+                    crate::round::REVEAL_MODES.join(", ")
+                ),
+            )
+            .with_hint(
+                "a policy may not ask for a submission rule this build cannot check: refuse \
+                 the policy and let the selector decide whether to upgrade, rather than \
+                 opening rounds that quietly run as \"open\"",
+            ));
+        }
     }
     if let Some(default) = object.get("default") {
         check_selection("quorum.default", default)?;

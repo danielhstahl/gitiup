@@ -294,6 +294,12 @@ struct RoundTally {
     attestation: Option<Emitted>,
     /// Where the verdict went, for the human line.
     filed_at: Option<String>,
+    /// What the round demanded of its seats: `open`, or `sealed` (giti-zp1.6). Printed
+    /// because a `verified` over a sealed round and one over an open round are not the same
+    /// claim, and whoever reads the line should know which one they got.
+    reveal_mode: String,
+    /// How many seats had committed, when the round was sealed (`0` otherwise).
+    committed: usize,
 }
 
 /// What emitting a `tier: quorum` attestation did.
@@ -334,6 +340,10 @@ impl RoundTally {
             json!(self.record.digest().map(|d| d.to_string()).ok()),
         );
         map.insert("signed_by".into(), json!(self.signed_by));
+        map.insert("reveal_mode".into(), json!(self.reveal_mode));
+        if self.reveal_mode == "sealed" {
+            map.insert("committed".into(), json!(self.committed));
+        }
         if let Some(filing) = &self.filing {
             let mut out = json!({ "state": filing.token(), "ref": ref_name(&self.record) });
             if let Some(oid) = filing.oid() {
@@ -385,6 +395,13 @@ impl RoundTally {
             self.record.seats,
             self.record.required_agree,
         );
+        if self.reveal_mode == "sealed" {
+            println!(
+                "  sealed (commit-reveal): {}/{} seats committed \u{b7} reveals are counted \
+                 against their own promise",
+                self.committed, self.record.seats
+            );
+        }
         if !self.record.counted.is_empty() {
             println!("  counted ({}):", self.record.counted.len());
             for vote in &self.record.counted {
@@ -700,11 +717,33 @@ impl<'a> Runner<'a> {
                 self.evaluation.now.to_rfc3339()
             ));
         }
+        // A sealed round's other half: how many seats promised something. Read here,
+        // separately from the tally's own fetch, because this is reporting: the tally does
+        // its own reading and takes nobody's word for what was committed (giti-zp1.6).
+        let committed = if round.is_sealed() {
+            let filed = store::commitments(&*self.opened.host, round)?;
+            if filed.len() < round.selected.len() {
+                self.notes.push(format!(
+                    "job {} attempt {}: {}/{} seats had committed when the clock said {}; a \
+                     sealed seat that committed nothing cannot have its answer counted",
+                    round.inputs.job_id,
+                    round.inputs.attempt,
+                    filed.len(),
+                    round.selected.len(),
+                    self.evaluation.now.to_rfc3339()
+                ));
+            }
+            filed.len()
+        } else {
+            0
+        };
         let revocations = self.revocations.as_deref().unwrap_or_default();
-        let mut record = verdict::VerdictRecord::evaluate(
+        // The round picks the flow: a sealed round is tallied against its commitments and
+        // an open round is not, and this command is not where that choice gets made.
+        let mut record = store::tally(
+            &*self.opened.host,
             round,
             &roster,
-            &attestations,
             revocations,
             self.evaluation,
         )?;
@@ -734,6 +773,8 @@ impl<'a> Runner<'a> {
             filing,
             attestation,
             filed_at,
+            reveal_mode: round.reveal_mode.clone(),
+            committed,
         })
     }
 

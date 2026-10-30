@@ -78,6 +78,18 @@ impl Scene {
         round
     }
 
+    /// The same, in `reveal_mode = sealed` (giti-zp1.6).
+    fn open_sealed_round(&self, change: &str, job: &str, attempt: u64) -> Round {
+        let mut inputs = sample::round_inputs(&self.roster, change, job);
+        inputs.attempt = attempt;
+        let secret = gitiup_quorum::derive::SelectionSecret::from_signing_key(&self.owner);
+        let mut round =
+            Round::open_sealed(&inputs, &self.roster, &secret).expect("a sealed round opens");
+        round.sign(&self.owner).expect("selector signs");
+        store::publish_round(&self.host, &round).expect("round publishes");
+        round
+    }
+
     /// ...and advertise it, which is the half that was missing before this ticket.
     fn advertise(&self, round: &Round) -> Oid {
         store::advertise_round(&self.host, round, &self.owner, sample::clock())
@@ -206,37 +218,38 @@ fn an_advertisement_is_signed_by_a_selector_of_its_round_or_it_is_noise() {
 }
 
 #[test]
-fn a_sealed_round_is_never_advertised_and_never_answered_as_if_it_were_open() {
+fn a_round_in_an_unknown_reveal_mode_is_never_advertised_and_never_answered_as_if_it_were_open() {
+    // The mode a build cannot enforce is refused, never read as `open`. `sealed` itself is
+    // enforced (giti-zp1.6) and *is* advertised — see tests/commit_reveal.rs — so the
+    // refusal is demonstrated with a mode from a build this one cannot reason about.
     let scene = Scene::new();
     let round = scene.open_round(CHANGE, JOB, 0);
-    let mut sealed = Advertisement::new(
+    let mut unknown = Advertisement::new(
         &round,
         scene.now(),
         DEFAULT_LEASE_TTL_US,
         DEFAULT_JOB_TTL_US,
     )
     .unwrap();
-    sealed.reveal_mode = REVEAL_MODE_SEALED.to_string();
-    sealed.signatures.clear();
-    sealed.sign(&scene.owner).expect("a selector signs it");
+    unknown.reveal_mode = "commit-reveal-v2".to_string();
+    unknown.signatures.clear();
+    unknown.sign(&scene.owner).expect("a selector signs it");
 
-    // The writer refuses, because an advertisement *lists the seats* and a sealed round
-    // exists to keep them unlistable (giti-zp1.6). Publishing one would tell every
-    // volunteer to go and reveal results that were meant to stay hidden until the
-    // threshold was met.
-    let err = store::advertise(&scene.host, &sealed).unwrap_err();
+    // The writer refuses: advertising a mode nobody enforces would recruit volunteers for
+    // rules that will not be checked.
+    let err = store::advertise(&scene.host, &unknown).unwrap_err();
     assert_eq!(err.exit_code(), 6, "{err}");
     assert!(err.message().contains("reveal mode"), "{err}");
 
     // A volunteer meets one anyway — a mirror that replicated the bytes, a store running
-    // an older writer — and the poll names it instead of handing the volunteer a round to
+    // a newer writer — and the poll names it instead of handing the volunteer a round to
     // serve. `gitiup work` turns exactly this error into exit 6 and publishes nothing.
     let name = store::job_ref(CHANGE, JOB).expect("a ref name");
     let oid = scene
         .host
         .put_cas(
             &Namespace::JOB,
-            &sealed.canonical_bytes().expect("canonical"),
+            &unknown.canonical_bytes().expect("canonical"),
         )
         .expect("put the bytes");
     scene
@@ -246,10 +259,41 @@ fn a_sealed_round_is_never_advertised_and_never_answered_as_if_it_were_open() {
     let err = store::open_rounds(&scene.host, scene.now(), store::Cursor::START, 10).unwrap_err();
     assert!(err.message().contains("reveal mode"), "{err}");
     assert!(
-        err.message().contains("sealed"),
+        err.message().contains("commit-reveal-v2"),
         "the sentence has to say which mode it refused, for a volunteer reading it back \
          out of a log: {err}"
     );
+}
+
+#[test]
+fn a_sealed_round_is_advertised_like_any_other_because_sealing_binds_results_not_seats() {
+    // giti-zp1.6: `sealed` keeps each seat's *result* back until every seat has committed;
+    // the seat list itself is published in the round record either way (ADR-0002 D11), so
+    // an advertisement that copies it leaks nothing this mode keeps — and without the
+    // advertisement `gitiup work` could not find sealed work at all.
+    let scene = Scene::new();
+    let round = scene.open_sealed_round(CHANGE, JOB, 0);
+    let oid = scene.advertise(&round);
+    let listed = store::open_rounds(&scene.host, scene.now(), store::Cursor::START, 10)
+        .expect("the listing works")
+        .items;
+    assert_eq!(listed.len(), 1, "{oid}");
+    assert_eq!(listed[0].reveal_mode, REVEAL_MODE_SEALED);
+    assert_eq!(
+        listed[0].seats, round.selected,
+        "the seats are the round's own"
+    );
+    // And the poll can still answer "is this key invited", which is the whole reason the
+    // seats are copied.
+    let invited = store::open_rounds_for(
+        &scene.host,
+        &round.selected[0].key_id,
+        scene.now(),
+        store::Cursor::START,
+        10,
+    )
+    .expect("a poll for one key");
+    assert_eq!(invited.items.len(), 1);
 }
 
 #[test]

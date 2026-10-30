@@ -28,10 +28,13 @@
 //! carries the selector's signature so the cheap check is possible
 //! ([`Advertisement::verify`]), but the cheap check was never the safety argument — the
 //! re-derived selection is (D11). That is also why an advertisement copies the seats:
-//! with `reveal_mode = open` the seats are public anyway, and copying them is what makes
-//! "am I invited?" answerable without fetching a round per job. A sealed round
-//! (giti-zp1.6) therefore must not be advertised like this, and [`Advertisement::new`]
-//! refuses one rather than quietly leaking what the mode exists to hide.
+//! the seats are public in the round record either way, and copying them is what makes
+//! "am I invited?" answerable without fetching a round per job. Both modes this build
+//! enforces may therefore be advertised — including `sealed`, which seals each seat's
+//! *result* until every seat has committed ([giti-zp1.6](../../../README.md),
+//! [`crate::commit`]) and not the *selection*; a mode this build does not know is
+//! refused. The advertisement is also how `gitiup work` finds a sealed round at all, and
+//! it is why the volunteer needs no flag to know it is in one: the round says so.
 //!
 //! # A lease is advice, not a lock
 //!
@@ -76,7 +79,7 @@ use crate::record::{
     ADVERTISEMENT_PAYLOAD_TYPE, LEASE_PAYLOAD_TYPE, body_bytes, canonical_bytes, check_signatures,
     from_canonical_bytes, require_key_id_shape, require_same_bytes, short_key,
 };
-use crate::round::{REVEAL_MODE_OPEN, Round};
+use crate::round::{REVEAL_MODES, Round};
 use crate::select::Seat;
 use crate::store::check_segment;
 
@@ -154,8 +157,9 @@ pub struct Advertisement {
     pub round_digest: Digest,
     /// Digest of the policy the selection ran under.
     pub policy_digest: Digest,
-    /// Copied from the round, and refused unless it is `"open"`: an index over a sealed
-    /// round would publish the very set the mode exists to keep secret.
+    /// Copied from the round, and refused unless it is a mode this build enforces
+    /// (`"open"` or `"sealed"`): an invitation to a mode this build cannot honour is a
+    /// volunteer running a job under rules nobody is checking.
     pub reveal_mode: String,
     /// Distinct identities that must agree for this job to pass, so a volunteer knows
     /// what its one vote is worth.
@@ -243,9 +247,11 @@ impl Advertisement {
     /// * a round that is not `sufficient` cannot reach its threshold whatever happens,
     ///   so it is a dispute (giti-zp1.7) and not an invitation;
     /// * a round whose `reveal_mode` this build cannot enforce is refused by
-    ///   [`Round::validate`], which is also what refuses a sealed round — an
-    ///   advertisement publishes the seats, and for a sealed round the seats *are* the
-    ///   secret;
+    ///   [`Round::validate`] — a mode outside
+    ///   [`crate::round::REVEAL_MODES`] is not a mode an invitation may
+    ///   recruit volunteers under. `sealed` *is* enforced (giti-zp1.6) and *is*
+    ///   advertised: what it keeps back is each seat's result until every seat has
+    ///   committed, not the seat list this record copies;
     /// * a TTL outside its bounds is refused rather than clamped, because a silently
     ///   shortened lease is a surprise at the worst moment.
     pub fn new(round: &Round, now: TimeUs, lease_ttl_us: i64, job_ttl_us: i64) -> Result<Self> {
@@ -305,16 +311,20 @@ impl Advertisement {
         }
         check_segment(&self.change_id, "change id")?;
         check_segment(&self.job_id, "job id")?;
-        if self.reveal_mode != REVEAL_MODE_OPEN {
+        if !REVEAL_MODES.contains(&self.reveal_mode.as_str()) {
             return Err(Error::unsupported(
                 "advertisement",
                 format!(
-                    "reveal mode '{}' is not enforced by this build, and an advertisement \
-                     lists the seats — which a round in that mode exists to keep \
-                     unlistable. Advertising a sealed round needs a sealed advertisement \
-                     (giti-zp1.6), not this one with the field rewritten.",
-                    self.reveal_mode
+                    "reveal mode '{mode}' is not enforced by this build, so advertising it \
+                     would recruit volunteers for rules nobody is checking. An invitation \
+                     states the mode it was built under and this build refuses a mode it \
+                     cannot enforce.",
+                    mode = self.reveal_mode
                 ),
+            )
+            .with_hint(
+                "this build advertises the modes it can enforce — \"open\", and \"sealed\" \
+                 (commit-reveal, giti-zp1.6); an unknown one is refused, never read as open",
             ));
         }
         if self.seats.is_empty() || self.seats.len() > MAX_ADVERTISED_SEATS {
@@ -967,14 +977,30 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_or_insufficient_round_is_not_advertised() {
+    fn an_unknown_reveal_mode_is_never_advertised() {
         let owner = sample::owner_key();
         let roster = sample::roster_of(&owner, 7, 41);
         let inputs = sample::round_inputs(&roster, "chg-000000000000f00d", "build/matrix/linux");
         let secret = crate::derive::SelectionSecret::from_signing_key(&owner);
-        let mut sealed = Round::open(&inputs, &roster, &secret).unwrap();
-        sealed.reveal_mode = crate::round::REVEAL_MODE_SEALED.into();
-        assert!(Advertisement::new(&sealed, sample::clock(), 60, 60).is_err());
+        // A mode this build cannot enforce: recruiting volunteers under rules nobody is
+        // checking is worse than telling the selector the mode is unknown. Written as a
+        // field because a round will not *be* in an unknown mode — `validate` refuses it —
+        // so this is what arrives from a store written by a newer build.
+        let mut unknown = Round::open(&inputs, &roster, &secret).unwrap();
+        unknown.reveal_mode = "commit-reveal-v2".into();
+        assert!(Advertisement::new(&unknown, sample::clock(), 60, 60).is_err());
+        // `sealed` is enforced (giti-zp1.6), so it advertises — and the advertisement
+        // carries that mode so the volunteer can see which flow it is being invited into.
+        let sealed = Round::open_sealed(&inputs, &roster, &secret).unwrap();
+        let ad = Advertisement::new(
+            &sealed,
+            sample::clock(),
+            DEFAULT_LEASE_TTL_US,
+            DEFAULT_JOB_TTL_US,
+        )
+        .expect("a sealed round advertises itself");
+        assert_eq!(ad.reveal_mode, crate::round::REVEAL_MODE_SEALED);
+        ad.matches(&sealed).expect("and still matches its round");
 
         // Two eligible volunteers cannot fill five seats: that is `insufficient`, and
         // advertising it would recruit volunteers for a quorum that cannot happen.
@@ -1199,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_advertisement_is_refused_even_if_built_by_hand() {
+    fn an_unenforceable_advertisement_is_refused_even_if_built_by_hand() {
         let round = round();
         let mut ad = Advertisement::new(
             &round,
@@ -1208,9 +1234,9 @@ mod tests {
             DEFAULT_JOB_TTL_US,
         )
         .unwrap();
-        ad.reveal_mode = "sealed".into();
+        ad.reveal_mode = "commit-reveal-v2".into();
         let err = ad.validate().unwrap_err();
         assert_eq!(err.exit_code(), 6, "{err}");
-        assert!(err.message().contains("sealed"), "{err}");
+        assert!(err.message().contains("commit-reveal-v2"), "{err}");
     }
 }

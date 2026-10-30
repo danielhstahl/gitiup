@@ -735,6 +735,21 @@ implement rather than treat it as `open`). Commitment *anonymity* is not the goa
 commit-reveal in `.6` — independence is, and independence comes from committing to the
 digest before anyone else reveals theirs.
 
+> **Implemented (giti-p1.6), with the honest caveat.** `sealed` is implemented, and it is
+> what the paragraph above argued for and nothing more: phase 1 publishes
+> `SHA256(canonical attestation bytes ‖ slot ‖ challenge)` at
+> `refs/gitiup/commit/<change>/<job>/<slot>`, phase 2 publishes the bytes at
+> `refs/gitiup/reveal/…`, and a reveal that does not open its commitment is refused *and
+> counted against the seat* (`commitment_mismatch`, and the mismatch stays in the store as
+> evidence). It is **not** secrecy — the store is public and the preimage is published, so
+> anyone with read access sees everything once the reveal lands; it does **not** hide the
+> seats, which an advertisement has always carried; and it cannot prove that an answer was
+> computed before another seat's was read, only make withholding it cost a commitment
+> (`missing`). Handle-keyed slots and sealed grants stay unimplemented, as decided above.
+> The mode is set by `quorum.reveal_mode` in the published policy
+> ([ADR-0004 D5](0004-published-policy-format-signing-and-resolution.md)), not by a flag.
+> See [docs/quorum.md](../docs/quorum.md).
+
 **What a verifier checks before running a stranger's job** (fail-closed; all of it is
 local plus two fetches):
 

@@ -46,6 +46,10 @@
 //!   spells it.
 //! * **the pool** — the store's current roster epoch, pinned by epoch *and* digest so a
 //!   later roster rewrite cannot change what this round meant.
+//! * **the submission flow** — `quorum.reveal_mode`, `open` (default) or `sealed`
+//!   ([giti-zp1.6](../../../docs/quorum.md)): a sealed round asks each seat to commit to
+//!   its bytes before revealing them. It is policy and not a flag because the person
+//!   submitting a change must not choose how independent its verification is.
 //! * **the seed** — keyed on the submitter's own key
 //!   ([ADR-0002 D2](../../../docs/adr/0002-roster-verifier-selection-and-sybil-resistance.md)).
 //!   That is what "the submitter is the selector" means operationally: whoever publishes the
@@ -277,6 +281,7 @@ impl RoundOutcome {
             "attempt": self.inputs.attempt,
             "round_ref": self.reference,
             "round_digest": self.round.digest().ok(),
+            "reveal_mode": self.round.reveal_mode,
             "seed": self.round.seed,
             "policy_digest": self.round.policy_digest,
             "inputs": self.inputs,
@@ -446,11 +451,12 @@ impl Quorum {
                 for round in &self.rounds {
                     let policy = &round.inputs.policy;
                     println!(
-                        "    {:<32} {}/{} seats · agree {} · seed {} · {}",
+                        "    {:<32} {}/{} seats · agree {} · reveal {} · seed {} · {}",
                         round.job,
                         round.selection.selected.len(),
                         policy.n,
                         policy.required_agree,
+                        round.round.reveal_mode,
                         short_digest(&round.round.seed.to_string()),
                         match (round.selection.sufficient, round.existing) {
                             (true, false) => "published",
@@ -776,7 +782,11 @@ pub(crate) fn plan(args: &Args, store: &Opened, record: &ChangeRecord) -> Result
         // one of the author's boxes instead of leaving it to whichever filter happened to
         // bite first.
         .excluding(&roster, &proposer)?;
+        // The owner's policy says how the seats must submit, and the round says it to
+        // everyone afterwards: `gitiup work` commits before it reveals because the round
+        // says `sealed`, not because anybody passed a flag (giti-zp1.6).
         let mut round = Round::open(&inputs, &roster, &secret)?;
+        round.set_reveal_mode(block.effective_reveal_mode())?;
         round.sign(&selector)?;
         let selection = round.selection(&roster)?;
         let check = ProposerExclusion::check(&roster, &inputs, &selection, &proposer);

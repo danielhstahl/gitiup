@@ -681,6 +681,50 @@ fn opening_a_round_without_an_author_is_refused() {
     assert!(message.contains("--proposer"), "{message}");
 }
 
+/// How a round is *opened* sealed, outside `gitiup change submit`: the selector says so
+/// when it derives, and the mode is part of what it signs (giti-zp1.6).
+#[test]
+fn a_round_can_be_opened_sealed_and_a_mode_this_build_cannot_check_is_refused() {
+    let scene = Scene::new();
+    // First the refusal, while no round exists yet: a mode this build cannot enforce is
+    // refused with a code, never quietly opened as `open`.
+    let text = refused(
+        &scene.derive(&["--reveal-mode", "commit-reveal-v2", "--json"]),
+        "a reveal mode from a newer build",
+    );
+    assert!(text.contains("commit-reveal-v2"), "{text}");
+    assert!(text.contains("refused"), "{text}");
+
+    let sealed = json(&scene.derive(&["--reveal-mode", "sealed", "--json"]));
+    assert_eq!(sealed["round"]["reveal_mode"], "sealed", "{sealed}");
+    ok(
+        &scene.derive(&["--reveal-mode", "sealed", "--publish", "--json"]),
+        "opening a sealed round",
+    );
+    // An auditor reading the published round back reads the same mode off the record: it
+    // is signed data, not a run-time setting. The audit line takes no `--head`.
+    let audit = ok(
+        &scene.harness.run(
+            &[
+                "select",
+                "--change",
+                CHANGE,
+                "--job",
+                JOB,
+                "--store",
+                &scene.store,
+                "--proposer",
+                &scene.author,
+                "--json",
+            ],
+            None,
+        ),
+        "auditing the sealed round",
+    );
+    let again: Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(again["round"]["reveal_mode"], "sealed", "{again}");
+}
+
 #[test]
 fn a_published_round_is_not_re_specified() {
     let scene = Scene::new();

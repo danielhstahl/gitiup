@@ -489,6 +489,20 @@ selection run all need, and nothing else. Grouped by who consumes it:
 | **the machine class** | `rules.require_env_match` (`strict` · `major` · `off`) plus the `require_*` block: `require_arch`, `require_os`, `require_os_version`, `require_image_digest`, `require_image_reference`, `require_provider`, `require_runner`, `require_toolchain`, `require_env_fingerprint`, `require_normalisation_version` | `Policy::verify` (giti-1rs.4), `.3`'s explain |
 | **the quorum, when the tier allows it** | `quorum.default` and `quorum.by_job[<glob>]`: `n`, `required_agree`, `reserves`, `tier_floor`, `tier_caps`, `max_per_identity` — `SelectionPolicy` verbatim | `giti-zp1.2`, `giti-msi.7`, `.4` |
 | **what a verifier must be able to do** | `quorum.requirements`: `arch`, `ram_mb`, `disk_mb`, `image_digests`, `sandboxes`, `min_sandbox_level` — `Requirements` verbatim | `gitiup select` (ADR-0002 D7's filter), `gitiup-sandbox`'s `admit` |
+| **how a seat submits** *(added with giti-p1.6, below)* | `quorum.reveal_mode`: `open` (absent means this) \| `sealed` | `gitiup change submit` (it opens the round), `gitiup work` (it follows it), `store::tally` |
+
+**Amendment (giti-p1.6, commit-reveal).** `quorum.reveal_mode` is the first addition to
+the `quorum` block since this ADR was accepted, and it is an *additive optional field*:
+a document published before it exists keeps its exact bytes and its `body_digest`, and a
+document that names it is refused by a v1 reader as an unknown field — which is the right
+behaviour, not a compatibility bug. A policy that asks for a submission rule the running
+build cannot enforce (`policy` token `quorum_reveal_mode`) is refused rather than opened as
+`open`, for the reason D9 states for every unknown field: no leniency, no silent default.
+It belongs to the owner and not to a flag for the same reason `n` and `required_agree` do:
+whoever submits a change must not choose how independent its verification is, and a fork
+must not be able to un-seal an upstream's rounds. What the mode means, and the list of
+things it does not buy, is [ADR-0002 D11](0002-roster-verifier-selection-and-sybil-resistance.md)
+and [docs/quorum.md](../docs/quorum.md).
 | **scope** | `protects` (globs inside `refs/heads/**`) | `.5`, `.4` |
 
 That is the set the ticket asked for — required tier, trust anchors, `required_agree`/`n`

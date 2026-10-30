@@ -27,6 +27,12 @@
 //! * **Freshness is bound to the change.** The commit and the round challenge are
 //!   checked per submission, so a replay of last week's honest work cannot certify
 //!   this week's change.
+//! * **In a sealed round, a reveal must open its commitment.** A reveal with nothing
+//!   committed behind it is refused (`no_commitment`), a commitment that does not describe
+//!   this round is refused (`foreign_commitment`), and a reveal that hashes to something
+//!   else is refused and *named* (`commitment_mismatch`, [giti-zp1.6]). A commitment with
+//!   no reveal is not a rejection at all: it is a silent seat, and it lands in `missing`
+//!   with everyone else who said nothing.
 
 use std::collections::BTreeMap;
 
@@ -35,6 +41,7 @@ use gitiup_attest::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::commit::{Filed, code as commitment};
 use crate::error::{Error, Result};
 use crate::record::{
     VERDICT_PAYLOAD_TYPE, body_bytes, canonical_bytes, check_signatures, from_canonical_bytes,
@@ -291,10 +298,15 @@ pub struct VerdictRecord {
 }
 
 impl VerdictRecord {
-    /// Evaluate a round's submissions.
+    /// Evaluate an **open** round's submissions.
     ///
     /// `attestations` may be in any order: the counting order is defined here (by key
     /// id) so that two honest owners reaching the same facts print the same verdict.
+    ///
+    /// A sealed round is refused here rather than tallied as if it were open: dropping the
+    /// commitment check is exactly the silent downgrade this build refuses everywhere a
+    /// `reveal_mode` appears. Call [`VerdictRecord::evaluate_sealed`], or
+    /// [`store::tally`](crate::store::tally) to have the round choose for you.
     pub fn evaluate(
         round: &Round,
         roster: &Roster,
@@ -302,7 +314,77 @@ impl VerdictRecord {
         revocations: &[Revocation],
         evaluation: &Evaluation,
     ) -> Result<VerdictRecord> {
+        if round.is_sealed() {
+            return Err(Error::unsupported(
+                "verdict",
+                "this round is `reveal_mode = sealed`, whose tally refuses a reveal that was \
+                 never committed to; counting it here would drop that rule",
+            )
+            .with_hint(
+                "use VerdictRecord::evaluate_sealed (or store::tally, which reads the \
+                 round's own reveal_mode and picks the right one)",
+            ));
+        }
+        VerdictRecord::tally(round, roster, attestations, &[], revocations, evaluation)
+    }
+
+    /// Evaluate a **sealed** round's submissions against its seats' commitments.
+    ///
+    /// `commitments` is what each seat filed at `refs/gitiup/commit/<change>/<job>/<slot>`
+    /// ([`store::commitments`](crate::store::commitments) reads it); the pairing is part of
+    /// the input ([`Filed`]) because a blob sitting in one seat's slot that names another
+    /// key is evidence, not a rounding error.
+    ///
+    /// Three refusals, each one a line in `rejected` naming the seat:
+    ///
+    /// | code | the fact |
+    ///|------|----------|
+    ///| `no_commitment` | a reveal arrived with nothing committed behind it (6) |
+    ///| `foreign_commitment` | the commitment does not describe this round or this seat (6) |
+    ///| `commitment_mismatch` | the reveal hashes to something else: a changed mind (8) |
+    ///
+    /// An open round is refused here for the mirror-image reason: adding a rule a round
+    /// did not ask for is as much a misreading as dropping one it did.
+    pub fn evaluate_sealed(
+        round: &Round,
+        roster: &Roster,
+        attestations: &[AttestationDoc],
+        commitments: &[Filed],
+        revocations: &[Revocation],
+        evaluation: &Evaluation,
+    ) -> Result<VerdictRecord> {
+        if !round.is_sealed() {
+            return Err(Error::unsupported(
+                "verdict",
+                format!(
+                    "this round is `reveal_mode = \"{}\"`: it asked for no commitments, so a \
+                     tally that enforced them is not this round's tally",
+                    round.reveal_mode
+                ),
+            )
+            .with_hint("use VerdictRecord::evaluate, or store::tally"));
+        }
+        VerdictRecord::tally(
+            round,
+            roster,
+            attestations,
+            commitments,
+            revocations,
+            evaluation,
+        )
+    }
+
+    /// The one tally both modes share, so the two entry points cannot drift.
+    fn tally(
+        round: &Round,
+        roster: &Roster,
+        attestations: &[AttestationDoc],
+        commitments: &[Filed],
+        revocations: &[Revocation],
+        evaluation: &Evaluation,
+    ) -> Result<VerdictRecord> {
         let policy_digest = round.inputs.policy.digest()?;
+        let sealed = round.is_sealed();
         let mut counted: Vec<CountedVote> = Vec::new();
         let mut rejected: Vec<Rejection> = Vec::new();
         let mut identity_votes: std::collections::BTreeSet<String> = Default::default();
@@ -414,6 +496,61 @@ impl VerdictRecord {
                     Some(6),
                 );
                 continue;
+            }
+
+            // In a sealed round the seat's own earlier promise is checked before its
+            // signature and its freshness, because the interesting fact about a reveal
+            // that does not open its commitment is that the seat changed its mind — a
+            // stale clock on top of that is noise. This is the only rule that can catch a
+            // verifier that read a neighbour's answer and matched it after committing
+            // (giti-zp1.6), so it is not a nicety.
+            if sealed {
+                let Some(filed) = commitments.iter().find(|filed| filed.seat == key_id) else {
+                    reject(
+                        commitment::NO_COMMITMENT,
+                        format!(
+                            "{} revealed into a sealed round with nothing committed at {}, so \
+                             there is nothing to check its answer against: an uncommitted \
+                             answer is not independent evidence, it is an answer with no \
+                             receipt",
+                            crate::record::short_key(&key_id),
+                            crate::store::commit_prefix(
+                                &round.inputs.change_id,
+                                &round.inputs.job_id
+                            )
+                            .unwrap_or_else(|_| "refs/gitiup/commit/…".to_string())
+                        ),
+                        Some(6),
+                    );
+                    continue;
+                };
+                if let Err(error) = filed.matches(round) {
+                    reject(
+                        commitment::FOREIGN_COMMITMENT,
+                        format!(
+                            "{}'s commitment does not speak about this round, so it opens \
+                             nothing here: {error}",
+                            crate::record::short_key(&key_id)
+                        ),
+                        Some(error.exit_code()),
+                    );
+                    continue;
+                }
+                let revealed = filed.commitment.reveals_as(doc)?;
+                if revealed != filed.commitment.commitment {
+                    reject(
+                        commitment::COMMITMENT_MISMATCH,
+                        format!(
+                            "{} revealed bytes that hash to {revealed}, not the {} it \
+                             committed to: the seat changed its mind, and a sealed round \
+                             refuses the second thought instead of counting it",
+                            crate::record::short_key(&key_id),
+                            filed.commitment.commitment
+                        ),
+                        Some(8),
+                    );
+                    continue;
+                }
             }
 
             // Signature, bindings, tier and freshness, with the round's own bindings.
