@@ -73,7 +73,17 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   machine.
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
-  `quorum`, and what a policy file may insist on.
+  `quorum`, and what a policy — the draft file and the published one — may insist on.
+* [The published policy](docs/policy.md) — the rule a merge gate applies, in the store and
+  signed by the repository's owner rather than in a checkout where a fork could edit it:
+  what the document publishes, how it is signed and by whom, how a clone learns it, the
+  resolution order and which sources a merge may rest on, and three worked examples — a
+  personal repository accepting one local run, a project requiring four agreeing out of
+  five, and a fork where the inheritance and the divergence are both visible. Every
+  command line there is executed in CI
+  ([`policy_doc_cli.rs`](crates/gitiup/tests/policy_doc_cli.rs)), and
+  [`examples/gitiup-policy.json`](examples/gitiup-policy.json) is the policy file it
+  documents.
 * [The quorum verification network](docs/quorum.md) — how the five are picked and
   audited, what the store holds, the operator's tour (register → approve → open a round →
   work → verdict → merge) and the two ways it fails (nobody turned up, and they disagree),
@@ -83,8 +93,10 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   that turns it into a `RunDigest` (`RunManifest::from_run`, `gitiup digest`).
 * [Verification](docs/verification.md) — what `gitiup verify attestation` checks and in
   which order, the exit codes a hook branches on (`0` accepted, `6` policy, `7` bad
-  signature, `8` digest mismatch), the machine-readable verdict a merge gate reads, and
-  what verification deliberately refuses to do.
+  signature, `8` digest mismatch), the machine-readable verdict a merge gate reads,
+  where the policy it applies comes from (the published policy first —
+  [the policy document](docs/policy.md)), and what verification deliberately refuses to
+  do.
 * [Contributing without a forge](docs/changes.md) — `gitiup change new|submit|list|show`
   and `change merge`: the signed change record a stranger publishes when there is no pull
   request, what each command writes and in which order, why a moved base is an exit code,
@@ -148,6 +160,7 @@ cargo run -p gitiup -- run --help           # the tiers, and what it takes to ea
 cargo run -p gitiup -- digest crates/gitiup-attest/tests/fixtures/runs/hello/run.json
 cargo run -p gitiup -- digest --json crates/gitiup-attest/tests/fixtures/runs/matrix-build/run.json
 cargo run -p gitiup -- verify attestation --help   # the ladder, and what each exit code means
+cargo run -p gitiup -- policy show --policy examples/gitiup-policy.json   # what a policy file says
 cargo run -p gitiup -- key gen --comment ada@laptop          # a new signing key, age-encrypted
 cargo run -p gitiup -- identity publish ada --email ada@example.com --passphrase-file -
 cargo run -p gitiup -- identity whoami --check              # "can this machine still sign?"

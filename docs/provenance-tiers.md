@@ -174,7 +174,8 @@ is a warning nobody reads.
 
 Keeping the attestation is the gated step. **`--out`** (write it for someone else) and
 **`--policy`** (ask to be gated) both run the policy, and the built-in default allows
-`local` only:
+`local` only — the same rule the repository's own policy will apply, because a run that
+aimed at a different bar than the gate uses is a run that failed twice:
 
 ```console
 $ gitiup run --out attestation.json
@@ -190,10 +191,12 @@ $ echo $?
 Exit code 6 is the same "refused" code the library uses for a policy rejection
 (ADR-0001 D7), so a merge gate cannot tell the two apart — which is the point.
 
-## Policy files
+## What a policy may insist on
 
-A policy file is JSON (`gitiup-policy.json` by convention, `$GITIUP_POLICY` to point at
-one, `--policy <path>` on the command line). Its tier-relevant members:
+The tier a run earned is checked against a policy, and a policy is JSON. The file form —
+`gitiup-policy.json` in the checkout by convention, `$GITIUP_POLICY` or `--policy <path>`
+to name one — is the **draft**: what a repository commits next to the change, and what
+`gitiup run` aims at. Its tier-relevant members:
 
 | member              | meaning                                                          |
 |---------------------|------------------------------------------------------------------|
@@ -209,11 +212,31 @@ one, `--policy <path>` on the command line). Its tier-relevant members:
 }
 ```
 
+What a merge may actually rest on is not the draft. A repository's rules live in the
+**published policy** — the same `rules` block, wrapped in an owner, a revision, a place
+in the store's chain, and a signature
+([ADR-0004](adr/0004-published-policy-format-signing-and-resolution.md)), so a fork
+cannot edit them and a caller cannot loosen them from a flag. `gitiup policy publish`
+writes one, `gitiup policy show` says which one is in force and where it came from, and
+[`docs/policy.md`](policy.md) is the whole of it, with three worked examples that are
+executed in CI. [`examples/gitiup-policy.json`](../examples/gitiup-policy.json) is the
+draft form in full — trust keys, a freshness window, and an environment requirement
+besides the tiers.
+
+The tiers are only one thing a policy decides. The published one also says whose keys may
+sign a proof (`trust_key_ids`), how many signatures make a set (`min_signatures`), how
+old a proof may be (`max_age_us`), what machine class the run had to be, and — for a
+repository that demands a quorum — how many seats, how many must agree, and what a
+verifier has to be able to do to be seated at all.
+
 A policy that contradicts itself is refused rather than resolved: `allow_simulated: true`
 together with `allowed_tiers: ["local"]` is an error, and so is `allow_simulated: false`
 with `simulated` in the list, because the *reader* would have to guess which statement
 was the stale one. Likewise an empty `allowed_tiers` (accepts nothing, so says nothing)
-and `min_signatures: 0` (trust nobody and notice nothing) are refusals, not defaults.
+and `min_signatures: 0` (trust nobody and notice nothing) are refusals, not defaults. A
+*published* policy is refused at publish for a great deal more than that — the table is
+[ADR-0004 D5](adr/0004-published-policy-format-signing-and-resolution.md) and the
+vectors generate 32 of those refusals.
 
 Because a policy names sandboxes too, an organisation can say "a run inside `unshare`
 counts here, a run on the runner's own shell does not" — a tier of `local` produced by a
@@ -227,6 +250,7 @@ skipped by a verifier that remembers to.
 |-----------------------------------------------|----------------------------------------------------------------------|
 | `crates/gitiup-attest/src/manifest.rs`         | `Tier`, its order, `trust_warning`, and `Provenance::check`           |
 | `crates/gitiup-attest/src/policy.rs`          | `allowed_tiers`, `allowed_sandboxes`, `check_provenance`, policy files |
+| `crates/gitiup-quorum/src/policy.rs`          | the published policy: the rules above, signed, versioned, and resolved ([docs/policy.md](policy.md)) |
 | `crates/gitiup-attest/src/envelope.rs`        | `AttestationDoc::verify` calls the provenance check before signatures  |
 | `crates/gitiup-run/src/simulate.rs`           | the simulated report: tier and sandbox are not parameters              |
 | `crates/gitiup-run/src/exec.rs`               | the executed report, same rule                                          |

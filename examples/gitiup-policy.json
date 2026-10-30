@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "allowed_tiers": ["local"],
+  "allowed_sandboxes": ["docker", "landlock", "podman", "unshare"],
+  "trust_key_ids": ["SHA256:kHe5CTrcfnmORAqMoE3KPhY+IjO+b4k1l7fkv3mQ+aQ"],
+  "min_signatures": 1,
+  "max_age_us": 86400000000,
+  "require_arch": "amd64",
+  "require_env_match": "major",
+  "require_toolchain": { "rustc": "1.99" }
+}

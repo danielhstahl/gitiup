@@ -1098,35 +1098,9 @@ pub(crate) fn policy_summary(resolved: &ResolvedPolicy) -> String {
         "NOT gate-eligible".to_string()
     });
     if let Some(rules) = policy_block(resolved).get("rules") {
-        parts.push(rules_line(rules));
+        parts.push(policy_cli::rules_line(rules));
     }
     parts.join(" · ")
-}
-
-/// The numbers a reader branches on, in the order the ladder uses them.
-fn rules_line(rules: &Value) -> String {
-    let tiers = rules["allowed_tiers"]
-        .as_array()
-        .map(|tiers| {
-            tiers
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("+")
-        })
-        .unwrap_or_default();
-    let trusted = rules["trust_key_ids"]
-        .as_array()
-        .map(|ids| ids.len().to_string())
-        .unwrap_or_default();
-    format!(
-        "trust {trusted} key(s) · tiers {tiers} · min {} · max age {}",
-        rules["min_signatures"].as_u64().unwrap_or(0),
-        rules["max_age_us"]
-            .as_i64()
-            .map(verify::human_age)
-            .unwrap_or_default()
-    )
 }
 
 /// The one line a verdict gets in the human report.

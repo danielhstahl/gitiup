@@ -104,6 +104,20 @@ jobs:
           python3 docs/adr/fixtures/federation-v1/generate.py --selftest
           cargo test -p gitiup-host -j 3 --test federation_vectors
 
+      # `docs/policy.md` is documentation with the examples executed, which is only a
+      # promise if someone runs them: `policy_doc_cli` parses the page, replays every
+      # `$` line against the built binary in a clean keystore and clean stores, and
+      # fails if a printed line, an exit code, a quoted digest or a link has drifted.
+      # The ADR-0004 vectors run beside it because the page quotes their digests, and a
+      # page that drifts from the vectors is the failure mode this whole epic exists to
+      # avoid: two honest sources agreeing on nothing.
+      - name: The published policy, and its worked examples
+        run: |
+          python3 docs/adr/fixtures/policy-v1/generate.py --check
+          python3 docs/adr/fixtures/policy-v1/generate.py --selftest
+          cargo test -p gitiup-quorum -j 3 --test policy_vectors --test policy_store
+          cargo test -p gitiup -j 3 --test policy_doc_cli --test policy_cli --test policy_ask_cli
+
       # The same repositories the suite would serve itself, but served the way an
       # operator serves them: `git-http-backend` behind a CGI, rooted at a
       # directory, with anonymous pushes enabled per repository (which the suite's

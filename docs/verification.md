@@ -7,12 +7,23 @@ signing keys — produces a signed document. This is the moment someone decides 
 to act on it.
 
 ```sh
-gitiup verify attestation proof.json --policy gitiup-policy.json --json
+# one proof, judged by the rules the repository's owner published
+gitiup policy explain attestation proof.json --store ./store --json
+
+# …or, with no store in reach, by rules an operator names: the same ladder, an
+# override instead of a signature
+gitiup verify attestation proof.json --policy examples/gitiup-policy.json --json
 ```
 
 One command, one exit code, and a report that says what was checked. It is meant to be
 the line a `pre-receive` hook, a CI job, a merge gate, or a volunteer's shell runs —
 which means it has to be *scriptable* first and pretty second.
+
+The two lines above ask the same ladder two different questions, and the difference is
+where the rules came from: [policy explain](policy.md) reads them out of the store, over
+which the repository's owner holds a signature; `--policy` reads a file somebody named
+on the command line. Both are gate-eligible, and only one of them is what a repository
+*has* as a policy. See [where the policy comes from](#where-the-policy-comes-from).
 
 ## The exit codes are the interface
 
@@ -48,7 +59,7 @@ Two conventions fall out of that table, and both are tested
 ```sh
 # A pre-receive hook: refuse the ref unless the proof for this commit is good enough.
 # (`gitiup hook install pre-receive` writes this and more — see
-# [the gate that runs where the refs land](#the-gate-that-runs-where-the-refs-land).)
+# [the gate that runs where the refs land](#the-gate-that-runs-where-the-refs-land-gitiup-hook-install-pre-receive).)
 gitiup policy check --commit "$newrev" --ref refs/heads/main \
     --store ./store --json >/tmp/check.json || {
     jq -r '.reasons[] | "refused: [\(.code)] \(.detail)"' /tmp/check.json >&2
@@ -246,26 +257,49 @@ the report says it was not checked rather than leaving the reader to assume it p
 
 ## Where the policy comes from
 
-A policy is not one flag; it is the same
-[`Policy`](../crates/gitiup-attest/src/policy.rs) `gitiup run` and a hook consult,
-built from three places, in this order of precedence:
+A policy is not one flag. The rules a verdict applies are **resolved**, in one order,
+and every report says which source won
+([ADR-0004 D4](adr/0004-published-policy-format-signing-and-resolution.md),
+[docs/policy.md](policy.md)):
 
-1. **`--policy <path>`** (or `$GITIUP_POLICY`) — the `gitiup-policy.json` a repo
-   commits next to the change: `trust_key_ids`, `allowed_tiers` / `allow_simulated`,
-   `allowed_sandboxes`, `min_signatures`, `max_age_us`, `require_arch` and the rest of
-   the environment requirement, `require_normalisation_version`. Written once, reviewed
-   like code, read identically by the runner, the gate and the volunteer.
-2. **The command line**, which overrides the file field by field: `--tier`,
-   `--sandbox`, `--min-signatures`, `--max-age`, `--max-skew`, `--normalisation-version`,
-   `--require <field=value>`, `--require-env-match`, `--expect-result`,
-   `--expect-challenge`, `--commit`, `--now`.
-3. **Trust, if nothing named it:** `--trust <key>` (a `SHA256:` fingerprint or a name
-   in this machine's keystore, repeatable), else the file's `trust_key_ids`, else this
-   machine's own keystore — the same local-trust rule `gitiup identity verify` and
-   `gitiup participant` use, and *named in the output*, because a proof accepted
-   because of a keyring nobody mentioned is a proof accepted by accident. Nothing is
-   trusted silently, and an empty keystore with no `--trust` is a refusal (6), not a
-   shrug.
+1. **`--policy <path>`**, then **`$GITIUP_POLICY`** — an operator's act, and the only
+   local file a merge may rest on, precisely because naming it was deliberate. It
+   *replaces* what is published — it does not merge with it — and it says so, in a note
+   on the answer, because a silent override is how a policy stops being enforced.
+2. **The store**: `refs/gitiup/policy/current`, walked to the revision in force, signed
+   by the repository's owner, with its `rules` (`trust_key_ids`, `allowed_tiers` /
+   `allow_simulated`, `allowed_sandboxes`, `min_signatures`, `max_age_us`, `require_arch`
+   and the rest of the environment requirement, `require_normalisation_version`) and its
+   `quorum` block. This is the source a repository *has a policy in*: written once, signed,
+   reviewable, and read identically by a clone, a hook, a bucket and a build agent that
+   has never seen the checkout. [docs/policy.md](policy.md) is the whole of it.
+3. **The checkout's `gitiup-policy.json`** — a draft, and *not gate-eligible*. It is what
+   `gitiup run` aims at and what an author commits next to the change; it is not what a
+   merge may rest on, because a fork can edit it.
+4. **This build's default**, which trusts nobody — the safe direction to be wrong in.
+
+A gate that lands on 3 or 4 refuses (`no_policy_published`, exit 6) rather than deciding
+a merge by a default nobody chose, and the `pre-receive` hook consults source 2 and
+nothing else, so a clone and the box that accepted the push cannot answer differently.
+
+On top of whichever policy won, two kinds of local input:
+
+* **The command line**, which overrides the rules field by field: `--tier`,
+  `--sandbox`, `--min-signatures`, `--max-age`, `--max-skew`, `--normalisation-version`,
+  `--require <field=value>`, `--require-env-match`, `--expect-result`,
+  `--expect-challenge`, `--commit`, `--now`. These are `verify attestation`'s, and they
+  answer "what should *this run* have to prove"; the gate-shaped commands
+  (`policy check`, `policy explain`, `verify change`, the hook) take no rule flags at
+  all, because "what does this repository require" is the owner's signed answer and not
+  the caller's.
+* **Trust, if nothing named it:** `--trust <key>` (a `SHA256:` fingerprint or a name
+  in this machine's keystore, repeatable), else the file's `trust_key_ids`, else this
+  machine's own keystore — the same local-trust rule `gitiup identity verify` and
+  `gitiup participant` use, and *named in the output*, because a proof accepted
+  because of a keyring nobody mentioned is a proof accepted by accident. Nothing is
+  trusted silently, and an empty keystore with no `--trust` is a refusal (6), not a
+  shrug. Note the two questions this keeps apart: `--trust` says whose **policy** this
+  box will apply, and the policy's own `trust_key_ids` says whose **proofs** count.
 
 `--trust-any-key` accepts any key whose signature verifies. It answers "is this
 self-consistent?" and never "may I merge?", and it prints that in every output; it is
@@ -286,8 +320,12 @@ Two knobs that look like conveniences and are not:
 ```sh
 gitiup verify attestation proof.json                      # the bytes `attest push` wrote
 gitiup attest show --digest "$d" --store ./store --bytes | gitiup verify attestation -
-gitiup verify attestation --store ./store --commit "$(git rev-parse HEAD)" --policy gitiup-policy.json
+gitiup policy check --commit "$(git rev-parse HEAD)" --store ./store
 ```
+
+The third line is the same read with the repository's rules rather than a file's:
+`policy check` resolves the published policy, finds the proofs for that commit, and
+answers with an exit code ([docs/policy.md](policy.md)).
 
 `--commit <oid>` with a store both *locates* the proof and *binds* the verdict to that
 commit: an attestation about another commit is refused at 8 rather than accepted
@@ -483,6 +521,8 @@ push over is not a gate.
 | `Check` / `Reason` / `VerdictReport`, and `CHECK_ORDER` | [`report`](../crates/gitiup-attest/src/report.rs) |
 | the exit code for a class of failure | [`ErrorKind::exit_code`](../crates/gitiup-attest/src/error.rs) |
 | what a policy may demand | [`policy`](../crates/gitiup-attest/src/policy.rs) |
+| the published policy: its format, its validator, the resolution ladder, the chain walk | [`gitiup-quorum/src/policy.rs`](../crates/gitiup-quorum/src/policy.rs), and [docs/policy.md](policy.md) |
+| publish / show, the provenance block, and the refusal of a policy nobody signed | [`gitiup/src/policy.rs`](../crates/gitiup/src/policy.rs) |
 | argv, the keystore, the store, the two renderings | [`gitiup/src/verify.rs`](../crates/gitiup/src/verify.rs) |
 | the merge gate over a change: the change-level checks, the combination rule, the verdicts | [`gitiup/src/verify_change.rs`](../crates/gitiup/src/verify_change.rs) |
 | "does this commit satisfy the policy", and every rule printed in D7 order | [`gitiup/src/policy_ask.rs`](../crates/gitiup/src/policy_ask.rs) |

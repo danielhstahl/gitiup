@@ -126,7 +126,9 @@ SHOW (which policy is in force):
 
 Resolution order (D4): --policy · $GITIUP_POLICY · the store · the tree file · this
 build's default. The answer always says which one won, and a merge may rest only on the
-first three.
+first three. A published answer also prints what it gates and, for a quorum policy, the
+seats and the agreement it demands — the numbers are in the signed document, so the
+report reads them from there and not from a flag.
 
 CHECK AND EXPLAIN (does a thing satisfy it, and why):
     --commit <oid>             check: the commit to judge. With a document, the commit it
@@ -704,6 +706,17 @@ fn report(resolved: &ResolvedPolicy, store: Option<&Opened>) -> Value {
     if let Some(opened) = store {
         map.insert("store".into(), opened.what.clone().into());
     }
+    if let Some(document) = &resolved.document {
+        map.insert(
+            "protects".into(),
+            document
+                .protects
+                .iter()
+                .map(|glob| glob.clone().into())
+                .collect::<Vec<Value>>()
+                .into(),
+        );
+    }
     map.insert("rules".into(), rules(resolved));
     Value::Object(map)
 }
@@ -740,6 +753,17 @@ pub(crate) fn rules(resolved: &ResolvedPolicy) -> Value {
     }
     if let Some(commit) = &policy.expected_commit {
         map.insert("expected_commit".into(), commit.to_string().into());
+    }
+    // The quorum block is part of the answer, not decoration: "this repository demands a
+    // quorum" is only a fact once the numbers that make it up are printed too, and a
+    // published document is the only place they can come from (ADR-0004 D5).
+    if let Some(quorum) = resolved
+        .document
+        .as_ref()
+        .and_then(|document| document.quorum.as_ref())
+        && let Ok(value) = serde_json::to_value(quorum)
+    {
+        map.insert("quorum".into(), value);
     }
     let trusted: Vec<String> = match &policy.trust {
         Trust::KeyIds(ids) => ids.iter().cloned().collect(),
@@ -795,6 +819,13 @@ fn print_report(resolved: &ResolvedPolicy, store: Option<&Opened>) {
     if let Some(us) = provenance.effective_from_us {
         println!("  from    {}", TimeUs(us).to_rfc3339());
     }
+    println!("  {:<8} {}", "rules", rules_line(&rules(resolved)));
+    if let Some(document) = &resolved.document {
+        println!("  protects {}", document.protects.join(", "));
+        for (label, text) in quorum_lines(document.quorum.as_ref()) {
+            println!("  {label:<8} {text}");
+        }
+    }
     if let Some(us) = provenance.at_us {
         println!(
             "  judged  {} ({})",
@@ -816,6 +847,110 @@ fn print_report(resolved: &ResolvedPolicy, store: Option<&Opened>) {
     for warning in &provenance.warnings {
         println!("  warning {warning}");
     }
+}
+
+/// The numbers a reader branches on, in the order the ladder uses them.
+///
+/// One formatter, because `policy show`, `policy check` and `verify change` are three
+/// ways of asking about one policy and must not answer with three different sentences.
+pub(crate) fn rules_line(rules: &Value) -> String {
+    let tiers = rules["allowed_tiers"]
+        .as_array()
+        .map(|tiers| {
+            tiers
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .unwrap_or_default();
+    let trusted = rules["trust_key_ids"]
+        .as_array()
+        .map(|ids| ids.len().to_string())
+        .unwrap_or_default();
+    format!(
+        "trust {trusted} key(s) · tiers {tiers} · min {} · max age {}",
+        rules["min_signatures"].as_u64().unwrap_or(0),
+        rules["max_age_us"]
+            .as_i64()
+            .map(crate::verify::human_age)
+            .unwrap_or_default()
+    )
+}
+
+/// The `quorum` block of a published document, as the lines `policy show` prints.
+///
+/// "This repository demands a quorum" is not yet a fact a reader can act on: the fact is
+/// *five seats, four agreeing, from endorsers, on that image*, and the only place those
+/// numbers exist is the signed document (ADR-0004 D5). Printing the tier alone would ask
+/// the reader to take the numbers on trust, which is the thing a published policy was
+/// supposed to end.
+fn quorum_lines(quorum: Option<&policy::QuorumBlock>) -> Vec<(&'static str, String)> {
+    let Some(quorum) = quorum else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(default) = &quorum.default {
+        lines.push(("quorum", selection_line(default)));
+    }
+    for (glob, policy) in quorum.by_job.iter().flatten() {
+        lines.push((
+            "quorum",
+            format!("job `{glob}`: {}", selection_line(policy)),
+        ));
+    }
+    // Only what the owner actually signed: a line that prints this build's defaults is a
+    // line a reader can mistake for a rule somebody chose (and a policy that says "open,
+    // three attempts" is not the same claim as one that forgot to say anything).
+    let mut round = Vec::new();
+    if quorum.effective_reveal_mode() != "open" {
+        round.push("sealed rounds".to_string());
+    }
+    if let Some(attempts) = quorum.max_attempts {
+        round.push(format!("at most {attempts} attempt(s) per job"));
+    }
+    if !round.is_empty() {
+        lines.push(("round", round.join(" · ")));
+    }
+    if let Some(requirements) = &quorum.requirements {
+        let mut parts = vec![
+            requirements.arch.clone(),
+            format!("{} MiB ram", requirements.ram_mb),
+            format!("{} MiB disk", requirements.disk_mb),
+            format!("sandboxes {}", requirements.sandboxes.join(" + ")),
+            format!("sandbox rung >= {}", requirements.min_sandbox_level),
+        ];
+        if !requirements.image_digests.is_empty() {
+            parts.push(format!(
+                "image(s) {}",
+                requirements.image_digests.join(", ")
+            ));
+        }
+        lines.push(("requires", parts.join(" · ")));
+    }
+    lines
+}
+
+/// One `SelectionPolicy` on one line: the numbers, in the order they decide.
+fn selection_line(policy: &gitiup_quorum::select::SelectionPolicy) -> String {
+    let caps: Vec<String> = policy
+        .tier_caps
+        .iter()
+        .map(|(tier, seats)| format!("{tier} {seats}"))
+        .collect();
+    format!(
+        "{} of {} seats must agree · floor {} · per tier {} · {} reserves · {} seat(s) per identity",
+        policy.required_agree,
+        policy.n,
+        policy.tier_floor.as_str(),
+        if caps.is_empty() {
+            "none".to_string()
+        } else {
+            caps.join(", ")
+        },
+        policy.reserves,
+        policy.max_per_identity,
+    )
 }
 
 // ---------------------------------------------------------------------------
