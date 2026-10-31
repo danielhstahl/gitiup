@@ -74,6 +74,13 @@
 //!| 8 | digest mismatch: `--expect` did not match, or an attestation that is not the bytes it claims |
 //!| 9 | the attempt cap is exhausted (`quorum retry`): terminal, and asking again is what has run out — see `gitiup help` |
 
+// Bolted to the forge adapter, and bolted out with it: with `--no-default-features` the
+// forge half of `migrate` is compiled out (see `migrate.rs`), and the argument parsing,
+// the journal and the ref constants it exists to serve are then unreachable. That is a
+// complete build, not a broken one, so it must not be buried under a wall of dead-code
+// warnings (giti-17g).
+#![cfg_attr(not(feature = "hosts-github"), allow(dead_code))]
+
 use std::process::ExitCode;
 
 mod attest;

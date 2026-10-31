@@ -191,7 +191,7 @@ pub(crate) fn quarantine(args: &Args) -> Result<(), CliError> {
     let reaches: Vec<String> = roster
         .as_ref()
         .map(|roster| {
-            gitiup_quorum::proposer_family_exclusions(roster, &[target.clone()])
+            gitiup_quorum::proposer_family_exclusions(roster, std::slice::from_ref(&target))
                 .into_iter()
                 .filter(|name| roster.entries.iter().any(|entry| &entry.key_id == name))
                 .map(|entry| participant::short(&entry))
@@ -779,13 +779,8 @@ pub(crate) fn history(args: &Args) -> Result<(), CliError> {
                 println!("  no seat has been filled in what this store holds.");
             } else {
                 println!(
-                    "  {:<16} {:>7} {:>9} {:>9} {:>7}  {}",
-                    "KEY",
-                    "SEATED",
-                    "DIVERGED",
-                    "REFUSED",
-                    "SILENT",
-                    "WHAT A QUARANTINE COULD CITE"
+                    "  {:<16} {:>7} {:>9} {:>9} {:>7}  WHAT A QUARANTINE COULD CITE",
+                    "KEY", "SEATED", "DIVERGED", "REFUSED", "SILENT"
                 );
                 for sheet in &report.sheets {
                     println!(

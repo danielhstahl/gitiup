@@ -144,6 +144,27 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+Those are the shapes you type while working. The shapes a shipped binary passes
+through are the same ones with `--release`, plus the two feature builds the code
+makes promises about: `--no-default-features`, which must not link any forge code
+at all (that absence is the point of the `hosts-github` feature, and it is only
+auditable if the build actually compiles), and `--all-features`, which wires in
+the AWS transport and the forge adapter. A gate that compiles one way is a gate
+that is not real, so every one of them is built on push and on pull request, next
+to the release build, the test targets, and a release build on the declared MSRV
+(`rust-version = "1.88"`):
+
+```sh
+cargo build --release --locked                                # what ships
+cargo build --release --locked -p gitiup --no-default-features # no forge code, as a binary
+cargo +1.88 build --release --locked                          # the declared MSRV
+```
+
+All of that, with `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`,
+is what [`.github/workflows/build.yml`](.github/workflows/build.yml) runs; it exists because
+"does it still compile" was otherwise a question only whoever happened to type the command
+could answer.
+
 The `s3` host (a repo in a plain bucket) is always compiled; the AWS transport
 behind it is a feature, so a default build links no HTTP or AWS code:
 

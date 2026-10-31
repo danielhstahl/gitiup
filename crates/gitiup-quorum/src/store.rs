@@ -656,10 +656,9 @@ pub fn quarantine_exclusions(
         if record.verify(owner_trust).is_err() {
             applied.ignored.push((
                 record.clone(),
-                format!(
-                    "no signature on it is from a key this machine trusts as an owner \
-                     (--owner); it is public and it is not applied"
-                ),
+                "no signature on it is from a key this machine trusts as an owner \
+                 (--owner); it is public and it is not applied"
+                    .to_string(),
             ));
             continue;
         }

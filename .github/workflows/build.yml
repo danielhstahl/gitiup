@@ -1,0 +1,125 @@
+name: build
+
+# The one question this job answers is the oldest question about a repository: does it still
+# compile — in every shape somebody is actually going to ask it for?
+#
+# It exists because "cargo does not compile, at least not with cargo build release" arrived
+# as a bug report (giti-17g) with no job on the board able to reproduce it. `host-conformance`
+# compiles the crates its suite needs (`gitiup-host-tests`, `gitiup-host`, `gitiup-quorum`,
+# and the CLI through the policy tests), and everything else was compiled by whoever happened
+# to type the command: the `--release` build an operator runs before shipping a binary, the
+# `--no-default-features` build whose whole promise is that it contains no forge code, the
+# `--all-features` build with the S3 and forge adapters wired in. The breakage that report
+# led to — `migrate::objects` importing the feature-gated `migrate::mirror`, so
+# `cargo build -p gitiup --no-default-features` died on an unresolved import while every
+# workflow stayed green — is exactly the kind that cannot be found by reading the code.
+#
+# So this job types every one of those commands, in the order a person would:
+#
+# * `cargo build --release --locked` — the reporter's own command, and the one nothing else
+#   here covers: `lto = "thin"` + `codegen-units = 1` exercise a different code path in the
+#   backend than a dev build, and `--locked` says it is *this* dependency graph that ships.
+# * every test target, `--no-run`: a suite that does not compile is a suite that did not run.
+# * the feature matrix, both ways round — `--all-features` (the aws and forge adapters in)
+#   and `--no-default-features` (no forge code at all) — because a feature gate that only
+#   compiles one way is a gate that is not real, and `gitiup/tests/no_forge_calls.rs` says as
+#   much about the case it cannot itself compile.
+# * `cargo clippy … -- -D warnings` and `cargo fmt --check`, so "it compiles" is not the end
+#   of the sentence: a future-incompatibility warning is code that compiles today and does
+#   not compile next quarter, which is the same ticket with a delay.
+#
+# and one job on the declared MSRV, because `rust-version = "1.88"` is a promise and a promise
+# nobody checks is a comment.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same reason as the conformance job: big link lines, small runners.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Every build a person would type
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints, as errors
+        run: cargo clippy --locked --workspace --all-targets -j 3 -- -D warnings
+
+      # The reporter's own command, verbatim: `cargo build --release`.
+      - name: The release build
+        run: cargo build --locked --release -j 3
+
+      # Everything the suite builds, without running the suite: the doctests and every
+      # integration test compile here, so "cargo test" fails on a real result and not on a
+      # compile error at the end of a long run.
+      - name: Every test target compiles
+        run: cargo test --locked --workspace --no-run -j 3
+
+      # The gate matrix. Both halves are the point: `--all-features` is the build with the S3
+      # transport and the forge adapter wired in, `--no-default-features` is the build that
+      # must not be able to reach a forge at all, and giti-17g was a compile error in exactly
+      # one of the two.
+      - name: Feature matrix
+        run: |
+          cargo check --locked --workspace --all-features --all-targets -j 3
+          cargo check --locked --workspace --no-default-features --all-targets -j 3
+          cargo build --locked --release -p gitiup --no-default-features -j 3
+          cargo check --locked -p gitiup-host-tests --no-default-features --features github,s3 --all-targets -j 3
+          cargo check --locked -p gitiup-host-github --no-default-features --all-targets -j 3
+
+  msrv:
+    name: The declared MSRV still builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-version` in the workspace `Cargo.toml`, spelled out here so that bumping one
+      # without the other is a visible mistake rather than a slow drift.
+      - name: Install rust 1.88
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: build-msrv-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Release build on 1.88
+        run: cargo build --locked --release -j 3
