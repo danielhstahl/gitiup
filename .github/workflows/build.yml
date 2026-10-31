@@ -50,6 +50,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  run_docker_build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup buildx docker
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      - name: build docker
+        run: |
+          docker build -t test -f docker/Dockerfile .
+
   build:
     name: Every build a person would type
     runs-on: ubuntu-latest
