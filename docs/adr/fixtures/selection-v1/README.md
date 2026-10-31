@@ -1,7 +1,7 @@
 # ADR-0002 selection vectors (`gitiup-round-1`)
 
 These are the golden vectors for verifier selection, the equivalent of
-`crates/gitiup-attest/tests/fixtures/v1/` for [ADR-0002](../0002-roster-verifier-selection-and-sybil-resistance.md).
+`crates/gitiup-attest/tests/fixtures/v1/` for [ADR-0002](../../0002-roster-verifier-selection-and-sybil-resistance.md).
 `gitiup select` (`giti-msi.3`) must reproduce `selection.json` from `roster.json` +
 `round.json` exactly; if it cannot, one of the two is wrong and the ADR says which.
 

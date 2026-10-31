@@ -276,6 +276,14 @@ impl Scene {
         self.harness.store()
     }
 
+    /// The roster the store serves at its head ref — what a reader actually resolves, as
+    /// opposed to the document the scene signed and published.
+    fn stored_roster(&self) -> Roster {
+        store::current_roster(&self.host())
+            .expect("the roster reads back")
+            .expect("there is a roster")
+    }
+
     /// The key that disagreed with the consensus, and the key that said nothing.
     fn diverging(&self) -> String {
         let verdict = self.verdict_record();
@@ -499,6 +507,12 @@ fn a_divergence_is_quarantined_from_the_evidence_and_the_roster_does_not_move() 
         before,
         "not one roster ref moved: quarantine is an exclusion input, never a roster edit"
     );
+    let served = scene.stored_roster();
+    assert_eq!(
+        (served.epoch, served.entries.len()),
+        (scene.roster.epoch, scene.roster.entries.len()),
+        "the roster a reader resolves after the quarantine is the one the owner signed: same epoch, same seats, and nothing added under a different name"
+    );
 
     // And the exclusion changes who is selected, through the round's own inputs.
     let selected = json(expect_ok(
@@ -514,6 +528,15 @@ fn a_divergence_is_quarantined_from_the_evidence_and_the_roster_does_not_move() 
     assert!(
         !seated.contains(&diverging.as_str()),
         "the quarantined key holds no seat: {seated:?}"
+    );
+    assert!(
+        scene.seats.contains(&diverging),
+        "the excluded key was one of this round's own seats: {diverging} not in {:?}",
+        scene.seats
+    );
+    assert!(
+        seated.iter().all(|seat| scene.roster.entry(seat).is_some()),
+        "a derived round seats nobody the owner did not sign for: {seated:?}"
     );
     assert!(
         selected["inputs"]["exclusions"]

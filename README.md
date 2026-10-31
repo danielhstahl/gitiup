@@ -12,6 +12,11 @@ Two goals, one tool:
 
 `gitiup` is pronounced like spurring on a horse.
 
+**New here?** [The quickstart](docs/quickstart.md) is the tool in fifteen minutes — plan a
+job, run it for real, sign the proof, file it, and merge a change into a repository that
+has no forge — and every command line on that page is executed by
+[`quickstart_doc_cli.rs`](crates/gitiup/tests/quickstart_doc_cli.rs).
+
 ## Workspace
 
 | crate           | what it is                                                       |
@@ -26,9 +31,15 @@ Two goals, one tool:
 | `gitiup-normalise` | output normalisation: the profile that turns the machine-specific parts of a log into placeholders so independent reruns converge on one digest, and the record of what it rewrote |
 | `gitiup-sandbox`  | the isolation ladder: container runtimes, bubblewrap, Landlock + seccomp in the child, `unshare(1)`, and an opt-in rung that admits it isolates nothing — each one probed rather than assumed, each refused rather than worked around, plus the default-deny egress proxy and the escape suite that proves the claim |
 | `gitiup-quorum` | the optional quorum network: the roster, deterministic and auditable verifier selection, round records, the advertisement and the TTL lease that let a stranger find a seat and lean on it, per-seat attestation storage — open, or committed-then-revealed when the policy seals the round — the verdict (`verified` / `failed` / `insufficient`), the `tier: quorum` attestation only a verified verdict can produce, the bounded escalation and its attempt cap, plus the published policy a gate applies — its format, its trust and coherence checks, the resolution ladder and the provenance every answer carries: ADR-0002 and ADR-0004 as code, and nothing else |
+| `gitiup-site` | the docs site builder: every `*.md` under `docs/` in, a directory of static HTML out — the GitHub-shaped heading anchors the docs' own cross-links are written against, the link rewriting from the source tree to the built tree (and into the repository for what is not a page), the reading order, the section search index, and the `check` half that refuses a dead anchor before it ships; no server, no JavaScript build step, no network at build time |
 
 The workspace globs `crates/*`, so a new crate is just `members`-free.
 
+* [Quickstart](docs/quickstart.md) — the tool in fifteen minutes, in the order a newcomer
+  should meet it: a simulated plan, a real run in a sandbox, a signed proof in a store, a
+  policy, a change merged into a repository with no forge, and a push refused for having
+  no proof. Every command line there is executed
+  ([`quickstart_doc_cli.rs`](crates/gitiup/tests/quickstart_doc_cli.rs)).
 * [ADR-0001 — attestation encoding, hash and signature format](docs/adr/0001-attestation-encoding-hash-and-signature.md) —
   the format every attestation ticket codes against (canonical JSON, SHA-256, Ed25519
   over DSSE PAE, `result`/`claims` split, freshness as policy).
@@ -120,6 +131,9 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
 * [Host abstraction design notes](docs/host-abstraction.md) — the contracts every
   host owes, including the ref namespaces, store layout, pack format and error
   taxonomy.
+* [The docs site](docs/site.md) — how these pages are built (`gitiup-site build`), how
+  they are published, the anchor and link rules they are written against, and the
+  `check` that refuses a dead link in CI.
 * [`gitiup-host` README](crates/gitiup-host/README.md) — the API surface.
 * [`gitiup-host-github` README](crates/gitiup-host-github/README.md) — the forge
   adapter: what a pull request and a check run become, what a forge admits it cannot
@@ -133,6 +147,8 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
 * [`gitiup-keys` README](crates/gitiup-keys/README.md) — the keystore, the agent
   backends and the identity claim: what is on disk, what is never written, and which
   backend produced which signature.
+* [`gitiup-site` README](crates/gitiup-site/README.md) — why the site builder is a
+  crate with a dependency of its own, and what it promises about reproducibility.
 * [ADR index](docs/adr/README.md) — where the decisions that several tickets depend on
   are kept.
 
@@ -144,12 +160,38 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+Those are the shapes you type while working. The shapes a shipped binary passes
+through are the same ones with `--release`, plus the two feature builds the code
+makes promises about: `--no-default-features`, which must not link any forge code
+at all (that absence is the point of the `hosts-github` feature, and it is only
+auditable if the build actually compiles), and `--all-features`, which wires in
+the AWS transport and the forge adapter. A gate that compiles one way is a gate
+that is not real, so every one of them is built on push and on pull request, next
+to the release build, the test targets, and a release build on the declared MSRV
+(`rust-version = "1.88"`):
+
+```sh
+cargo build --release --locked                                # what ships
+cargo build --release --locked -p gitiup --no-default-features # no forge code, as a binary
+cargo +1.88 build --release --locked                          # the declared MSRV
+```
+
+All of that, with `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`,
+is what [`.github/workflows/build.yml`](.github/workflows/build.yml) runs; it exists because
+"does it still compile" was otherwise a question only whoever happened to type the command
+could answer.
+
 The `s3` host (a repo in a plain bucket) is always compiled; the AWS transport
 behind it is a feature, so a default build links no HTTP or AWS code:
 
 ```sh
 cargo build -p gitiup-host --features s3
 ```
+
+These docs are a workspace member too, and build like one: `cargo run -p gitiup-site --
+build --out _site` writes the site the same pages are published as, and
+`cargo run -p gitiup-site -- check` says whether every link in them lands
+([the docs site](docs/site.md)).
 
 Try it out without any infrastructure:
 

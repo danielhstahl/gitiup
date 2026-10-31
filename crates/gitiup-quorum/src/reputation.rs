@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn divergence_is_a_ground_and_silence_is_not() {
         let verdict = verdict_with(1);
-        let report = Report::from_verdicts(&[verdict.clone()], None);
+        let report = Report::from_verdicts(std::slice::from_ref(&verdict), None);
         assert!(
             report
                 .sheets

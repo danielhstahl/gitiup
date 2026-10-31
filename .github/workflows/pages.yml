@@ -1,0 +1,118 @@
+name: pages
+
+# The docs are the contract, and this is the job that publishes them.
+#
+# Two questions, in two steps, from one build of `gitiup-site`:
+#
+# * **does every link in `docs/` still land?** (`check`) — the half that belongs in
+#   CI on a pull request. The docs cross-reference each other by heading anchor, and
+#   an anchor whose heading has been reworded is invisible until a reader follows it
+#   and lands on nothing. That drift is exactly what a reviewer will not catch by
+#   reading a diff, and it is already in this repository's history: `federation.md`
+#   pointed at a `D5` heading that lives in ADR-0005, and a fixture README's links to
+#   the ADRs they document were one directory short. `check` found both on its first
+#   run, and this job is where they would have been caught.
+# * **does the published site match the checkout?** (`build` + Pages) — only on the
+#   default branch. The builder is offline and deterministic, so what is published is
+#   a function of the tree: two runs on one commit are byte-identical
+#   (`tests/build_site.rs` asserts it), which is what makes "deploy the artifact of
+#   the build we just ran" an honest statement.
+#
+# The deploy is `actions/upload-pages-artifact` plus `actions/deploy-pages` rather
+# than a push to a `gh-pages` branch: the site is a build product, and a branch of
+# build products is a branch that gets merged by accident. Everything the artifact
+# contains came from this checkout — no Jekyll, no npm, no theme download.
+#
+# `pull_request` runs the build and the check and uploads nothing: a fork's CI can
+# always say whether the docs are sound, and a fork cannot deploy anywhere.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # `pages: write` and `id-token: write` are what `deploy-pages` needs to mint the
+  # OIDC token that proves this run is the one allowed to publish.
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  # A deployment is not a build: cancelling a half-finished publish is how a site ends
+  # up serving a mixture of two commits.
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  site:
+    name: The docs build, and every link in them lands
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pages-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # The crate's own suite: the markdown rules, the navigation list against the
+      # files in `docs/`, and the reproducibility of one build against another.
+      - name: Test the site builder
+        run: cargo test --locked -p gitiup-site -j 3
+
+      # Link integrity first: it is the failure worth having at the top of the log,
+      # and it costs a second render of the docs, not a second compile.
+      - name: Check the docs
+        run: cargo run --locked --release -j 3 -p gitiup-site -- check
+
+      # A project site is served from /<repo>/ on Pages, which is the only reason
+      # `--base-path` exists (404.html, the one page that cannot know its depth). The
+      # other pages use relative hrefs and do not care where they are mounted.
+      - name: Build the site
+        run: |
+          cargo build --locked --release -p gitiup-site -j 3
+          ./target/release/gitiup-site build --out _site \
+            --base-path "/${{ github.event.repository.name }}/" \
+            --source-ref "${{ github.event.repository.default_branch }}" \
+            --site-url "${{ github.server_url }}/${{ github.repository }}"
+
+      - name: What was published
+        run: |
+          find _site -type f | sort
+          du -sh _site
+
+      - name: Upload the Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

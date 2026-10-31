@@ -1,9 +1,9 @@
 # ADR-0003 change vectors (`gitiup-change-1`)
 
-The golden vectors for [ADR-0003](../0003-change-record-format-and-merge-semantics.md):
+The golden vectors for [ADR-0003](../../0003-change-record-format-and-merge-semantics.md):
 the equivalent, for changes, of `crates/gitiup-attest/tests/fixtures/v1/` for
-[ADR-0001](../0001-attestation-encoding-hash-and-signature.md) and of
-[`selection-v1/`](../selection-v1/) for [ADR-0002](../0002-roster-verifier-selection-and-sybil-resistance.md).
+[ADR-0001](../../0001-attestation-encoding-hash-and-signature.md) and of
+[`selection-v1/`](../selection-v1/) for [ADR-0002](../../0002-roster-verifier-selection-and-sybil-resistance.md).
 A Rust `ChangeRecord` that cannot reproduce these files is wrong, however reasonable
 it looks: four tickets (`giti-b2z.2`, `.3`, `.4`, `giti-91m.4`) otherwise invent four
 formats that all claim to be "the change record".
@@ -91,4 +91,4 @@ Edit `generate.py` and the ADR in the same commit (the field table, the derivati
 the limits and the ref names are all quoted there), run `python3 generate.py`, and
 commit the six records with it. A domain string or a payload type is not editable
 in place: that is a new record type, with a new fixture directory, per
-[ADR-0003 D11](../0003-change-record-format-and-merge-semantics.md).
+[ADR-0003 D11](../../0003-change-record-format-and-merge-semantics.md).

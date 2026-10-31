@@ -73,7 +73,8 @@ OPTIONS:
                             `local` only)
         --json              print the canonical attestation manifest, not the plan
     -o, --out <path>        write the attestation manifest here (default: write
-                            nothing at all)
+                            nothing at all). `gitiup attest push <file> --sign` files it:
+                            the manifest is the attestation before anybody has signed it
         --force             let --out overwrite an existing file
     -h, --help              this text
 

@@ -20,7 +20,9 @@
 //! honest. A store that could reformat a record on the way in would be a store that
 //! destroys signatures, so every read here goes through
 //! [`AttestationDoc::from_canonical_bytes`] and refuses anything that is merely
-//! valid JSON.
+//! valid JSON. The one input that is not already a document is the unsigned manifest
+//! `gitiup run --out` writes, which is wrapped before it is signed — see
+//! [`document_from_bytes`].
 //!
 //! # What is checked here, and what is not
 //!
@@ -119,7 +121,10 @@ WHERE IT GOES (every command):
                              somewhere else
 
 push — file one attestation:
-    DOC                      an attestation document in canonical form, or - for stdin
+    DOC                      an attestation document in canonical form, or - for stdin.
+                             The unsigned manifest `gitiup run --out` wrote is accepted
+                             too: it is the same attestation one step earlier, and
+                             --sign is what turns it into a document
     --run-report <path|->    build the manifest from a run report (docs/run-report.md)
                              instead of handing over a document
     --sign                   sign it with this machine's key first; required when the
@@ -302,6 +307,31 @@ fn manifest_subject(doc: &AttestationDoc) -> Result<Oid, CliError> {
 // push
 // ---------------------------------------------------------------------------
 
+/// The two shapes `push` accepts, and why both are the same object at two moments.
+///
+/// A signed *document* (`{schema_version, payload_type, manifest, signatures}`) is what
+/// a store holds and what `verify` reads. A bare *manifest* — the file `gitiup run
+/// --out` writes, before anybody has signed it — is the same attestation one step
+/// earlier: signing it is the next thing anyone does with it, and `push --sign` is
+/// exactly the command that does it. Accepting only the first shape meant the obvious
+/// two commands in a row (`run --out`, then `push --sign`) did not compose, so a runner
+/// could produce a proof its own tool would not file.
+///
+/// Wrapping is only ever a step towards a signature: a bare manifest that arrives
+/// without `--sign` still falls into the "an unsigned attestation is a rumour" refusal
+/// below, and bytes that are neither shape are refused with the *document* error — the
+/// more useful of the two messages, and its own exit code, because a malformed document
+/// and a malformed manifest are one event to a caller.
+fn document_from_bytes(bytes: &[u8]) -> Result<AttestationDoc, gitiup_attest::Error> {
+    match AttestationDoc::from_canonical_bytes(bytes) {
+        Ok(doc) => Ok(doc),
+        Err(document_error) => match RunManifest::from_canonical_bytes(bytes) {
+            Ok(manifest) => Ok(AttestationDoc::new(manifest)),
+            Err(_) => Err(document_error),
+        },
+    }
+}
+
 fn push(args: &Args) -> Result<(), CliError> {
     if let Some(()) = args.help(ATTEST_HELP) {
         return Ok(());
@@ -325,7 +355,7 @@ fn push(args: &Args) -> Result<(), CliError> {
                 }
             };
             let bytes = participant::read_maybe_stdin(&path)?;
-            AttestationDoc::from_canonical_bytes(&bytes)?
+            document_from_bytes(&bytes)?
         }
     };
 

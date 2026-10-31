@@ -1,0 +1,576 @@
+/*
+  gitiup docs — one stylesheet, no framework, no build step.
+
+  Written for one job: make 100 KB of dense technical prose readable on a laptop,
+  readable on a phone, and printable, without a line of CSS nobody can explain.
+  Three layout regions (sidebar, article, "on this page"), one measure that never
+  runs past ~85 characters, and a palette that is two greys and one blue in light
+  and dark.
+
+  The rules that are not obvious and should not be rediscovered:
+
+  * `.layout` is a grid, not flexbox, so the two side columns can be dropped to
+    `order` values on narrow screens without moving markup: the article comes
+    first on a phone and the sidebar last, which is the order a reader on a phone
+    actually wants.
+  * `.table-wrap` scrolls sideways and nothing else. ADR tables have nine columns;
+    the alternative is nine columns of wrapped text, which nobody reads.
+  * `pre.code[data-lang]::before` prints the fence language from the attribute, so
+    the "console" and "sh" labels cost no markup and no JavaScript.
+  * Only `.anchor` and the details/summary chrome are interactive, and both work
+    without scripting.
+*/
+
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f6f7f9;
+  --code-bg: #f3f4f6;
+  --border: #d7dbe0;
+  --text: #1c2024;
+  --text-soft: #5c6672;
+  --link: #2458b3;
+  --link-visited: #6b4ba0;
+  --accent: #2458b3;
+  --mark: #fff3b0;
+  --max-article: 52rem;
+  --sidebar: 15rem;
+  --toc: 13rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a;
+    --bg-soft: #1b1f24;
+    --code-bg: #1f242a;
+    --border: #333a42;
+    --text: #dfe3e8;
+    --text-soft: #98a3b0;
+    --link: #7ab0ff;
+    --link-visited: #c39bff;
+    --accent: #7ab0ff;
+    --mark: #5c4a00;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    "Noto Sans", Arial, sans-serif;
+}
+
+code,
+pre,
+kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.9em;
+}
+
+a {
+  color: var(--link);
+}
+
+a:visited {
+  color: var(--link-visited);
+}
+
+a.external::after {
+  content: " \2197";
+  color: var(--text-soft);
+  font-size: 0.8em;
+}
+
+/* --------------------------------------------------------------- top bar -- */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.topbar .brand {
+  font-weight: 700;
+  font-size: 1.15rem;
+  text-decoration: none;
+  letter-spacing: 0.02em;
+}
+
+.topbar .tagline {
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  flex: 1 1 18rem;
+}
+
+.search {
+  display: flex;
+  gap: 0.35rem;
+  margin-left: auto;
+}
+
+.search input[type="search"] {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  min-width: 12rem;
+}
+
+.search button {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.search-page {
+  margin: 1rem 0;
+}
+
+.search-page input[type="search"] {
+  flex: 1 1 auto;
+  min-width: 14rem;
+  font-size: 1rem;
+}
+
+/* ---------------------------------------------------------------- layout -- */
+
+.layout {
+  display: grid;
+  grid-template-columns: var(--sidebar) minmax(0, 1fr) var(--toc);
+  gap: 0 2rem;
+  align-items: start;
+  max-width: 84rem;
+  margin: 0 auto;
+  padding: 0 1rem;
+}
+
+main {
+  min-width: 0;
+  order: 2;
+}
+
+/* ---------------------------------------------------------------- article -- */
+
+.page {
+  max-width: var(--max-article);
+  padding: 1.5rem 0 3rem;
+  min-width: 0;
+}
+
+.page > *:first-child {
+  margin-top: 0;
+}
+
+.page h1,
+.page h2,
+.page h3,
+.page h4 {
+  line-height: 1.25;
+  margin: 2rem 0 0.6rem;
+  scroll-margin-top: 4rem;
+}
+
+.page h1 {
+  font-size: 1.85rem;
+}
+
+.page h2 {
+  font-size: 1.35rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.2rem;
+}
+
+.page h3 {
+  font-size: 1.1rem;
+}
+
+.page h4 {
+  font-size: 1rem;
+  color: var(--text-soft);
+}
+
+.anchor {
+  margin-left: 0.4rem;
+  text-decoration: none;
+  color: var(--text-soft);
+  font-weight: 400;
+  opacity: 0.55;
+}
+
+.anchor:hover {
+  opacity: 1;
+}
+
+.page ul,
+.page ol {
+  padding-left: 1.4rem;
+}
+
+.page li {
+  margin: 0.3rem 0;
+}
+
+.page li > p {
+  margin: 0.35rem 0;
+}
+
+.page hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2rem 0;
+}
+
+.page blockquote {
+  margin: 1rem 0;
+  padding: 0.2rem 1rem;
+  border-left: 3px solid var(--border);
+  color: var(--text-soft);
+}
+
+.page blockquote.alert {
+  border-left-color: var(--accent);
+  color: var(--text);
+  background: var(--bg-soft);
+}
+
+/* Code inside prose is a name: a ref, a flag, a digest. It should not look like
+   a block, and it must not break a long `refs/gitiup/...` across a line. */
+.page code {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.05em 0.3em;
+  overflow-wrap: anywhere;
+}
+
+pre.code {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.8rem 0.9rem;
+  overflow-x: auto;
+  position: relative;
+  margin: 1rem 0;
+}
+
+pre.code code {
+  background: none;
+  border: 0;
+  padding: 0;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+pre.code[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-soft);
+  border-left: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.page table {
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.page th,
+.page td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.page thead th {
+  background: var(--bg-soft);
+}
+
+.page img {
+  max-width: 100%;
+}
+
+.figure {
+  display: inline-block;
+}
+
+.caption {
+  display: block;
+  color: var(--text-soft);
+  font-size: 0.85rem;
+}
+
+.footnote-ref a {
+  text-decoration: none;
+}
+
+.footnote {
+  border-top: 1px solid var(--border);
+  margin-top: 1.5rem;
+  padding-top: 0.5rem;
+  color: var(--text-soft);
+  font-size: 0.92rem;
+}
+
+.index-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.index-list li {
+  border-bottom: 1px solid var(--border);
+  padding: 0.45rem 0;
+}
+
+.results {
+  list-style: none;
+  padding-left: 0;
+}
+
+.results li {
+  border-bottom: 1px solid var(--border);
+  padding: 0.5rem 0;
+}
+
+.results .where {
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  display: block;
+}
+
+.results .snippet {
+  display: block;
+  color: var(--text-soft);
+  font-size: 0.9rem;
+}
+
+.search-status {
+  color: var(--text-soft);
+}
+
+/* ---------------------------------------------------------------- sidebar -- */
+
+.sidebar {
+  order: 1;
+  position: sticky;
+  top: 4rem;
+  max-height: calc(100vh - 5rem);
+  overflow-y: auto;
+  padding: 1.5rem 0 3rem;
+  font-size: 0.9rem;
+}
+
+.nav-title {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+  margin: 1.4rem 0 0.4rem;
+  border: 0;
+  padding: 0;
+}
+
+.sidebar ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.sidebar li a {
+  display: block;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  text-decoration: none;
+  color: var(--text);
+}
+
+.sidebar li a:hover {
+  background: var(--bg-soft);
+  text-decoration: underline;
+}
+
+.sidebar li a.current {
+  background: var(--bg-soft);
+  border-left: 2px solid var(--accent);
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------------- toc -- */
+
+.toc {
+  order: 3;
+  position: sticky;
+  top: 4rem;
+  max-height: calc(100vh - 5rem);
+  overflow-y: auto;
+  padding: 1.5rem 0 3rem;
+  font-size: 0.82rem;
+}
+
+.toc-title {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+  border: 0;
+  padding: 0;
+  margin: 0 0 0.4rem;
+}
+
+.toc ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.toc li a {
+  display: block;
+  padding: 0.12rem 0;
+  text-decoration: none;
+  color: var(--text-soft);
+}
+
+.toc li a:hover {
+  color: var(--link);
+}
+
+.toc li.toc-3 {
+  padding-left: 0.8rem;
+}
+
+/* ------------------------------------------------------------------ pager -- */
+
+.pager {
+  max-width: var(--max-article);
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.pager-links {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.pager-next {
+  margin-left: auto;
+  text-align: right;
+}
+
+.source-link {
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.site-footer {
+  border-top: 1px solid var(--border);
+  margin: 0 1rem;
+  padding: 1.5rem 0 3rem;
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  max-width: 84rem;
+  margin-inline: auto;
+}
+
+.site-footer p {
+  margin: 0.2rem 0;
+}
+
+/* ------------------------------------------------------------------ small -- */
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  }
+
+  .toc {
+    display: none;
+  }
+}
+
+@media (max-width: 780px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: static;
+    order: 3;
+    max-height: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .topbar .tagline {
+    display: none;
+  }
+
+  .search {
+    margin-left: 0;
+  }
+
+  .page {
+    padding-top: 1rem;
+  }
+
+  .page table {
+    font-size: 0.86rem;
+  }
+}
+
+@media print {
+  .topbar,
+  .sidebar,
+  .toc,
+  .pager,
+  .site-footer {
+    display: none;
+  }
+
+  .layout {
+    display: block;
+  }
+
+  .page {
+    max-width: none;
+  }
+
+  a {
+    color: inherit;
+  }
+}

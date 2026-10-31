@@ -4,3 +4,6 @@ prompt.txt
 .fathom/
 __pycache__/
 *.pyc
+
+# The docs site: a build product (`gitiup-site build`).
+/_site/

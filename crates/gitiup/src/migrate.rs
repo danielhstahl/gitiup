@@ -42,12 +42,20 @@
 //! rather know.
 
 pub mod journal;
-pub mod objects;
 
+// The whole verb is "leave a forge", so every part of it is bolted to the forge adapter:
+// `changes` reads the pull database, `mirror` fetches the history the forge will not hand
+// over an API for, and `objects` moves and re-hashes what that mirror took — and it imports
+// `super::mirror` to do it. With `--no-default-features` there is no forge to leave and
+// `repo` refuses, so none of this is reachable; leaving `objects` unbolted had it importing
+// a `mirror` that was never compiled, which is a compile error in a build that is otherwise
+// perfectly good (giti-17g).
 #[cfg(feature = "hosts-github")]
 mod changes;
 #[cfg(feature = "hosts-github")]
 mod mirror;
+#[cfg(feature = "hosts-github")]
+pub mod objects;
 
 use std::path::PathBuf;
 

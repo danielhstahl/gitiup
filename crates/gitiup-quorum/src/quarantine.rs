@@ -1104,7 +1104,7 @@ impl Ledger {
                 .then(b.digest.hex().cmp(&a.digest.hex()))
         });
         let mut lifts = lifts;
-        lifts.sort_by(|a, b| b.lifted_at_us.cmp(&a.lifted_at_us));
+        lifts.sort_by_key(|lift| std::cmp::Reverse(lift.lifted_at_us));
         Ok(Ledger {
             quarantines: filed,
             lifts,

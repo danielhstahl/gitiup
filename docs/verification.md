@@ -38,8 +38,8 @@ on the command line. Both are gate-eligible, and only one of them is what a repo
 
 These are [ADR-0001 D7](adr/0001-attestation-encoding-hash-and-signature.md)'s
 taxonomy and no other. They are computed by
-[`ErrorKind::exit_code`](../crates/gitiup-attest/src/error.rs) in the format crate,
-not by the CLI, so a merge gate calling
+[`ErrorKind::exit_code`](../crates/gitiup-canon/src/error.rs) — the error taxonomy
+`gitiup-attest` re-exports — and not by the CLI, so a merge gate calling
 [`AttestationDoc::verify`](../crates/gitiup-attest/src/envelope.rs) and a human
 running the command get the same number from the same bytes. That is the whole reason
 the taxonomy lives in the library.
@@ -110,7 +110,7 @@ A `tier: quorum` attestation is not a run's proof. It is a signed statement abou
 round: the round it names, the roster epoch and digest it was tallied under, the
 `ResultDigest` the seats agreed on, and the seats that agreed
 ([`gitiup_quorum::attestation`](../crates/gitiup-quorum/src/attestation.rs),
-[giti-zp1.5](quorum.md#attesting-it-gitiup-quorum-verdict--attest)). It is produced by
+[giti-zp1.5](quorum.md#attesting-it-gitiup-quorum-verdict---attest)). It is produced by
 `gitiup quorum verdict --attest` and by nothing else — `QuorumAttestation::from_verdict`
 is the only constructor and it refuses a verdict that is not `verified`.
 
@@ -535,7 +535,7 @@ push over is not a gate.
 |-------|------|
 | the ladder, in order, and every reason | [`AttestationDoc::verify_report`](../crates/gitiup-attest/src/envelope.rs) |
 | `Check` / `Reason` / `VerdictReport`, and `CHECK_ORDER` | [`report`](../crates/gitiup-attest/src/report.rs) |
-| the exit code for a class of failure | [`ErrorKind::exit_code`](../crates/gitiup-attest/src/error.rs) |
+| the exit code for a class of failure | [`ErrorKind::exit_code`](../crates/gitiup-canon/src/error.rs) |
 | what a policy may demand | [`policy`](../crates/gitiup-attest/src/policy.rs) |
 | the published policy: its format, its validator, the resolution ladder, the chain walk | [`gitiup-quorum/src/policy.rs`](../crates/gitiup-quorum/src/policy.rs), and [docs/policy.md](policy.md) |
 | publish / show, the provenance block, and the refusal of a policy nobody signed | [`gitiup/src/policy.rs`](../crates/gitiup/src/policy.rs) |
