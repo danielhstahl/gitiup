@@ -62,7 +62,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
       - name: build docker
         run: |
-          docker build --platform linux/amd64,linux/arm64 -t test -f docker/Dockerfile .
+          docker buildx build --platform linux/amd64,linux/arm64 -t test -f docker/Dockerfile .
 
   build:
     name: Every build a person would type
