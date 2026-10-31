@@ -53,7 +53,7 @@ jobs:
         # been resolved once (`docker images --digests minio/minio`) and bump it
         # deliberately, with a note. Left moving until then, because a pin that was
         # never verified against a registry is a guess with a date on it.
-        image: minio/minio:latest
+        image: pgsty/minio:latest
         ports:
           - 9000:9000
         env:
