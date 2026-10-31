@@ -636,7 +636,7 @@ fn set_limit(resource: libc::c_uint, soft: u64, hard: u64) -> io::Result<()> {
         rlim_cur: soft as libc::rlim_t,
         rlim_max: hard as libc::rlim_t,
     };
-    if unsafe { libc::setrlimit(resource, &limit) } == 0 {
+    if unsafe { libc::setrlimit(resource as _, &limit) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
