@@ -55,13 +55,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
       - name: setup buildx docker
         uses: docker/setup-buildx-action@v3
         with:
           platforms: linux/amd64,linux/arm64
       - name: build docker
         run: |
-          docker build -t test -f docker/Dockerfile .
+          docker buildx build --platform linux/amd64,linux/arm64 -t test -f docker/Dockerfile .
 
   build:
     name: Every build a person would type
