@@ -1,11 +1,11 @@
 # ADR-0004 policy vectors (`gitiup-policy-1`)
 
-The golden vectors for [ADR-0004](../0004-published-policy-format-signing-and-resolution.md):
+The golden vectors for [ADR-0004](../../0004-published-policy-format-signing-and-resolution.md):
 the equivalent, for a published repository policy, of
 [`change-v1/`](../change-v1/) for
-[ADR-0003](../0003-change-record-format-and-merge-semantics.md) and of
+[ADR-0003](../../0003-change-record-format-and-merge-semantics.md) and of
 [`selection-v1/`](../selection-v1/) for
-[ADR-0002](../0002-roster-verifier-selection-and-sybil-resistance.md). A Rust
+[ADR-0002](../../0002-roster-verifier-selection-and-sybil-resistance.md). A Rust
 `PolicyDocument` that cannot reproduce these files is wrong, however reasonable it
 looks — four tickets (`giti-91m.2`, `.3`, `.4`, `.5`) and one quorum ticket
 (`giti-zp1.2`) otherwise invent four "published policies" that all claim to be the

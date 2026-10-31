@@ -490,7 +490,7 @@ something was skipped.
 
 ## What is not here yet
 
-* **tightening a provenance demand locally** — [D5](#d5-authority-availability-and-how-a-stale-copy-is-marked)
+* **tightening a provenance demand locally** — [D5](adr/0005-what-a-mirror-may-carry-and-what-a-copy-is-worth.md#d5--authority-availability-and-how-a-stale-copy-is-marked)
   allows an operator to demand *more* than the signed policy does (and never less), and
   there is no such knob yet: the demand comes from the signed document and nowhere else.
 * **a bucket that serves anonymous reads through this build's S3 transport** — the

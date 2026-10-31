@@ -1,0 +1,39 @@
+[package]
+name = "gitiup-site"
+description = "The docs site builder: markdown in docs/, a static HTML site out — no server, no JavaScript build step, no network at build time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This is the only crate in the workspace that reaches outside it at build time for
+# a dependency, and it earns it: `pulldown-cmark` is the markdown parser, which is
+# a specification (CommonMark, plus the GFM tables the docs are full of) rather
+# than a decision this project should be re-deriving. The alternatives were to
+# hand-write a parser — a few hundred lines of scanner with the same test surface
+# `gitiup-normalise` has, for a renderer nobody gates a merge on — or to depend on
+# a full site generator, which would mean trusting a JavaScript toolchain to
+# reproduce the docs that the Rust suite already executes.
+#
+# What it is *not* is a trust boundary. Nothing here feeds a digest, a signature or
+# a merge decision: the worst a wrong render can do is print a page badly, which is
+# why the dependency is allowed to live in this crate and nowhere else. The CLI, the
+# host crates and the format crate keep their empty or near-empty dependency lists
+# (`gitiup/tests/cli_hygiene.rs`, `gitiup-attest/tests/dependency_hygiene.rs`); a
+# static site builder does not get to make that promise for anyone else.
+#
+# It has no HTTP client and no git binding on purpose: the input is a checkout and
+# the output is a directory, so `build` runs with no network and the site can be
+# published from a laptop as readily as from Actions.
+
+[dependencies]
+pulldown-cmark = "0.13"
+
+[dev-dependencies]
+# The same reason every other crate in the workspace takes it: a test that builds a
+# site must not write in the repository it lives in.
+tempfile = "3"
+
+[lints]
+workspace = true
