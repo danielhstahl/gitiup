@@ -137,6 +137,18 @@ fn fixture_path(name: &str) -> String {
         .to_string()
 }
 
+/// The *manifest* beside that report: the same attestation before anybody signed it, in
+/// exactly the shape `gitiup run --out` writes.
+fn manifest_path(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../gitiup-attest/tests/fixtures/runs")
+        .join(name)
+        .join("manifest.json")
+        .to_str()
+        .expect("fixture path")
+        .to_string()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -377,6 +389,89 @@ fn an_unsigned_attestation_is_refused() {
         None,
     );
     assert_eq!(json(&listed)["count"], 0);
+}
+
+/// The file `gitiup run --out` writes is the manifest — the same attestation one step
+/// before anybody signed it — and `attest push --sign` is that next step. These are the
+/// first two commands a newcomer types after a real run, and they did not compose until
+/// `push` learned the shape `run` produces (giti-vfv: no quickstart could be written
+/// without it). Wrapping is only a step towards a signature: the same bare manifest
+/// without `--sign` is still refused as the rumour it is.
+#[test]
+fn the_manifest_a_run_wrote_is_what_push_signs_and_files() {
+    let harness = Harness::new();
+    harness.key("ada");
+    let manifest = manifest_path("hello");
+
+    let filed = harness.run(
+        &[
+            "attest",
+            "push",
+            &manifest,
+            "--sign",
+            "--store",
+            &harness.store(),
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code(&filed), 0, "{}{}", stdout(&filed), stderr(&filed));
+    let filed = json(&filed);
+    assert_eq!(
+        filed["tier"], "simulated",
+        "the hello fixture ran in nothing"
+    );
+    assert_eq!(
+        filed["signers"].as_array().expect("a signer list").len(),
+        1,
+        "push --sign adds exactly this machine's signature: {filed}"
+    );
+
+    // And it comes back out of the store like any other attestation.
+    let listed = json(&harness.run(
+        &[
+            "attest",
+            "list",
+            "--all",
+            "--store",
+            &harness.store(),
+            "--json",
+        ],
+        None,
+    ));
+    assert_eq!(listed["count"], 1, "{listed}");
+    assert_eq!(listed["attestations"][0]["digest"], filed["digest"]);
+
+    let other = Harness::new();
+    other.key("ada");
+    let unsigned = other.run(
+        &["attest", "push", &manifest, "--store", &other.store()],
+        None,
+    );
+    assert_eq!(
+        code(&unsigned),
+        6,
+        "{}{}",
+        stdout(&unsigned),
+        stderr(&unsigned)
+    );
+    assert!(
+        stderr(&unsigned).contains("no signature"),
+        "{}",
+        stderr(&unsigned)
+    );
+    let empty = json(&other.run(
+        &[
+            "attest",
+            "list",
+            "--all",
+            "--store",
+            &other.store(),
+            "--json",
+        ],
+        None,
+    ));
+    assert_eq!(empty["count"], 0, "an unsigned manifest was filed: {empty}");
 }
 
 /// A listing needs to be told what to list: guessing "everything" is how an

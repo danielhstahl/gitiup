@@ -12,6 +12,11 @@ Two goals, one tool:
 
 `gitiup` is pronounced like spurring on a horse.
 
+**New here?** [The quickstart](docs/quickstart.md) is the tool in fifteen minutes — plan a
+job, run it for real, sign the proof, file it, and merge a change into a repository that
+has no forge — and every command line on that page is executed by
+[`quickstart_doc_cli.rs`](crates/gitiup/tests/quickstart_doc_cli.rs).
+
 ## Workspace
 
 | crate           | what it is                                                       |
@@ -29,6 +34,11 @@ Two goals, one tool:
 
 The workspace globs `crates/*`, so a new crate is just `members`-free.
 
+* [Quickstart](docs/quickstart.md) — the tool in fifteen minutes, in the order a newcomer
+  should meet it: a simulated plan, a real run in a sandbox, a signed proof in a store, a
+  policy, a change merged into a repository with no forge, and a push refused for having
+  no proof. Every command line there is executed
+  ([`quickstart_doc_cli.rs`](crates/gitiup/tests/quickstart_doc_cli.rs)).
 * [ADR-0001 — attestation encoding, hash and signature format](docs/adr/0001-attestation-encoding-hash-and-signature.md) —
   the format every attestation ticket codes against (canonical JSON, SHA-256, Ed25519
   over DSSE PAE, `result`/`claims` split, freshness as policy).
