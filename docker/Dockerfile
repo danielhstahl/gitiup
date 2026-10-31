@@ -12,8 +12,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build the application for musl
-RUN cargo build --locked --release --target x86_64-unknown-linux-musl && \
-    cp target/x86_64-unknown-linux-musl/release/gitiup /gitiup
+RUN cargo build --locked --release && \
+    cp target/release/gitiup /gitiup
 
 # --- Runtime Stage ---
 FROM scratch
