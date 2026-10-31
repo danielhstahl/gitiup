@@ -1,0 +1,66 @@
+on:
+  release:
+    types: [published]
+jobs:
+
+  build_rust_binary:
+    name: release ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # release changes require contents write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl -L https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz -o cross-x86_64-unknown-linux-gnu.tar.gz
+          tar -xvzf cross-x86_64-unknown-linux-gnu.tar.gz
+          rustup update stable
+
+      - name: Compile
+        run: |
+          ./cross build --release --target ${{ matrix.target }}
+
+      - name: Release
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../gitiup-${{ matrix.target }}.tar.gz gitiup
+
+      - name: upload artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} gitiup-${{ matrix.target }}.tar.gz
+
+
+  build_rust_docker:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup buildx docker
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: generate docker
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/danielhstahl/gitiup:${{ github.event.release.tag_name }} -f docker/Dockerfile . --push
