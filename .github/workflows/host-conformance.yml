@@ -45,33 +45,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    services:
-      minio:
-        # A bucket that changes what `If-Match` means is changing the host contract,
-        # and this job is where that must surface as a failure on a branch rather
-        # than as a lost conditional write in production — so pin this once it has
-        # been resolved once (`docker images --digests minio/minio`) and bump it
-        # deliberately, with a note. Left moving until then, because a pin that was
-        # never verified against a registry is a guess with a date on it.
-        image: pgsty/minio:latest
-        #entrypoint: ./ci/run-with-args.sh
-        ports:
-          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - name: run minio service
         env:
           MINIO_ROOT_USER: gitiup-conformance
           MINIO_ROOT_PASSWORD: gitiup-conformance-secret
-        options: >-
-          server
-          /data
-          --health-cmd "mc ready local"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-        # The container's own storage is fine: the job is disposable, and the suite
-        # creates the bucket (with versioning, which it refuses to run without).
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            pgsty/minio server /data --console-address ":9001"
 
-    steps:
-      - uses: actions/checkout@v4
+      - name: Wait for MinIO
+        run: |
+          timeout 30 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done'
 
       - name: Install rust
         uses: dtolnay/rust-toolchain@stable
