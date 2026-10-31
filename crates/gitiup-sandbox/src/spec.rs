@@ -321,7 +321,7 @@ impl Spec {
         // The canary's directory too: a probe that cannot exec its own canary has not
         // observed anything, whatever it reports.
         paths.extend(self.tool_dirs());
-        for system in SYSTEM_READ_ONLY {
+        for system in crate::platform::system_read_only() {
             let path = Path::new(system);
             if !paths.contains(&path.to_path_buf()) {
                 paths.push(path.to_path_buf());
@@ -400,6 +400,10 @@ impl Spec {
 
 /// The directories a build needs to read and execute, so a sandbox is a cage and not
 /// a brick wall.
+///
+/// The Linux list. The real answer is per-OS and comes from
+/// [`crate::platform::system_read_only`]; this is kept as a named constant because the
+/// Linux list is the one every container mount and Landlock grant is written against.
 pub const SYSTEM_READ_ONLY: [&str; 8] = [
     "/usr", "/bin", "/sbin", "/lib", "/lib64", "/libexec", "/etc", "/opt",
 ];

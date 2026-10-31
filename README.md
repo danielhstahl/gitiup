@@ -82,6 +82,13 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   rung denies and what it does not, how egress is refused by default, and what the escape
   suite actually checks. `gitiup doctor --sandbox` says which of it is true on your
   machine.
+* [macOS](docs/macos.md) — the same question for the machine most people own: the ladder
+  there is `docker`/`podman` → `seatbelt` → opt-in `plain`, because Landlock, seccomp and
+  namespaces are Linux mechanisms and XNU's Seatbelt sandbox is what macOS has instead.
+  Running the tool inside a Linux container, running a job in Docker Desktop's VM, and
+  running it natively under a kernel-enforced profile are all real options; this page says
+  which one promises what, and what was observed on real hardware rather than reasoned
+  about.
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy — the draft file and the published one — may insist on.

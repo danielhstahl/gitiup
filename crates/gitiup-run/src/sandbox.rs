@@ -286,12 +286,26 @@ mod tests {
     fn an_unknown_backend_is_refused_with_the_ladder() {
         let err = open("kvm").unwrap_err();
         assert!(err.detail().contains("kvm"), "{err}");
-        assert!(err.hint().unwrap().contains("landlock"), "{err}");
+        // The ladder of *this* OS: the point of the hint is that the names in it are
+        // names this machine can be given, which on a Mac does not include `landlock`.
+        let this_os = if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "landlock"
+        };
+        assert!(err.hint().unwrap().contains(this_os), "{err}");
+        assert!(err.hint().unwrap().contains("docker"), "{err}");
     }
 
     #[test]
     fn names_are_typable() {
+        // The in-process rung's name, whichever OS this is: `landlock` on Linux,
+        // `seatbelt` on macOS, and `--sandbox darwin` accepted as an alias for the
+        // latter so a typist arrives either way.
+        #[cfg(target_os = "linux")]
         assert_eq!(open(" LANDLOCK ").unwrap().name(), "landlock");
+        #[cfg(target_os = "macos")]
+        assert_eq!(open(" SEATBELT ").unwrap().name(), "seatbelt");
     }
 
     #[test]

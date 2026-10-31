@@ -27,10 +27,13 @@ machines with different keys.
 
 ## Before you start
 
-* **Linux** for the parts that run a job. Sandboxing is kernel-enforced (Landlock,
-  bubblewrap, a container runtime); elsewhere `--execute` is refused and the only tier on
-  offer is `simulated`, which is a plan and not evidence. See
-  [the sandbox](sandbox.md) for what is available where you are.
+* **Linux, or a Linux container, for the parts that run a job.** Sandboxing is
+  kernel-enforced (Landlock, bubblewrap, a container runtime). On macOS there is a
+  kernel-enforced rung too — a container in the desktop app's VM, or `seatbelt`, the XNU
+  sandbox — and the page about which to use is [macOS](macos.md). On a machine where
+  nothing probes clean, `--execute` is refused and the only tier on offer is `simulated`,
+  which is a plan and not evidence. `gitiup doctor --sandbox` says which of these you are
+  on; see [the sandbox](sandbox.md) for what each rung denies.
 * **`git`** (2.28 or newer) on `PATH`. The store here is a bare repository and the
   plain-git host drives your `git`.
 * **Rust 1.88+** to build.
@@ -203,9 +206,10 @@ wrote        build.attestation.json
 
 Use whatever backend `gitiup doctor --sandbox` names as active — `--sandbox docker`,
 `--sandbox bwrap`, `--sandbox unshare`. `landlock` is used here because it needs no
-runtime. `gitiup run --sandboxes` lists what this build offers and why each of the
-others is not available on this machine; `none` is refused, because an unconfined run
-earns no tier.
+runtime; on a Mac the rung that needs no runtime is `seatbelt`, or run the whole page
+inside a Linux container ([macOS](macos.md) says which to pick and why). `gitiup run
+--sandboxes` lists what this build offers and why each of the others is not available on
+this machine; `none` is refused, because an unconfined run earns no tier.
 
 Now the tier moved to `local`, and the two elided lines are the point of the whole tool:
 
@@ -546,5 +550,6 @@ retried on 6 loops forever, which is what the cap exists to prevent.
 | how a policy is signed, published and resolved | [the published policy](policy.md) |
 | how to run a job so its bytes come out the same twice | [reproducibility](reproducibility.md), [the run report](run-report.md) |
 | what the sandbox does and does not isolate | [the sandbox](sandbox.md) |
+| what any of this is allowed to do on a Mac | [macOS](macos.md) |
 | how a change is stored, and what a merge records | [contributing without a forge](changes.md), [ADR-0003](adr/0003-change-record-format-and-merge-semantics.md) |
 | where the decisions that several tickets depend on are kept | [the ADR index](adr/README.md) |

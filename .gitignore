@@ -7,3 +7,9 @@ __pycache__/
 
 # The docs site: a build product (`gitiup-site build`).
 /_site/
+.fathom/*
+!.fathom/reviews/
+!.fathom/ratchet.toml
+!.fathom/LAYOUT.md
+.fathom/**/*.tmp
+.fathom/**/*.sqlite3-*

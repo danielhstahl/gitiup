@@ -24,6 +24,7 @@ that probed.
 | `podman`   | as `docker`, rootless where possible | as `docker` | as `docker` |
 | `bwrap`    | `bubblewrap` namespaces | the filesystem except the binds (workspace read-only, scratch read-write, `/proc`, sized `/tmp`), all egress unless an allowlist was asked for, `--dev-bind /` never | nothing outside the namespaces, but the user namespace means root inside is not root outside |
 | `landlock` | Landlock + seccomp + rlimits applied to the child before `execve` | writes outside the scratch, every TCP port the job was not given (ABI 4+), `ptrace`/`process_vm_readv`, `mount`/`unshare`/`setns`/module loading/`open_by_handle_at`, the privilege syscalls, installing a seccomp filter of one's own, core dumps, cpu/address/process/file rlimits | **reads** — anything the runner's uid can read is readable; the process table is still this machine's |
+| `seatbelt` | an XNU kernel sandbox profile, applied by `sandbox-exec` at `execve` | writes outside the scratch *and* a list of credential trees (`~/.ssh`, the keychains, the gitiup keystore), every socket the job was not given, cpu/process/file rlimits applied in the child | reads outside that credential list, Mach and IOKit, anything a profile cannot express — and the kernel is still this machine's |
 | `unshare`  | `unshare(1)` user + network namespaces | all egress (only a down `lo` exists), the host's uids | the filesystem: the mount namespace is not unshared, so the workspace and everything else reachable stays writable |
 | `plain`    | nothing | only the rlimits and the core-dump ban | everything else; it is the rung that says "I am not a sandbox" out loud |
 
@@ -39,6 +40,13 @@ UNSANDOXED: the `plain` backend runs the job as this user, with this user's file
 this user's network and no confinement at all.
 …
 ```
+
+The ladder is **per-OS**, because the mechanisms are: `bwrap`, `landlock` and `unshare`
+are Linux mechanisms, and the macOS ladder is `docker`, `podman`, `seatbelt`, `plain`.
+A rung the OS cannot provide is not offered at all — asking a Mac for `--sandbox
+landlock` is refused with the list of what exists — and [macOS](macos.md) is the page
+about what a Mac can promise, why the container rungs lead both ladders, and what a
+`seatbelt` attestation is worth.
 
 ## What a step may touch
 

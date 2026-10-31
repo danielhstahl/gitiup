@@ -114,6 +114,59 @@ jobs:
           cargo check --locked -p gitiup-host-tests --no-default-features --features github,s3 --all-targets -j 3
           cargo check --locked -p gitiup-host-github --no-default-features --all-targets -j 3
 
+  macos:
+    name: The macOS ladder, observed on a Mac
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    # The ticket this job exists for asked whether the sandboxing story survives a Mac.
+    # The answer is not meant to be an argument: `seatbelt` is the macOS rung, and a rung
+    # is only worth the probe that ran on the machine that made the claim — so the claim
+    # is checked on Apple silicon, on every pull request, by the same escape suite that
+    # guards the Linux rungs. Two properties make that worth the runner-minutes:
+    #
+    # * the checks go through `plan` → `command`, the path a real job takes, so nothing is
+    #   tested that production does not use;
+    # * a check the profile cannot express on a given macOS is reported as *unchecked* and
+    #   named, which is a refusal to assume rather than a green light. `docs/macos.md`
+    #   says what each outcome means.
+    #
+    # `cargo build`, not `cargo check`: the release link on a second platform is the part
+    # a cross-compile cannot see, and the sandbox crate is where the platform gates are.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --locked --release -j 3
+
+      # What this machine is, as the tool sees it: the ladder, each backend's probe, and
+      # the verdict. Printed before the tests so a failure has its context in the log —
+      # and printed without gating on the exit code, because the verdict *is* asserted
+      # below by the escape suite and by `tests/serves.rs`. A Mac that may not serve jobs
+      # should fail on a check, not on a status print.
+      - name: What this Mac offers
+        continue-on-error: true
+        run: ./target/release/gitiup doctor --sandbox
+
+      - name: The sandbox crate
+        run: cargo test --locked -p gitiup-sandbox -j 3
+
+      - name: The escape suite, on XNU
+        run: cargo test --locked -p gitiup-sandbox --test escape -- --nocapture
+
   msrv:
     name: The declared MSRV still builds
     runs-on: ubuntu-latest

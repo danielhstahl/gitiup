@@ -26,6 +26,7 @@ use gitiup_attest::{Error, ErrorKind, Result};
 use serde::Serialize;
 
 use crate::backends;
+use crate::platform::{OS, Platform};
 use crate::probe::Probe;
 use crate::spec::{Enforcement, Purpose, Spec};
 
@@ -193,6 +194,12 @@ pub struct Backend {
     /// The probe properties that were watched, when available.
     pub observed: Vec<String>,
     /// The probe properties that could not be watched, when available.
+    ///
+    /// Carried as `name — note`, not as a bare name: "`ptrace`: unchecked" tells a
+    /// reviewer that a hole exists, and the note is the whole of what they can act on
+    /// ("no trace denial is expressible on this macOS" versus "the image has no canary
+    /// binary" are different jobs). The names alone are still available from
+    /// [`Probe::unverified`].
     pub unchecked: Vec<String>,
 }
 
@@ -216,9 +223,10 @@ impl Backend {
                     .map(|name| name.to_string())
                     .collect(),
                 unchecked: probe
-                    .unverified()
+                    .properties
                     .iter()
-                    .map(|name| name.to_string())
+                    .filter(|property| property.observed == crate::probe::Observed::Skipped)
+                    .map(|property| format!("{} — {}", property.name, property.note))
                     .collect(),
             },
             Err(error) => Backend {
@@ -259,19 +267,45 @@ impl Backend {
 /// The backends, in the order they should be preferred: strongest isolation first, and
 /// the one that isolates nothing last.
 ///
-/// Containers lead because they are the only rung that also isolates *reads* and
-/// gives the job a filesystem of its own. Landlock is the interesting one for a
-/// machine with no container runtime: it needs no daemon, no root and no setup, and it
-/// is enforced by the same kernel that runs the job.
+/// The list is **per-OS**, because the mechanisms are: a macOS kernel has neither
+/// Landlock nor namespaces, and a Linux kernel has no Seatbelt. What is the same on
+/// every OS is how a rung earns its place — a probe that observes a denial — and that
+/// containers lead both ladders because a container is the only rung that also
+/// isolates *reads* and gives the job a filesystem of its own.
+///
+/// The in-process rung is the interesting one on a machine with no container runtime:
+/// Landlock on Linux (no daemon, no root, no setup), Seatbelt on macOS (no daemon, no
+/// root, in every macOS release). See [docs/macos.md](../../../docs/macos.md) for what
+/// a Mac can and cannot promise.
 pub fn backends() -> Vec<Box<dyn Sandbox>> {
-    vec![
+    // Containers first, on every OS: they are the strongest rung that exists
+    // everywhere, and on macOS they are the only rung whose kernel is not this kernel.
+    let mut rungs: Vec<Box<dyn Sandbox>> = vec![
         Box::new(backends::container::Container::docker()),
         Box::new(backends::container::Container::podman()),
-        Box::new(backends::bwrap::Bubblewrap),
-        Box::new(backends::inprocess::Landlock),
-        Box::new(backends::unshare::Unshare),
-        Box::new(backends::plain::Plain),
-    ]
+    ];
+    match Platform::survey().os {
+        #[cfg(target_os = "linux")]
+        OS::Linux => {
+            rungs.push(Box::new(backends::bwrap::Bubblewrap));
+            rungs.push(Box::new(backends::inprocess::Landlock));
+            rungs.push(Box::new(backends::unshare::Unshare));
+        }
+        #[cfg(target_os = "macos")]
+        OS::MacOS => {
+            rungs.push(Box::new(backends::seatbelt::Seatbelt));
+        }
+        // Every OS gets the container rungs above and the opt-in rung below, and
+        // nothing in between that its kernel cannot provide.
+        _ => {}
+    }
+    rungs.push(Box::new(backends::plain::Plain));
+    rungs
+}
+
+/// The ladder this OS has, as a sentence: `docker, podman, bwrap, landlock, unshare, plain`.
+pub fn ladder() -> String {
+    implemented().join(", ")
 }
 
 /// The names of every backend this build can run, in preference order.
@@ -329,6 +363,7 @@ pub fn open(name: &str) -> Result<Box<dyn Sandbox>> {
     let name = match name.as_str() {
         "shell" | "host" | "plain" => PLAIN.to_string(),
         "bubblewrap" | "bwrap" => "bwrap".to_string(),
+        "sandbox-exec" | "sandbox_exec" | "apple" | "darwin" | "seatbelt" => "seatbelt".to_string(),
         other => other.to_string(),
     };
     backends()
@@ -412,8 +447,8 @@ pub fn admit(backend: &dyn Sandbox, spec: &Spec) -> Result<Admitted> {
         .with_hint(match spec.purpose {
             Purpose::Quorum => concat!(
                 "serve quorum jobs from a backend that denies egress in the kernel (docker or ",
-                "podman with --network=none, bwrap, unshare, or landlock on Landlock ABI 4+), ",
-                "and keep the default-deny egress policy for quorum rounds",
+                "podman with --network=none, bwrap, unshare, landlock on Landlock ABI 4+, or ",
+                "seatbelt on macOS), and keep the default-deny egress policy for quorum rounds",
             )
             .to_string(),
             Purpose::Local => "raise the isolation".to_string(),
@@ -538,12 +573,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_preference_order_is_containers_then_namespaces_then_syscalls_then_nothing() {
+    fn the_preference_order_is_containers_then_the_platform_rung_then_nothing() {
         let names = implemented();
+        // The ladder is per-OS because the mechanisms are; every OS starts with the
+        // container rungs and ends with the one that isolates nothing.
+        let expected: &[&str] = if cfg!(target_os = "linux") {
+            &["docker", "podman", "bwrap", "landlock", "unshare", "plain"]
+        } else if cfg!(target_os = "macos") {
+            &["docker", "podman", "seatbelt", "plain"]
+        } else {
+            &["docker", "podman", "plain"]
+        };
+        assert_eq!(names, expected, "this OS's ladder");
         assert_eq!(
-            names,
-            vec!["docker", "podman", "bwrap", "landlock", "unshare", "plain"],
-            "the order in the ticket is the order on the machine"
+            names.first().copied(),
+            Some("docker"),
+            "a container is the strongest rung on every OS this tool runs on"
         );
         let backends = backends();
         assert_eq!(
@@ -553,6 +598,22 @@ mod tests {
         );
         assert!(backends.last().unwrap().opt_in_only());
         assert!(!backends.last().unwrap().serves_quorum());
+    }
+
+    #[test]
+    fn every_backend_in_the_ladder_answers_the_three_questions() {
+        // Cheap and structural: a rung that names itself "", claims nothing, or has no
+        // kind would print a doctor line nobody can read.
+        for candidate in backends() {
+            assert!(!candidate.name().is_empty());
+            assert!(candidate.guarantees().len() > 40, "{}", candidate.name());
+            assert!(
+                !candidate.guarantees().contains("sandboxed"),
+                "{}",
+                candidate.name()
+            );
+            let _ = candidate.kind().as_str();
+        }
     }
 
     #[test]
@@ -570,6 +631,14 @@ mod tests {
         assert_eq!(open(" UNSHARE ").unwrap().name(), "unshare");
         assert_eq!(open("shell").unwrap().name(), PLAIN);
         assert_eq!(open("bubblewrap").unwrap().name(), "bwrap");
+        // The platform rungs are only openable on the platform that has them: asking a
+        // Linux box for `seatbelt` is the same class of mistake as asking it for a
+        // syscall its kernel has never heard of.
+        if cfg!(target_os = "macos") {
+            assert_eq!(open("sandbox-exec").unwrap().name(), "seatbelt");
+        } else {
+            assert!(open("seatbelt").is_err(), "{} on this OS", ladder());
+        }
     }
 
     #[test]

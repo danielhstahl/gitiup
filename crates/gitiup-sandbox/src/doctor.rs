@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::backend::{self, Backend};
 use crate::egress::Egress;
 use crate::kernel::{Availability, Kernel};
+use crate::platform::OS;
 use crate::spec::{Enforcement, Spec};
 
 /// How a line should be read.
@@ -119,7 +120,7 @@ pub fn survey() -> Report {
         "kernel",
         format!(
             "{} — uid {}{}; {} processes already owned by this uid",
-            kernel.kernel,
+            kernel.platform.describe(),
             kernel.uid,
             if kernel.euid == 0 {
                 " (effective root)"
@@ -129,6 +130,7 @@ pub fn survey() -> Report {
             kernel.processes_of_uid
         ),
     ));
+    checks.push(Check::info("ladder", backend::ladder()));
     if kernel.euid != 0 {
         checks.push(Check::warn(
             "unprivileged uid",
@@ -151,7 +153,7 @@ pub fn survey() -> Report {
                 }
             ),
         )),
-        None => {
+        None if kernel.os() == OS::Linux => {
             let lsm = if kernel.lsm.is_empty() {
                 "unknown".to_string()
             } else {
@@ -162,6 +164,19 @@ pub fn survey() -> Report {
                 format!("the {} kernel has no Landlock (lsm: {lsm})", kernel.kernel),
                 "use a kernel with `CONFIG_SECURITY_LANDLOCK=y` (Linux 5.13+, `landlock` listed in \
                  /sys/kernel/security/lsm), or rely on the docker/podman/bwrap/unshare backends",
+            ));
+        }
+        None => {
+            // Not a refusal: there is no Landlock to want on a machine whose kernel is
+            // not Linux, and a FAIL line here would send someone to recompile a kernel
+            // they do not have. The rung that does the same job on this OS is a backend
+            // line below, and docs/macos.md says what it promises.
+            checks.push(Check::info(
+                "landlock",
+                format!(
+                    "not applicable: Landlock is a Linux mechanism and this is {}",
+                    kernel.platform.sysname
+                ),
             ));
         }
     }
@@ -178,11 +193,9 @@ pub fn survey() -> Report {
              refuses seccomp(2), so run gitiup with a profile that allows it, or use a \
              container backend where the runtime does the filtering",
         )),
-        Availability::Unknown(why) => checks.push(Check::warn(
-            "seccomp",
-            format!("could not be established: {why}"),
-            "check /proc/sys/kernel/seccomp/actions_avail",
-        )),
+        Availability::Unknown(why) => {
+            checks.push(Check::info("seccomp", format!("not applicable: {why}")))
+        }
     }
 
     match &kernel.user_namespaces {
@@ -200,7 +213,7 @@ pub fn survey() -> Report {
         )),
         Availability::Unknown(why) => checks.push(Check::info(
             "user namespaces",
-            format!("not established: {why}"),
+            format!("not applicable: {why}"),
         )),
     }
 
@@ -270,6 +283,18 @@ pub fn survey() -> Report {
             deny.enforcement_label_on(active.as_deref()),
         ),
     ));
+
+    if kernel.os() == OS::MacOS {
+        checks.push(Check::info(
+            "macOS",
+            format!(
+                "the in-process rung on this OS is Seatbelt ({}); the container rungs run the \
+                 job inside the Docker/podman Linux VM rather than in this kernel, which is \
+                 the rung that isolates reads as well as writes — docs/macos.md compares them",
+                active.as_deref().unwrap_or("none probed clean")
+            ),
+        ));
+    }
 
     let may_serve_jobs = backends
         .iter()

@@ -1203,9 +1203,10 @@ fn confine(
                  was {ladder}"
             ),
             "install or enable one rung that denies egress in the kernel (docker, podman, \
-             bwrap, landlock on ABI 4+, unshare) and run `gitiup doctor --sandbox` to see \
-             which line fails and why; until then `gitiup run` plans and attests as \
-             `simulated`, which is the honest tier and says so on its face",
+             bwrap, landlock on ABI 4+, unshare — or seatbelt on macOS) and run `gitiup \
+             doctor --sandbox` to see which line fails and why; until then `gitiup run` \
+             plans and attests as `simulated`, which is the honest tier and says so on \
+             its face",
         ));
     }
     let rung = backend::open(&name).map_err(CliError::from)?;

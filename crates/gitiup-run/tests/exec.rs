@@ -329,11 +329,18 @@ fn the_sandbox_vocabulary_is_honest_about_what_exists() {
 
     // Every rung of the ladder is a name that opens, and each one states what it
     // denies. "Not built into this build" is no longer an honest answer for docker or
-    // landlock: both are implemented, and whether either works is a question for the
-    // probe, not for a list in a source file.
+    // the platform's in-process rung: both are implemented, and whether either works is
+    // a question for the probe, not for a list in a source file.
     let ladder = sandbox::implemented();
+    // The in-process rung of *this* OS: Landlock where the kernel has it, Seatbelt where
+    // XNU has its own, and neither is a name the other machine should be given.
+    let in_process = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "landlock"
+    };
     assert!(
-        ladder.iter().any(|name| name == "landlock"),
+        ladder.iter().any(|name| name == in_process),
         "the in-process rung must be offered: {ladder:?}"
     );
     for name in &ladder {
@@ -357,7 +364,12 @@ fn the_sandbox_vocabulary_is_honest_about_what_exists() {
     );
 
     // `open` is case-insensitive because flags are typed by people.
-    assert_eq!(sandbox::open(" LANDLOCK ").unwrap().name(), "landlock");
+    assert_eq!(
+        sandbox::open(&format!(" {in_process} ").to_uppercase())
+            .unwrap()
+            .name(),
+        in_process
+    );
 
     // Detection reports the truth about this machine, and says why when it is no.
     let backends = sandbox::detect();
@@ -423,12 +435,16 @@ fn a_step_writes_in_its_workspace_and_scratch_only() {
     );
     // And the ladder agrees about where the writable tree is, for the rung that
     // enforces it in the kernel rather than by a mount.
-    let landlock = sandbox::open("landlock").unwrap();
+    let in_process = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "landlock"
+    };
+    let rung = sandbox::open(in_process).unwrap();
     assert!(
-        landlock.guarantees().contains("Reads are NOT isolated")
-            || landlock.guarantees().contains("nothing"),
+        rung.guarantees().contains("NOT isolated") || rung.guarantees().contains("nothing"),
         "{}",
-        landlock.guarantees()
+        rung.guarantees()
     );
 }
 

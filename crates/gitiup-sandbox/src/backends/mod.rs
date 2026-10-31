@@ -7,8 +7,15 @@
 
 pub mod bwrap;
 pub mod container;
+/// The Linux in-process backend (Landlock + seccomp). Compiled only where its syscalls
+/// exist; on macOS the equivalent rung is [`seatbelt`].
+#[cfg(target_os = "linux")]
 pub mod inprocess;
 pub mod plain;
+/// The macOS in-process backend. Compiled everywhere — the profile it builds is a
+/// value, and its tests run on any host — but only put in the ladder on macOS, where
+/// `sandbox-exec` exists to apply it.
+pub mod seatbelt;
 pub mod unshare;
 
 use std::path::Path;

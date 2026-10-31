@@ -8,13 +8,23 @@
 //! Each fact is *established*, not read from a config: a sysctl that says user
 //! namespaces are enabled and a seccomp profile from an outer container that refuses
 //! them anyway are exactly the mismatch this crate must not paper over.
+//!
+//! Which facts exist is a question about the OS ([`crate::platform`]): Landlock, seccomp
+//! and namespaces are Linux mechanisms, and on macOS the survey says so and reports the
+//! Seatbelt facts instead. A fact that does not exist on this OS is reported as
+//! `Unknown` with the reason, which is the difference between "this machine cannot do
+//! that" and "nobody looked".
 
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::linux::{self, SeccompFilter};
+use crate::limits;
+#[cfg(target_os = "linux")]
+use crate::linux::SeccompFilter;
+use crate::platform::{self, OS, Platform};
 
 /// Something the survey could or could not establish.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +65,8 @@ impl Availability {
 /// The machine's isolation facts.
 #[derive(Debug, Clone)]
 pub struct Kernel {
+    /// The OS family and version, which decides which ladder this machine has.
+    pub platform: Platform,
     /// `uname -s -r`, as reported by the running kernel.
     pub kernel: String,
     /// Real uid of this process.
@@ -88,9 +100,15 @@ impl Kernel {
         SURVEY.get_or_init(Kernel::gather)
     }
 
+    /// The OS family this survey was taken on.
+    pub fn os(&self) -> OS {
+        self.platform.os
+    }
+
     /// Do it all again. Public for tests that change the environment.
     pub fn gather() -> Kernel {
-        let landlock_abi = linux::landlock_abi();
+        let platform = Platform::survey().clone();
+        let landlock_abi = landlock_abi();
         let lsm = std::fs::read_to_string("/sys/kernel/security/lsm")
             .map(|text| {
                 text.trim()
@@ -105,6 +123,7 @@ impl Kernel {
             .map(|text| text.trim().to_string());
         Kernel {
             kernel: uname(),
+            platform,
             uid: unsafe { libc::getuid() },
             euid: unsafe { libc::geteuid() },
             landlock_abi,
@@ -114,35 +133,13 @@ impl Kernel {
             user_namespaces: probe_user_namespaces(),
             max_user_namespaces: read_number("/proc/sys/user/max_user_namespaces"),
             ptrace_scope: read_number("/proc/sys/kernel/yama/ptrace_scope").map(|v| v as u32),
-            processes_of_uid: linux::current_nproc(),
+            processes_of_uid: limits::current_nproc(),
         }
     }
 
     /// Where a helper binary lives, searching `PATH` the way a shell would.
     pub fn binary(name: &str) -> Option<PathBuf> {
-        if let Some(absolute) = Path::new(name)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-        {
-            let _ = absolute;
-            return Path::new(name).is_file().then(|| PathBuf::from(name));
-        }
-        // The usual suspects first, so a stripped PATH in a CI job still finds
-        // `/usr/bin/unshare`.
-        let mut searched: Vec<PathBuf> = Vec::new();
-        if let Some(path) = std::env::var_os("PATH") {
-            searched.extend(std::env::split_paths(&path).filter(|p| !p.as_os_str().is_empty()));
-        }
-        for system in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-            let directory = PathBuf::from(system);
-            if !searched.contains(&directory) {
-                searched.push(directory);
-            }
-        }
-        searched
-            .iter()
-            .map(|directory| directory.join(name))
-            .find(|candidate| candidate.is_file())
+        platform::binary(name)
     }
 
     /// Whether seccomp can be used *right now*: an outer container profile can make a
@@ -182,14 +179,27 @@ fn read_number(path: &str) -> Option<u64> {
         .ok()
 }
 
+/// The Landlock ABI on this machine, if it has one.
+fn landlock_abi() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::landlock_abi()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Try to install the hardened seccomp filter in a child.
+#[cfg(target_os = "linux")]
 fn probe_seccomp() -> Availability {
     let filter = SeccompFilter::hardened();
     let mut command = Command::new("/bin/true");
     command.env_clear();
     unsafe {
         command.pre_exec(move || {
-            linux::no_new_privs()?;
+            crate::linux::no_new_privs()?;
             // SAFETY: this is the forked child (the enclosing `unsafe` is the
             // `pre_exec` registration), and the filter is what a real job would get;
             // the process execs `/bin/true` immediately after.
@@ -210,8 +220,27 @@ fn probe_seccomp() -> Availability {
     }
 }
 
+/// On an OS without seccomp there is nothing to try, and saying so is the honest
+/// answer: `Unknown`, not `No`, because the machine was not refused anything — the
+/// mechanism is simply not part of it.
+#[cfg(not(target_os = "linux"))]
+fn probe_seccomp() -> Availability {
+    Availability::Unknown(format!(
+        "seccomp is a Linux mechanism and this is {}; the equivalent denials here come from \
+         the backend that does the isolating",
+        Platform::survey().sysname
+    ))
+}
+
 /// Try to create a user namespace by creating one.
 fn probe_user_namespaces() -> Availability {
+    if Platform::survey().os != OS::Linux {
+        return Availability::Unknown(format!(
+            "user namespaces are a Linux mechanism and this is {}; there is no namespace to \
+             create here",
+            Platform::survey().sysname
+        ));
+    }
     let Some(unshare) = Kernel::binary("unshare") else {
         return Availability::Unknown(
             "no unshare(1) binary to try with (install util-linux)".to_string(),
@@ -266,12 +295,40 @@ mod tests {
     #[test]
     fn seccomp_and_user_namespaces_are_established_by_trying() {
         let kernel = Kernel::gather();
-        // Neither may be `Unknown` on Linux: both have something safe to try. A
-        // machine with no `unshare` binary is the one honest `Unknown`.
-        assert!(!matches!(kernel.seccomp_usable, Availability::Unknown(_)));
+        // On Linux neither may be `Unknown`: both have something safe to try. A
+        // machine with no `unshare` binary is the one honest `Unknown`. On an OS
+        // without the mechanism, `Unknown` with a reason is the only honest answer,
+        // and a backend that relied on it would be lying about this machine.
+        match kernel.os() {
+            OS::Linux => {
+                assert!(!matches!(kernel.seccomp_usable, Availability::Unknown(_)));
+                assert!(
+                    kernel.user_namespaces.is_yes() || kernel.user_namespaces.reason().is_some(),
+                    "a `no` must come with what the kernel said"
+                );
+            }
+            other => {
+                for availability in [&kernel.seccomp_usable, &kernel.user_namespaces] {
+                    assert!(
+                        matches!(availability, Availability::Unknown(_)),
+                        "{other:?} has no {} to try: {:?}",
+                        availability.state(),
+                        availability
+                    );
+                    assert!(availability.reason().is_some(), "an Unknown needs a reason");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_platform_and_the_kernel_agree_about_which_os_this_is() {
+        let kernel = Kernel::survey();
         assert!(
-            kernel.user_namespaces.is_yes() || kernel.user_namespaces.reason().is_some(),
-            "a `no` must come with what the kernel said"
+            kernel.kernel.starts_with(&kernel.platform.sysname),
+            "{}",
+            kernel.kernel
         );
+        assert_eq!(kernel.os(), kernel.platform.os);
     }
 }

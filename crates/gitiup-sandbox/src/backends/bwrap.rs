@@ -79,7 +79,7 @@ impl Bubblewrap {
         args.push(spec.scratch.display().to_string());
         args.push("--setenv".to_string());
         args.push("PATH".to_string());
-        args.push(crate::linux::default_path().to_string_lossy().into_owned());
+        args.push(crate::limits::default_path().to_string_lossy().into_owned());
         args
     }
 }

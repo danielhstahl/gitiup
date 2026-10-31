@@ -20,6 +20,18 @@
 //! its author ignores `HTTP_PROXY`. That is why a quorum job with an allowlist is
 //! refused on this backend and accepted on `landlock`, where the kernel refuses every
 //! port except the proxy's.
+//!
+//! # On macOS this rung is a different animal, and a better one
+//!
+//! There is no container runtime in Darwin; `docker` and `podman` on a Mac talk to a
+//! Linux VM the desktop app manages. That makes the isolation **stronger** than the
+//! same command on Linux — the job cannot touch this kernel at all, because it is a
+//! different kernel — and it makes the mounts a contract of their own, because only the
+//! directories the app has agreed to *share* exist inside the VM. A path outside that
+//! list mounts as an empty directory, silently, and the job cannot find its own
+//! checkout. That is why `probe` checks `mount_probe` (can a container read a file
+//! the host just wrote?) before it believes anything about the write checks, and why
+//! [`plan`] puts the file-sharing warning in the notes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -30,6 +42,7 @@ use crate::backend::{Env, Kind, Launch, Sandbox};
 use crate::egress::Egress;
 use crate::escape::Witness;
 use crate::kernel::Kernel;
+use crate::platform::{OS, Platform};
 use crate::probe::Probe;
 use crate::spec::Enforcement;
 use crate::spec::Spec;
@@ -172,6 +185,47 @@ impl Container {
             .output()
     }
 
+    /// Whether a container can actually see a host directory it was given.
+    ///
+    /// This is the check that matters on macOS and is a formality on Linux. A
+    /// container runtime on macOS runs inside a VM, and only the directories the
+    /// desktop app has agreed to *share* exist in it: bind-mount a path that is not
+    /// shared and the runtime does not complain — it mounts an empty directory, and the
+    /// job quietly cannot find its own checkout. Worse, the write-outside check below
+    /// becomes vacuous, because a write to a host path that the VM cannot see was never
+    /// a write to the host at all. So this writes a file, mounts its directory
+    /// read-only, and asks a container to read it back: an observation, not a config
+    /// read.
+    fn mount_probe(&self) -> Option<String> {
+        let directory = std::env::temp_dir();
+        let marker = directory.join(format!("gitiup-mount-probe-{}", std::process::id()));
+        let secret = format!("gitiup-visible-{}", std::process::id());
+        if std::fs::write(&marker, &secret).is_err() {
+            return None;
+        }
+        // The mount goes before the image, which `probe_args` puts last.
+        let mut args = self.probe_args();
+        let image = args.pop();
+        args.push("-v".to_string());
+        args.push(format!(
+            "{}:{}:ro",
+            directory.display(),
+            directory.display()
+        ));
+        if let Some(image) = image {
+            args.push(image);
+        }
+        let command = format!("cat '{}' 2>/dev/null || true", marker.display());
+        let read = self.exec(&args, &["/bin/sh".to_string(), "-c".to_string(), command]);
+        let _ = std::fs::remove_file(&marker);
+        match read {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).contains(&secret) => {
+                Some(directory.display().to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// The host path a probe container would have to escape to, and whether it managed
     /// to write there.
     fn fs_probe(&self) -> bool {
@@ -294,10 +348,38 @@ impl Sandbox for Container {
         }
         probe.observed("image", format!("`{image}` is present locally"));
 
+        // Can a container see what the host put in a directory? Everything the
+        // write check below can claim depends on the answer, and on macOS it is not a
+        // formality: an unshared path mounts as an empty directory, without a word of
+        // complaint from the runtime.
+        let visible = self.mount_probe();
+        match &visible {
+            Some(directory) => probe.observed(
+                "mount-visibility",
+                format!("a read-only mount of {directory} was readable inside the container"),
+            ),
+            None => probe.skipped(
+                "mount-visibility",
+                "a container could not read a file the host just wrote into a directory it was \
+                 given as `-v`: the job would not find its own checkout. On macOS this means \
+                 the directory is not in the runtime's file-sharing list (Docker Desktop: \
+                 Settings → Resources → File sharing); or run gitiup inside the VM, where \
+                 mounts are not involved at all (docs/macos.md)",
+            ),
+        }
+
         if self.fs_probe() {
             probe.failed(
                 "fs-write-outside",
                 "a container wrote to a host path that was never mounted",
+            );
+        } else if visible.is_none() {
+            // Not "denied": the write cannot land on a host the VM cannot see, so the
+            // check observed nothing about isolation and says so.
+            probe.skipped(
+                "fs-write-outside",
+                "the runtime could not see a host directory at all, so a write that did not \
+                 arrive is a fact about file sharing and not about the sandbox",
             );
         } else {
             probe.observed(
@@ -377,6 +459,17 @@ impl Sandbox for Container {
             "writable mounts: {}",
             path_list(&spec.write_paths())
         ));
+        if Platform::survey().os == OS::MacOS {
+            // The one thing about a container on macOS that has bitten everyone: the
+            // job runs in the desktop app's Linux VM, and a path the app has not
+            // agreed to share mounts as an empty directory with no warning at all.
+            launch.notes.push(
+                "this container runs in the runtime's Linux VM: every mounted path above must \
+                 be in the desktop app's file-sharing list, or the job will find an empty \
+                 directory where its checkout should be (docs/macos.md)"
+                    .to_string(),
+            );
+        }
         let _ = env;
         Ok(launch)
     }
