@@ -13,13 +13,13 @@ COPY crates ./crates
 
 # Build the application for musl
 RUN cargo build --locked --release --target x86_64-unknown-linux-musl && \
-    cp target/x86_64-unknown-linux-musl/release/myapp /myapp
+    cp target/x86_64-unknown-linux-musl/release/gitiup /gitiup
 
 # --- Runtime Stage ---
 FROM scratch
 
 # Copy the statically linked binary
-COPY --from=builder /myapp /myapp
+COPY --from=builder /gitiup /gitiup
 
 # Set entrypoint
-ENTRYPOINT ["/myapp"]
+ENTRYPOINT ["/gitiup"]
