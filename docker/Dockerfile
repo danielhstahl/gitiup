@@ -12,7 +12,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build the application for musl
-RUN cargo build --release --target x86_64-unknown-linux-musl && \
+RUN cargo build --locked --release --target x86_64-unknown-linux-musl && \
     cp target/x86_64-unknown-linux-musl/release/myapp /myapp
 
 # --- Runtime Stage ---
