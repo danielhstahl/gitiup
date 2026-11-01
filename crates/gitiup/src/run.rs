@@ -58,6 +58,7 @@ use gitiup_attest::{
     Digest, EnvironmentRequirement, ErrorKind, GitOid, InputValue, POLICY_PATH_ENV, Policy,
     PolicyFile, RunManifest, StepOutcome, Tier, TimeUs,
 };
+use gitiup_run::act;
 use gitiup_run::sandbox;
 use gitiup_run::{
     Execution, MAX_MATRIX_ARMS, Plan, PlannedJob, Replay, Selector, Simulation, Workflow, diagnose,
@@ -102,6 +103,17 @@ OPTIONS:
                             used and named, otherwise this is required. `none` is
                             refused: an unconfined run earns no tier
         --sandboxes         list the sandboxes this build offers, then exit
+        --engine <name>     with --execute: `gitiup` (the default — this build runs the
+                            steps itself) or `act` (nektos/act runs the whole job in its
+                            own container). `act` is the engine that understands `uses:`
+                            steps, `services:` and the expression language; it is also a
+                            containment gitiup does not own, so an attestation from it says
+                            `sandbox: act` and a policy has to name `act` to accept one
+                            (docs/act.md, ADR-0006)
+        --act-image <l=img> with --engine act: the image for a `runs-on:` label
+                            (repeatable: --act-image 'ubuntu-24.04=ghcr.io/img@sha256:…').
+                            Required: without one act stops and asks a terminal which image
+                            to pull, and a runner cannot answer
         --logs <when>       how much of a step's captured output to print (--execute
                             only): `failed` is the default and prints the streams of
                             the step that failed, `all` prints every step's, `none`
@@ -146,6 +158,40 @@ Exit codes: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, ambiguous job)
 8 mismatch · 10 a step in the run failed
 ";
 
+/// Which thing runs the steps, decided once per command line (giti-ic0, ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Engine {
+    /// This build: one process per step, inside a sandbox gitiup probed.
+    #[default]
+    Gitiup,
+    /// nektos/act: the whole job, inside a container act starts.
+    Act,
+}
+
+impl Engine {
+    /// `gitiup` or `act`, in the words a refusal quotes back.
+    fn parse(text: &str) -> Result<Engine, CliError> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" => Err(CliError::usage(
+                "--engine needs a name: `gitiup` (the default) or `act`",
+            )),
+            "gitiup" | "giti" | "self" | "internal" => Ok(Engine::Gitiup),
+            "act" => Ok(Engine::Act),
+            other => Err(CliError::usage(format!(
+                "--engine {other} is not an engine: `gitiup` runs the steps itself, `act` \
+                 hands the job to nektos/act (https://nektosact.com)"
+            ))),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Engine::Gitiup => "gitiup",
+            Engine::Act => "act",
+        }
+    }
+}
+
 /// What the user asked for, once the flags are sorted out.
 #[derive(Debug, Default)]
 struct Options {
@@ -166,6 +212,10 @@ struct Options {
     execute: bool,
     sandbox: Option<String>,
     list_sandboxes: bool,
+    /// Which engine runs the steps; see [`Engine`].
+    engine: Option<String>,
+    /// `--act-image` mappings: `runs-on` label → image.
+    act_images: Vec<(String, String)>,
     /// How much step output to print; see [`LogMode`].
     logs: Option<String>,
     workdir: Option<PathBuf>,
@@ -222,6 +272,24 @@ impl Options {
                 "--execute" => options.execute = true,
                 "--sandbox" => options.sandbox = Some(value()?),
                 "--sandboxes" => options.list_sandboxes = true,
+                "--engine" => options.engine = Some(value()?),
+                "--act-image" => {
+                    let text = value()?;
+                    let (label, image) = text.split_once('=').ok_or_else(|| {
+                        CliError::usage(format!(
+                            "`--act-image {text}` is not label=image (e.g. \
+                             --act-image 'ubuntu-24.04=ghcr.io/img@sha256:…')"
+                        ))
+                    })?;
+                    if label.trim().is_empty() || image.trim().is_empty() {
+                        return Err(CliError::usage(format!(
+                            "`--act-image {text}` needs both a label and an image"
+                        )));
+                    }
+                    options
+                        .act_images
+                        .push((label.trim().to_string(), image.trim().to_string()));
+                }
                 "--logs" => options.logs = Some(value()?),
                 "--workdir" => options.workdir = Some(PathBuf::from(value()?)),
                 "--policy" => options.policy = Some(value()?),
@@ -286,6 +354,42 @@ impl Options {
             None => Ok(LogMode::default()),
             Some(text) => LogMode::parse(text),
         }
+    }
+
+    /// The engine the command line asked for, with the checks only the engine choice
+    /// can make (giti-ic0, ADR-0006).
+    ///
+    /// An engine is not a sandbox and the flags must not pretend otherwise: `act`
+    /// contains nothing gitiup probed, so there is no `--sandbox` to name, and it only
+    /// exists as an *execution* engine, so `--execute` is not optional.
+    fn engine(&self) -> Result<Engine, CliError> {
+        let engine = match &self.engine {
+            Some(text) => Engine::parse(text)?,
+            None => Engine::default(),
+        };
+        if engine == Engine::Act {
+            if !self.execute {
+                return Err(CliError::refused(
+                    "--engine act without --execute: act is an execution engine, and a plan \
+                     needs no engine at all",
+                    "drop --engine (the default plans on its own) or run with --execute --engine act",
+                ));
+            }
+            if self.sandbox.is_some() {
+                return Err(CliError::refused(
+                    "--engine act does not take a --sandbox: what contains the job is a \
+                     container act starts, and the attestation says `sandbox: act` rather \
+                     than borrowing a gitiup backend's name",
+                    "drop --sandbox; `gitiup run --sandboxes` says what the gitiup engine offers",
+                ));
+            }
+        } else if !self.act_images.is_empty() {
+            return Err(CliError::refused(
+                "--act-image names an image for the act engine, which was not asked for",
+                "pass --engine act, or drop --act-image",
+            ));
+        }
+        Ok(engine)
     }
 }
 
@@ -693,6 +797,23 @@ impl Outcome {
     }
 }
 
+/// Print what a run captured, at the moment it stops existing anywhere else.
+///
+/// The attestation carries the digest of each stream and never the text, so whatever
+/// this prints is the only copy of that log there will ever be; with `--json` stdout
+/// belongs to the manifest, so the log goes to stderr instead. Both engines — gitiup's
+/// own runner and act — are printed here, before the policy gate, so a run that a
+/// policy then refuses still leaves its reason behind.
+fn emit(outcome: &Outcome, mode: LogMode, json: bool) {
+    for line in outcome.output_report(mode) {
+        if json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
 /// One `label      text` entry, wrapped under the label's column.
 ///
 /// The report reads as a column of fields, and a hint long enough to wrap still has to
@@ -1009,6 +1130,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
     let log_mode = options.log_mode()?;
+    let engine = options.engine()?;
 
     let (workflow_path, workflow_text) = read_workflow(options.workflow.as_deref())?;
     let workflow = Workflow::parse(&workflow_path, &workflow_text)?;
@@ -1047,48 +1169,82 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     // sandbox that ran it" is a check this command can make, and only if it knows the
     // name independently of the attestation.
     let mut backend: Option<String> = None;
+    // For the act engine there is no gitiup sandbox to name, and the honest line about
+    // who ran the job takes its place in the checks printed under the result.
+    let mut engine_note: Option<String> = None;
+    let workdir = match &options.workdir {
+        Some(path) => path.clone(),
+        None => std::env::current_dir()
+            .map_err(|why| CliError::io(format!("cannot tell what directory I am in: {why}")))?,
+    };
     if options.execute {
-        // Open and probe before anything is spawned: `none`, a backend this build did
-        // not implement, and a backend this machine cannot do are three different
-        // refusals, and none of them may run a step on the way to saying so.
-        let sandbox_name = choose_sandbox(&options)?;
-        let sandbox = sandbox::open(&sandbox_name)?;
-        sandbox.probe()?;
-        let workdir = match options.workdir {
-            Some(path) => path,
-            None => std::env::current_dir().map_err(|why| {
-                CliError::io(format!("cannot tell what directory I am in: {why}"))
-            })?,
-        };
-        let backend_name = sandbox.name().to_string();
-        backend = Some(backend_name);
-        for run in &runs {
-            let mut execution = Execution::new(
-                commit.clone(),
-                source.clone(),
-                sandbox.name(),
-                &workdir,
-                &runner,
-            );
-            execution.event = event.clone();
-            execution.inputs = options.inputs.clone();
-            execution.secret_names = options.secrets.clone();
-            execution.run_id = options.run_id.clone();
-            execution.now_us = Some(clock);
-            let report = gitiup_run::execute(&run.plan, &run.job, &*sandbox, &execution)
-                .map_err(|why| for_job(many, &run.label(), CliError::from(why)))?;
-            let outcome = Outcome::new(run, &report, true)?;
-            // Printed here, at the moment the streams stop existing anywhere else, and
-            // before the policy gate: a run that fails and is then refused by a policy
-            // has to leave both the refusal and the reason behind.
-            for line in outcome.output_report(log_mode) {
-                if options.json {
-                    eprintln!("{line}");
-                } else {
-                    println!("{line}");
-                }
+        if engine == Engine::Act {
+            // act is discovered, not assumed: the version it reports is recorded in the
+            // attestation, because a run of unknown version proves nothing a stranger
+            // can repeat.
+            let act_engine = act::Engine::discover(None)?;
+            engine_note = Some(format!(
+                "engine       {name} {version} ran the job in its own container ({container}); \
+                 gitiup watched act's exit code and read its log, and probed none of the \
+                 containment it used",
+                name = engine.name(),
+                version = act_engine.version,
+                container = act_engine.container
+            ));
+            for line in &act_engine.notes {
+                eprintln!("warning: engine: {line}");
             }
-            outcomes.push(outcome);
+            for run in &runs {
+                let mut request = act::Request::new(
+                    commit.clone(),
+                    source.clone(),
+                    workflow_path.clone(),
+                    &workdir,
+                );
+                request.event = event.clone();
+                request.inputs = options.inputs.clone();
+                request.secret_names = options.secrets.clone();
+                request.run_id = options.run_id.clone();
+                request.now_us = Some(clock);
+                request.images = options.act_images.clone();
+                request.repo = None;
+                let report = act::run(&run.job, &act_engine, &request)
+                    .map_err(|why| for_job(many, &run.label(), CliError::from(why)))?;
+                let outcome = Outcome::new(run, &report, true)?;
+                emit(&outcome, log_mode, options.json);
+                outcomes.push(outcome);
+            }
+        } else {
+            // Open and probe before anything is spawned: `none`, a backend this build did
+            // not implement, and a backend this machine cannot do are three different
+            // refusals, and none of them may run a step on the way to saying so.
+            let sandbox_name = choose_sandbox(&options)?;
+            let sandbox = sandbox::open(&sandbox_name)?;
+            sandbox.probe()?;
+            let backend_name = sandbox.name().to_string();
+            backend = Some(backend_name);
+            for run in &runs {
+                let mut execution = Execution::new(
+                    commit.clone(),
+                    source.clone(),
+                    sandbox.name(),
+                    &workdir,
+                    &runner,
+                );
+                execution.event = event.clone();
+                execution.inputs = options.inputs.clone();
+                execution.secret_names = options.secrets.clone();
+                execution.run_id = options.run_id.clone();
+                execution.now_us = Some(clock);
+                let report = gitiup_run::execute(&run.plan, &run.job, &*sandbox, &execution)
+                    .map_err(|why| for_job(many, &run.label(), CliError::from(why)))?;
+                let outcome = Outcome::new(run, &report, true)?;
+                // Printed here, at the moment the streams stop existing anywhere else,
+                // and before the policy gate: a run that fails and is then refused by a
+                // policy has to leave both the refusal and the reason behind.
+                emit(&outcome, log_mode, options.json);
+                outcomes.push(outcome);
+            }
         }
     } else {
         if !options.secrets.is_empty() {
@@ -1177,10 +1333,10 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     // policy allows `local` only — so a simulated attestation is refused here rather
     // than being quietly filed next to the real ones. Every run is judged, because a
     // gate that only looked at the first one would be a hole with a heading on it.
-    if options.out.is_some()
+    let gated = options.out.is_some()
         || options.policy.is_some()
-        || std::env::var_os(POLICY_PATH_ENV).is_some()
-    {
+        || std::env::var_os(POLICY_PATH_ENV).is_some();
+    if gated {
         let policy = load_policy(options.policy.as_deref())?;
         if let Some(requirement) = policy.environment_requirement() {
             if outcomes.iter().any(|outcome| !outcome.executed) {
@@ -1197,6 +1353,37 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         for outcome in &outcomes {
             gate(&policy, outcome, many)?;
         }
+        // An act run names a containment gitiup did not probe, so it is only kept by an
+        // owner who has said so by name. The built-in policy allows `local` and names no
+        // sandbox, which is exactly the policy that must not swallow one: "any backend the
+        // format accepts" is a reasonable default about backends gitiup probed, and act is
+        // not one of them (ADR-0006).
+        if engine == Engine::Act
+            && options.out.is_some()
+            && !policy
+                .allowed_sandboxes
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(act::ENGINE))
+        {
+            return Err(CliError::refused(
+                format!(
+                    "this run would attest as `sandbox: {}`, which no policy has accepted",
+                    act::ENGINE
+                ),
+                "an act run is contained by act, not by a gitiup sandbox: keep it only where the \
+                 policy names it — write `\"allowed_sandboxes\": [\"docker\", \"act\"]` in the \
+                 policy file you gate with, or drop --out and treat the run as local \
+                 experimentation",
+            ));
+        }
+    } else if engine == Engine::Act {
+        eprintln!(
+            "note    this run says `sandbox: {}`: act contained it, gitiup only launched act and \
+             read its log. Nothing is filed, and a policy that does not name `{}` will refuse it \
+             if you try",
+            act::ENGINE,
+            act::ENGINE
+        );
     }
 
     // The producer's own sums, computed for every run whether or not anybody asked to
@@ -1204,7 +1391,11 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     // `--json` caller — the one scripting this — never gets.
     let mut checks: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
     for outcome in &outcomes {
-        checks.push(outcome.verification(backend.as_deref())?);
+        let mut lines = outcome.verification(backend.as_deref())?;
+        if let Some(note) = &engine_note {
+            lines.push(note.clone());
+        }
+        checks.push(lines);
     }
     // The one line that says what to do with what was just made, worded for whether a
     // file now exists to do it with.
@@ -1597,6 +1788,24 @@ fn list_sandboxes() {
     println!(
         "  (with none available there is no --execute: a simulated plan is the only \
          tier on offer, and it says so)"
+    );
+    let (available, note) = act::status();
+    println!("engines this build can hand a job to:");
+    println!("  gitiup    available   one process per step, in the sandbox named above");
+    println!(
+        "  {:<9} {:<11} {}",
+        act::ENGINE,
+        if available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        note
+    );
+    println!(
+        "  (act runs the `uses:` steps and services gitiup's own runner refuses to guess \
+         at; it is contained by act, so an attestation from it says `sandbox: act` and a \
+         policy has to name that — see docs/act.md)"
     );
 }
 

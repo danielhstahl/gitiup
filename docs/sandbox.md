@@ -48,6 +48,16 @@ landlock` is refused with the list of what exists — and [macOS](macos.md) is t
 about what a Mac can promise, why the container rungs lead both ladders, and what a
 `seatbelt` attestation is worth.
 
+### The `act` engine is not a rung
+
+`gitiup run --engine act` hands a job to [nektos/act](https://nektosact.com) and attests
+what act reported. It is listed under *engines*, never here: no rung of the ladder is
+built by somebody else's flags, and the name that lands in a report has to be a name this
+build can open and probe. An act run therefore says `sandbox: act` — a name that is not
+in any list above, that a policy has to accept by naming it, and that no quorum policy can
+list at all. [Running a workflow with `act`](act.md) says what it does promise;
+[ADR-0006](adr/0006-running-workflows-with-act.md) is the decision.
+
 ## What a step may touch
 
 `gitiup run --execute` runs each step under one spec

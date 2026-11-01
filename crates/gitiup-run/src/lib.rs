@@ -89,6 +89,7 @@
 
 #![doc(issue_tracker_base_url = "https://github.com/gitiup/gitiup/issues/")]
 
+pub mod act;
 pub mod env;
 pub mod exec;
 pub mod plan;

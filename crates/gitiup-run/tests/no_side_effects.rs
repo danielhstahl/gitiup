@@ -53,8 +53,9 @@ const FORBIDDEN: &[&str] = &[
     "stdin()",
 ];
 
-/// What the crate may depend on: the format, and the normaliser executed logs go
-/// through. Anything else has to be argued for in review, not added quietly.
+/// What the crate may depend on: the format, the normaliser executed logs go
+/// through, and the JSON reader act's log is parsed with. Anything else has to be
+/// argued for in review, not added quietly.
 const ALLOWED_DEPENDENCIES: &[&str] = &[
     "gitiup-attest",
     "gitiup-normalise",
@@ -63,6 +64,10 @@ const ALLOWED_DEPENDENCIES: &[&str] = &[
     // socket to the world (its egress proxy is loopback-only and only exists when a
     // job asked for egress) and it computes no digests.
     "gitiup-sandbox",
+    // Same boundary, same excuse: `src/act.rs` (giti-ic0, ADR-0006) parses act's
+    // `--json` log stream. No I/O, already in the lockfile via gitiup-attest, and the
+    // simulated path still may not reach it.
+    "serde_json",
 ];
 
 fn crate_root() -> PathBuf {
@@ -110,6 +115,9 @@ fn nothing_in_the_crate_can_open_a_socket() {
         "src/lib.rs",
         "src/exec.rs",
         "src/sandbox.rs",
+        // The act engine spawns a process and talks to no socket: act does its own
+        // fetching, and gitiup never reaches the network from this crate.
+        "src/act.rs",
     ] {
         let text = read(module);
         for forbidden in sockets {
@@ -119,7 +127,7 @@ fn nothing_in_the_crate_can_open_a_socket() {
 }
 
 #[test]
-fn the_crate_depends_on_exactly_two_things() {
+fn the_crate_depends_on_exactly_what_it_says_it_does() {
     let manifest = read("Cargo.toml");
     let mut section = String::new();
     let mut direct = BTreeSet::new();

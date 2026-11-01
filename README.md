@@ -89,6 +89,13 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   running it natively under a kernel-enforced profile are all real options; this page says
   which one promises what, and what was observed on real hardware rather than reasoned
   about.
+* [Running a workflow with `act`](docs/act.md) — the one part of Actions execution this
+  project does not re-implement: `gitiup run --engine act` hands the job to
+  [nektos/act](https://nektosact.com), which understands `uses:`, `services:` and the
+  expression language, and the attestation says `sandbox: act` because the containment
+  was act's and gitiup only launched it and read its log. What that engine refuses, and
+  why a policy has to name it, is the page; the decision is
+  [ADR-0006](docs/adr/0006-running-workflows-with-act.md).
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy — the draft file and the published one — may insist on.

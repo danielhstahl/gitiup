@@ -43,11 +43,16 @@ gitiup-normalise = { path = "../gitiup-normalise" }
 # is reached *before* anything is spawned, so "no sandbox" is a refusal rather than a
 # step that ran unconfined.
 gitiup-sandbox = { path = "../gitiup-sandbox" }
+# The `act` engine (giti-ic0, ADR-0006) reads a machine-readable log stream, and act's
+# surface is logrus JSON lines. Hand-rolling a second parser next to `yaml` would be
+# the worst of both: more code to audit for no more guarantee. `serde_json` is already
+# in the workspace lockfile through `gitiup-attest`, it performs no I/O, and the
+# simulated path still cannot reach it (`tests/no_side_effects.rs`).
+serde_json = "1"
 
 [dev-dependencies]
-# Test-only: the fixtures in `tests/` hand over run reports as JSON, the same shape
-# a runner writes. The library itself still depends on nothing but the format crate
-# and the normaliser.
+# The fixtures in `tests/` hand over run reports as JSON, the same shape a runner
+# writes.
 serde_json = "1"
 
 [lints]
