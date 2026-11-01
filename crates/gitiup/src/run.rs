@@ -21,12 +21,20 @@
 //! while **`--out`** (writing one for someone else) and **`--policy`** (asking to be
 //! gated) both run the policy, whose default allows `local` only.
 //!
+//! **A workflow may have several jobs, and an attestation is still one run.** That is
+//! not a limitation of the format and not a limitation here: `--job <id>` (or the
+//! bare positional job name) picks one job, repeating it picks several, and
+//! `--all-jobs` takes every run the workflow would produce. What never happens is one
+//! attestation about two runs, so a command that selects more than one run *prints or
+//! writes more than one attestation* — one canonical manifest per run.
+//!
 //! # Exit codes
 //!
 //! The same taxonomy as `gitiup digest` (ADR-0001 D7), so a merge gate branches on
 //! one set of numbers: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, or an
 //! ambiguous selection) · 8 mismatch.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -36,7 +44,9 @@ use gitiup_attest::{
     PolicyFile, RunManifest, Tier, TimeUs,
 };
 use gitiup_run::sandbox;
-use gitiup_run::{Execution, Plan, PlannedJob, Replay, Selector, Simulation, Workflow};
+use gitiup_run::{
+    Execution, MAX_MATRIX_ARMS, Plan, PlannedJob, Replay, Selector, Simulation, Workflow,
+};
 
 use crate::CliError;
 
@@ -45,11 +55,20 @@ gitiup run — plan a workflow job; run it only with --execute
 
 USAGE:
     gitiup run [OPTIONS] [JOB]
+    gitiup run --job <id> [--job <id>]…
+    gitiup run --all-jobs
     gitiup run --sandboxes
 
 OPTIONS:
     -w, --workflow <path>   workflow to plan (default: the only file in
                             .github/workflows/)
+        --job <id>          run this job (repeatable). The same thing as naming it
+                            here — `gitiup run <job>` — and the spelling a change
+                            record's job hint uses. Name two jobs and both run: each
+                            one gets its own attestation, never one for the lot
+        --all-jobs          every run the workflow would produce — every job, and
+                            every arm of a matrix job — as one attestation each.
+                            Each of them is byte-identical to running it on its own
         --matrix <k=v>      pin one matrix arm (repeatable). A job with a matrix
                             needs this: one attestation is one result
         --event <name>      which event to describe (default: the workflow's own
@@ -73,8 +92,10 @@ OPTIONS:
                             `local` only)
         --json              print the canonical attestation manifest, not the plan
     -o, --out <path>        write the attestation manifest here (default: write
-                            nothing at all). `gitiup attest push <file> --sign` files it:
-                            the manifest is the attestation before anybody has signed it
+                            nothing at all; with more than one run, a directory to
+                            write one manifest per run in). `gitiup attest push <file>
+                            --sign` files it: the manifest is the attestation before
+                            anybody has signed it
         --force             let --out overwrite an existing file
     -h, --help              this text
 
@@ -90,6 +111,10 @@ gated step: with --out or --policy the policy runs, and the default policy refus
 a simulated attestation. Write `\"allow_simulated\": true` in a policy file to allow
 one deliberately. The warning on stderr is printed either way.
 
+More than one run is more than one attestation: with several runs selected, --json
+prints one canonical manifest per line and --out must name a DIRECTORY, which gets
+one manifest per run, named after the job and its matrix arm.
+
 Exit codes: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, ambiguous job) ·
 8 mismatch
 ";
@@ -98,7 +123,12 @@ Exit codes: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, ambiguous job)
 #[derive(Debug, Default)]
 struct Options {
     workflow: Option<String>,
+    /// The job named as a bare word: `gitiup run build`.
     job: Option<String>,
+    /// The jobs named with `--job`, in the order given.
+    jobs: Vec<String>,
+    /// Every run the workflow would produce.
+    all_jobs: bool,
     matrix: Vec<(String, String)>,
     event: Option<String>,
     inputs: Vec<(String, InputValue)>,
@@ -142,6 +172,8 @@ impl Options {
             match name.as_str() {
                 "-h" | "--help" | "help" => options.help = true,
                 "-w" | "--workflow" => options.workflow = Some(value()?),
+                "--job" => options.jobs.push(value()?),
+                "--all-jobs" => options.all_jobs = true,
                 "--matrix" => {
                     let text = value()?;
                     let (key, arm) = pair("--matrix", &text)?;
@@ -177,7 +209,7 @@ impl Options {
                     if let Some(previous) = &options.job {
                         return Err(CliError::usage(format!(
                             "two jobs given ('{previous}' and '{name}'); one attestation is \
-                             one job"
+                             one job (name the ones you want with --job)"
                         )));
                     }
                     options.job = Some(name);
@@ -185,6 +217,37 @@ impl Options {
             }
         }
         Ok(options)
+    }
+
+    /// The jobs named on the command line, in the order they were given, without
+    /// repeats.
+    ///
+    /// `--job build` and `gitiup run build` are the same request in two spellings — the
+    /// first is the one the change record's job hint, the plan's own refusals and
+    /// `gitiup help` all use — so they merge into one list, bare word first. Saying the
+    /// same job twice is a stutter and is said once. There is no override here: a bare
+    /// word and a `--job` that differ ask for both jobs, which is what both readings of
+    /// the command line agree on.
+    fn named_jobs(&self) -> Result<Vec<String>, CliError> {
+        if self.all_jobs && (self.job.is_some() || !self.jobs.is_empty()) {
+            return Err(CliError::usage(
+                "--all-jobs and --job say different things: one is every job the workflow \
+                 has, the other names particular ones",
+            ));
+        }
+        let mut named: Vec<String> = Vec::new();
+        for name in self.job.iter().chain(self.jobs.iter()) {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(CliError::usage(
+                    "--job needs a job id, and this one is empty",
+                ));
+            }
+            if !named.iter().any(|seen| seen == name) {
+                named.push(name.to_string());
+            }
+        }
+        Ok(named)
     }
 }
 
@@ -239,6 +302,26 @@ struct Outcome {
 }
 
 impl Outcome {
+    /// One run's attestation, digests and all: the report is folded into the manifest
+    /// exactly the way it is when one job is run alone.
+    fn new(run: &Requested, report: &RunReport, executed: bool) -> Result<Outcome, CliError> {
+        let manifest = gitiup_run::manifest_for(report)?;
+        let (run_digest, result_digest) = digests(&manifest)?;
+        Ok(Outcome {
+            plan: run.plan.clone(),
+            job: run.job.clone(),
+            manifest,
+            executed,
+            run_digest,
+            result_digest,
+        })
+    }
+
+    /// `build`, or `build [os=linux]` — the run, named the way the reader named it.
+    fn label(&self) -> String {
+        format!("{}{}", self.job.id, self.job.arm_text())
+    }
+
     fn tier(&self) -> Tier {
         self.manifest.result.provenance.tier
     }
@@ -319,6 +402,273 @@ fn digests(manifest: &RunManifest) -> Result<(String, String), CliError> {
     ))
 }
 
+/// One run this command was asked to produce: the plan it came from, and the run.
+///
+/// The plan travels with the run because the plan text is what a simulated run prints
+/// and because the plan's caveats go into the attestation's annotations. Keeping them
+/// together per run is what makes `gitiup run --all-jobs` produce byte-for-byte what
+/// the same run produces when somebody pins it by hand.
+struct Requested {
+    plan: Plan,
+    job: PlannedJob,
+}
+
+impl Requested {
+    /// `build`, or `build [os=linux]`: how one run is referred to in every message.
+    fn label(&self) -> String {
+        format!("{}{}", self.job.id, self.job.arm_text())
+    }
+}
+
+/// The runs this invocation asked for, in the order they were asked for, one per
+/// attestation.
+///
+/// Three shapes of request, and only one of them is a guess refused:
+///
+/// * nothing named — the workflow's single job, or a refusal that lists the jobs and
+///   says how to name one;
+/// * `--job <id>` (repeatable, and the same as the positional spelling) — those jobs,
+///   each still needing its matrix arm pinned, because widening one named job into six
+///   runs is not what "run the build job" said;
+/// * `--all-jobs` — every run the workflow would produce, every job and every arm,
+///   each planned exactly as if it had been pinned by hand.
+fn plan_runs(workflow: &Workflow, options: &Options) -> Result<Vec<Requested>, CliError> {
+    let pin: BTreeMap<String, String> = options.matrix.iter().cloned().collect();
+    let named = options.named_jobs()?;
+    let mut runs: Vec<Requested> = Vec::new();
+    if options.all_jobs {
+        for job in &workflow.jobs {
+            let wide = Plan::build(
+                workflow,
+                &Selector {
+                    job: Some(job.id.clone()),
+                    matrix: pin.clone(),
+                },
+            )?;
+            let arms = wide
+                .jobs
+                .iter()
+                .map(|planned| planned.matrix.clone())
+                .collect::<Vec<_>>();
+            for arm in arms {
+                // One plan per arm, pinned: the annotations a hand-pinned run carries
+                // are this run's, not the whole job's.
+                let plan = Plan::build(
+                    workflow,
+                    &Selector {
+                        job: Some(job.id.clone()),
+                        matrix: arm,
+                    },
+                )?;
+                let planned = select_job(&plan)?.clone();
+                runs.push(Requested { plan, job: planned });
+            }
+        }
+    } else if named.is_empty() {
+        let plan = Plan::build(
+            workflow,
+            &Selector {
+                job: None,
+                matrix: pin.clone(),
+            },
+        )
+        .map_err(|why| offer_all_jobs(workflow, CliError::from(why)))?;
+        let job = select_job(&plan)?.clone();
+        runs.push(Requested { plan, job });
+    } else {
+        for name in &named {
+            let plan = Plan::build(
+                workflow,
+                &Selector {
+                    job: Some(name.clone()),
+                    matrix: pin.clone(),
+                },
+            )?;
+            let job = select_job(&plan)?.clone();
+            runs.push(Requested { plan, job });
+        }
+    }
+    if runs.is_empty() {
+        return Err(CliError::refused(
+            "this workflow plans no job",
+            "a workflow needs at least one job with steps",
+        ));
+    }
+    if runs.len() > MAX_MATRIX_ARMS {
+        return Err(CliError::refused(
+            format!(
+                "{} runs would be planned — more than {MAX_MATRIX_ARMS} attestations for \
+                 one command line, which is a mistake about the matrix rather than a build",
+                runs.len()
+            ),
+            "narrow it: --job <id> for the jobs you meant, --matrix k=v for one arm",
+        ));
+    }
+    Ok(runs)
+}
+
+/// The sandbox `--execute` will confine the run with, decided once per command line.
+///
+/// The ticket says `--execute` requires an explicit sandbox. What that must mean is:
+/// the attestation may never be vague about what confined it, and it may never silently
+/// pick a confinement out of several on offer. So a named backend is used as given;
+/// where exactly one backend works here it is used and *said*; where several do, the
+/// choice is the user's to make.
+fn choose_sandbox(options: &Options) -> Result<String, CliError> {
+    if let Some(name) = options.sandbox.as_deref() {
+        return Ok(name.to_string());
+    }
+    let available: Vec<String> = sandbox::detect()
+        .into_iter()
+        .filter(|backend| backend.available)
+        .map(|backend| backend.name)
+        .collect();
+    match available.as_slice() {
+        // The ticket's other half: with nothing holding, nothing runs. A default of
+        // "just pick one anyway" would be the unconfined execution this command exists
+        // to refuse.
+        [] => Err(CliError::refused(
+            "no sandbox on this machine holds, so there is nothing to run the step in",
+            "run `gitiup doctor --sandbox` to see which rung failed and what to                              install or set; until then `gitiup run` plans and attests as                              `simulated`, which is the safe default",
+        )),
+        [only] => {
+            println!(
+                "sandbox        {only} (the only one this machine offers; name it with --sandbox to be explicit)"
+            );
+            Ok(only.clone())
+        }
+        many => Err(CliError::refused(
+            format!(
+                "{} sandboxes work here ({}), and --execute must say which one confined the run",
+                many.len(),
+                many.join(", ")
+            ),
+            "pass --sandbox <name> (see --sandboxes)",
+        )),
+    }
+}
+
+/// When a workflow has several jobs and nothing was named, the library's refusal names
+/// `--job`; this command has one more answer than the library does, so it adds it.
+fn offer_all_jobs(workflow: &Workflow, mut error: CliError) -> CliError {
+    if workflow.jobs.len() > 1 {
+        if let Some(hint) = error.hint.as_mut() {
+            hint.push_str(" — or pass --all-jobs to run every one of them, one attestation each");
+        }
+    }
+    error
+}
+
+/// A failure from one run of several, saying *which* run it came from.
+fn for_job(many: bool, label: &str, mut error: CliError) -> CliError {
+    if many {
+        error.message = format!("job `{label}`: {}", error.message);
+    }
+    error
+}
+
+/// The gate for one produced attestation: does the policy in force let it through?
+fn gate(policy: &Policy, outcome: &Outcome, many: bool) -> Result<(), CliError> {
+    policy
+        .check_provenance(&outcome.manifest.result.provenance)
+        .map_err(|why| for_job(many, &outcome.label(), CliError::from(why)))?;
+    // The machine class the change requires (giti-1rs.4). A plan is held to less of
+    // it, because a plan honestly claims no image digest and no toolchain inventory —
+    // refusing a plan for the fields it refuses to invent would teach everyone to
+    // stop reading the notes.
+    let Some(requirement) = policy.environment_requirement() else {
+        return Ok(());
+    };
+    let (asked, _) = if outcome.executed {
+        (requirement.clone(), Vec::new())
+    } else {
+        plan_view(requirement)
+    };
+    if asked.is_empty() {
+        return Ok(());
+    }
+    asked
+        .check(
+            &outcome.manifest.result.environment,
+            &outcome.manifest.result.provenance,
+            policy.require_env_match,
+        )
+        .map_err(|why| for_job(many, &outcome.label(), CliError::from(why)))
+}
+
+/// Several attestations, one file each, in the directory `--out` named.
+///
+/// One attestation is one result, so there is no such thing as "the file" when a
+/// command produced three; `--out` names a directory instead and every run gets a
+/// manifest named after itself. Nothing is overwritten without `--force`, same rule,
+/// once per file.
+fn write_attestations(dir: &Path, outcomes: &[Outcome], force: bool) -> Result<(), CliError> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(CliError::refused(
+            format!(
+                "`{}` is a file, and {} attestations do not fit in one file",
+                dir.display(),
+                outcomes.len()
+            ),
+            "name a directory with --out, or run one job at a time with --job <id>",
+        ));
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|why| CliError::io(format!("cannot create `{}`: {why}", dir.display())))?;
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for outcome in outcomes {
+        let path = dir.join(manifest_file_name(&outcome.job, &mut taken));
+        write_attestation(&path, &outcome.manifest, force)?;
+        println!("wrote        {}", path.display());
+    }
+    Ok(())
+}
+
+/// The file one run's attestation gets: its job, its matrix arm, `.json`.
+///
+/// Predictable on purpose — a second run of the same command overwrites the same
+/// names (with `--force`), which is what makes a directory of attestations a cache of
+/// a workflow rather than a pile of temporary files.
+fn manifest_file_name(job: &PlannedJob, taken: &mut BTreeSet<String>) -> String {
+    let mut stem = file_safe(&job.id);
+    for (axis, value) in &job.matrix {
+        stem.push('+');
+        stem.push_str(&file_safe(axis));
+        stem.push('=');
+        stem.push_str(&file_safe(value));
+    }
+    // Two job ids that clean up to the same name are the workflow's fault, but the
+    // second attestation is not allowed to silently eat the first.
+    let mut name = format!("{stem}.json");
+    let mut fork = 1;
+    while !taken.insert(name.clone()) {
+        fork += 1;
+        name = format!("{stem}#{fork}.json");
+    }
+    name
+}
+
+/// Keep a name a filesystem will accept and a shell can quote: no slashes, no spaces,
+/// no control characters — nothing but the label characters a job id is made of.
+fn file_safe(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '=' | '+') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "run".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     let options = Options::parse(args)?;
     if options.help {
@@ -338,64 +688,36 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     for warning in &workflow.warnings {
         eprintln!("warning: {warning}");
     }
-    let selector = Selector {
-        job: options.job.clone(),
-        matrix: options.matrix.iter().cloned().collect(),
-    };
-    let plan = Plan::build(&workflow, &selector)?;
-    let job = select_job(&plan)?.clone();
+
+    let runs = plan_runs(&workflow, &options)?;
+    // Said before anything runs: one attestation is one result, so a workflow with
+    // several jobs yields several attestations, and a reader should not find that out
+    // from a file they did not ask for.
+    let many = runs.len() > 1;
+    if many {
+        eprintln!(
+            "note    {} runs, so {} attestations: one per run — never one attestation \
+             about two runs (--json prints one manifest per line; --out names a directory \
+             to write them in)",
+            runs.len(),
+            runs.len()
+        );
+    }
 
     let event = workflow.event_for(options.event.as_deref())?;
     let commit = resolve_commit(options.commit.as_deref())?;
     let source = WorkflowSource::from_text(workflow_path.clone(), workflow_text);
     let runner = format!("gitiup {}", env!("CARGO_PKG_VERSION"));
+    // One clock for the command line, so two runs of one workflow claim the same
+    // instant and the only thing that differs between them is the job.
+    let clock = now_us()?;
 
-    let outcome = if options.execute {
+    let mut outcomes: Vec<Outcome> = Vec::with_capacity(runs.len());
+    if options.execute {
         // Open and probe before anything is spawned: `none`, a backend this build did
         // not implement, and a backend this machine cannot do are three different
         // refusals, and none of them may run a step on the way to saying so.
-        // The ticket says `--execute` requires an explicit sandbox. What that must
-        // mean is: the attestation may never be vague about what confined it, and it
-        // may never silently pick a confinement out of several on offer. So a named
-        // backend is used as given; where exactly one backend works here it is used
-        // and *said*; where several do, the choice is the user's to make.
-        let sandbox_name = match options.sandbox.as_deref() {
-            Some(name) => name.to_string(),
-            None => {
-                let available: Vec<String> = sandbox::detect()
-                    .into_iter()
-                    .filter(|backend| backend.available)
-                    .map(|backend| backend.name)
-                    .collect();
-                match available.as_slice() {
-                    // The ticket's other half: with nothing holding, nothing runs. A
-                    // default of "just pick one anyway" would be the unconfined
-                    // execution this command exists to refuse.
-                    [] => {
-                        return Err(CliError::refused(
-                            "no sandbox on this machine holds, so there is nothing to run the step in",
-                            "run `gitiup doctor --sandbox` to see which rung failed and what to                              install or set; until then `gitiup run` plans and attests as                              `simulated`, which is the safe default",
-                        ));
-                    }
-                    [only] => {
-                        println!(
-                            "sandbox        {only} (the only one this machine offers; name it with --sandbox to be explicit)"
-                        );
-                        only.clone()
-                    }
-                    many => {
-                        return Err(CliError::refused(
-                            format!(
-                                "{} sandboxes work here ({}), and --execute must say which one confined the run",
-                                many.len(),
-                                many.join(", ")
-                            ),
-                            "pass --sandbox <name> (see --sandboxes)",
-                        ));
-                    }
-                }
-            }
-        };
+        let sandbox_name = choose_sandbox(&options)?;
         let sandbox = sandbox::open(&sandbox_name)?;
         sandbox.probe()?;
         let workdir = match options.workdir {
@@ -404,22 +726,22 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                 CliError::io(format!("cannot tell what directory I am in: {why}"))
             })?,
         };
-        let mut execution = Execution::new(commit, source, sandbox.name(), &workdir, &runner);
-        execution.event = event.clone();
-        execution.inputs = options.inputs.clone();
-        execution.secret_names = options.secrets.clone();
-        execution.run_id = options.run_id.clone();
-        execution.now_us = Some(now_us()?);
-        let report = gitiup_run::execute(&plan, &job, &*sandbox, &execution)?;
-        let manifest = gitiup_run::manifest_for(&report)?;
-        let (run_digest, result_digest) = digests(&manifest)?;
-        Outcome {
-            manifest,
-            plan,
-            job,
-            executed: true,
-            run_digest,
-            result_digest,
+        for run in &runs {
+            let mut execution = Execution::new(
+                commit.clone(),
+                source.clone(),
+                sandbox.name(),
+                &workdir,
+                &runner,
+            );
+            execution.event = event.clone();
+            execution.inputs = options.inputs.clone();
+            execution.secret_names = options.secrets.clone();
+            execution.run_id = options.run_id.clone();
+            execution.now_us = Some(clock);
+            let report = gitiup_run::execute(&run.plan, &run.job, &*sandbox, &execution)
+                .map_err(|why| for_job(many, &run.label(), CliError::from(why)))?;
+            outcomes.push(Outcome::new(run, &report, true)?);
         }
     } else {
         if !options.secrets.is_empty() {
@@ -432,99 +754,112 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                 "run with --execute --sandbox <name> to pass secrets for real, or drop --secret",
             ));
         }
-        let mut simulation = Simulation::new(commit, source, &runner);
-        simulation.event = event.clone();
-        simulation.inputs = options.inputs.clone();
-        simulation.run_id = options.run_id.clone();
-        simulation.now_us = Some(now_us()?);
-        simulation.matrix = job.matrix.clone();
-        if let Some(path) = &options.replay_from {
-            let bytes = read_file(path)?;
-            let report: RunReport = serde_json::from_slice(&bytes).map_err(|why| {
-                CliError::new(
-                    ErrorKind::Invalid,
-                    format!("`{path}` is not a run report: {why}"),
-                    Some("pass the runner's report JSON — the file `gitiup digest` reads"),
-                )
-            })?;
-            // The provenance of the replay is the file's own digest: not a
-            // verification (the tier has not moved), just a citation a reader can
-            // check against the file they still have.
-            simulation.replay = Some(Replay::from_report(&report, Some(Digest::sha256(&bytes)))?);
+        let replay = match &options.replay_from {
+            Some(path) => {
+                let bytes = read_file(path)?;
+                let report: RunReport = serde_json::from_slice(&bytes).map_err(|why| {
+                    CliError::new(
+                        ErrorKind::Invalid,
+                        format!("`{path}` is not a run report: {why}"),
+                        Some("pass the runner's report JSON — the file `gitiup digest` reads"),
+                    )
+                })?;
+                // The provenance of the replay is the file's own digest: not a
+                // verification (the tier has not moved), just a citation a reader can
+                // check against the file they still have.
+                Some(Replay::from_report(&report, Some(Digest::sha256(&bytes)))?)
+            }
+            None => None,
+        };
+        for run in &runs {
+            let mut simulation = Simulation::new(commit.clone(), source.clone(), &runner);
+            simulation.event = event.clone();
+            simulation.inputs = options.inputs.clone();
+            simulation.run_id = options.run_id.clone();
+            simulation.now_us = Some(clock);
+            simulation.matrix = run.job.matrix.clone();
+            simulation.replay = replay.clone();
+            let report = gitiup_run::simulate_report(&run.plan, &run.job, &simulation)?;
+            outcomes.push(Outcome::new(run, &report, false)?);
         }
-        let report = gitiup_run::simulate_report(&plan, &job, &simulation)?;
-        let manifest = gitiup_run::manifest_for(&report)?;
-        let (run_digest, result_digest) = digests(&manifest)?;
-        Outcome {
-            manifest,
-            plan,
-            job,
-            executed: false,
-            run_digest,
-            result_digest,
-        }
-    };
+    }
 
-    for warning in outcome.warnings() {
+    // The warning is about the tier, and every run of one command line shares it.
+    for warning in outcomes[0].warnings() {
         eprintln!("{warning}");
     }
 
     // The gate. Kept attestations and asked-for policies are checked, and the default
     // policy allows `local` only — so a simulated attestation is refused here rather
-    // than being quietly filed next to the real ones.
+    // than being quietly filed next to the real ones. Every run is judged, because a
+    // gate that only looked at the first one would be a hole with a heading on it.
     if options.out.is_some()
         || options.policy.is_some()
         || std::env::var_os(POLICY_PATH_ENV).is_some()
     {
         let policy = load_policy(options.policy.as_deref())?;
-        policy.check_provenance(&outcome.manifest.result.provenance)?;
-        // The machine class the change requires (giti-1rs.4). A plan is held to less
-        // of it, because a plan honestly claims no image digest and no toolchain
-        // inventory — refusing a plan for the fields it refuses to invent would teach
-        // everyone to stop reading the notes.
         if let Some(requirement) = policy.environment_requirement() {
-            let (asked, skipped) = if outcome.executed {
-                (requirement.clone(), Vec::new())
-            } else {
-                plan_view(requirement)
-            };
-            if !skipped.is_empty() {
-                eprintln!(
-                    "note    a plan claims no {}; those parts of the environment requirement \
-                     were not checked",
-                    skipped.join(", ")
-                );
+            if outcomes.iter().any(|outcome| !outcome.executed) {
+                let (_, skipped) = plan_view(requirement);
+                if !skipped.is_empty() {
+                    eprintln!(
+                        "note    a plan claims no {}; those parts of the environment \
+                         requirement were not checked",
+                        skipped.join(", ")
+                    );
+                }
             }
-            if !asked.is_empty() {
-                asked.check(
-                    &outcome.manifest.result.environment,
-                    &outcome.manifest.result.provenance,
-                    policy.require_env_match,
-                )?;
-            }
+        }
+        for outcome in &outcomes {
+            gate(&policy, outcome, many)?;
         }
     }
 
     if options.json {
         // The canonical bytes, verbatim: re-encoding them here would be a second
-        // opinion about the encoding, which is exactly what ADR-0001 refuses.
-        let text = String::from_utf8(outcome.manifest.canonical_bytes()?)
-            .map_err(|_| CliError::io("the canonical attestation is not utf-8 (it should be)"))?;
-        print!("{text}");
+        // opinion about the encoding, which is exactly what ADR-0001 refuses. With
+        // more than one run that is one manifest per line — each line still the exact
+        // bytes whose digest is printed beside it.
+        for outcome in &outcomes {
+            let text = String::from_utf8(outcome.manifest.canonical_bytes()?).map_err(|_| {
+                CliError::io("the canonical attestation is not utf-8 (it should be)")
+            })?;
+            print!("{text}");
+            if many {
+                println!();
+            }
+        }
     } else {
-        print!("{}", outcome.to_text());
-        if !outcome.executed {
-            // What the plan had to assume, repeated here rather than only in the
-            // attestation's annotations.
-            for assumption in &outcome.job.assumptions {
-                println!("assumed    {assumption}");
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if many {
+                if index > 0 {
+                    println!();
+                }
+                println!(
+                    "run {} of {} — {}",
+                    index + 1,
+                    outcomes.len(),
+                    outcome.label()
+                );
+            }
+            print!("{}", outcome.to_text());
+            if !outcome.executed {
+                // What the plan had to assume, repeated here rather than only in the
+                // attestation's annotations.
+                for assumption in &outcome.job.assumptions {
+                    println!("assumed    {assumption}");
+                }
             }
         }
     }
 
     if let Some(path) = &options.out {
-        write_attestation(path, &outcome.manifest, options.force)?;
-        println!("wrote        {}", path.display());
+        if many {
+            write_attestations(path, &outcomes, options.force)?;
+        } else {
+            write_attestation(path, &outcomes[0].manifest, options.force)?;
+            println!("wrote        {}", path.display());
+        }
     }
     Ok(())
 }
@@ -546,7 +881,9 @@ fn select_job(plan: &Plan) -> Result<&PlannedJob, CliError> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            "name the job (`gitiup run <job>`) and pin one matrix arm (`--matrix k=v`)",
+            "name the job (`gitiup run --job <id>`, or `gitiup run <job>`) and pin one \
+             matrix arm (`--matrix k=v`) — or ask for all of them with `--all-jobs`, \
+             which writes one attestation per run",
         )),
     }
 }
@@ -827,6 +1164,130 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn a_job_can_be_named_with_the_flag_the_rest_of_the_tool_advertises() {
+        // `--job <id>` is the spelling ADR-0003 D9, `gitiup change new --job`, and this
+        // command's own refusals all use, so it has to be the one the parser takes.
+        for args in [vec!["--job", "build"], vec!["--job=build"], vec!["build"]] {
+            let options = Options::parse(&strings(&args)).unwrap();
+            assert_eq!(
+                options.named_jobs().unwrap(),
+                vec!["build".to_string()],
+                "{args:?}"
+            );
+        }
+
+        // Saying the same job twice is a stutter, not two requests.
+        let options = Options::parse(&strings(&["--job", "build", "--job", "build"])).unwrap();
+        assert_eq!(options.named_jobs().unwrap(), vec!["build".to_string()]);
+    }
+
+    #[test]
+    fn several_jobs_are_asked_for_by_name_and_keep_their_order() {
+        let options = Options::parse(&strings(&["--job", "deploy", "--job", "build"])).unwrap();
+        assert_eq!(
+            options.named_jobs().unwrap(),
+            vec!["deploy".to_string(), "build".to_string()]
+        );
+    }
+
+    #[test]
+    fn one_job_two_spellings_is_one_job_and_two_spellings_naming_two_is_two() {
+        let options = Options::parse(&strings(&["build", "--job", "build"])).unwrap();
+        assert_eq!(
+            options.named_jobs().unwrap(),
+            vec!["build".to_string()],
+            "the same job said twice is one run"
+        );
+
+        // A bare word and a `--job` that differ ask for both, in the order they were
+        // written: both readings of the command line say the same thing.
+        let options = Options::parse(&strings(&["build", "--job", "deploy"])).unwrap();
+        assert_eq!(
+            options.named_jobs().unwrap(),
+            vec!["build".to_string(), "deploy".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_job_or_some_jobs_is_asked_for_and_not_both() {
+        let error = Options::parse(&strings(&["--all-jobs", "--job", "build"]))
+            .unwrap()
+            .named_jobs()
+            .unwrap_err();
+        assert_eq!(error.code, 2, "{}", error.message);
+        assert!(error.message.contains("--all-jobs"), "{}", error.message);
+
+        let options = Options::parse(&strings(&["--all-jobs"])).unwrap();
+        assert!(options.all_jobs);
+        assert!(options.named_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_help_lists_every_flag_the_parser_accepts() {
+        for flag in [
+            "--workflow",
+            "--job",
+            "--all-jobs",
+            "--matrix",
+            "--event",
+            "--input",
+            "--commit",
+            "--run-id",
+            "--secret",
+            "--replay-from",
+            "--execute",
+            "--sandbox",
+            "--sandboxes",
+            "--workdir",
+            "--policy",
+            "--json",
+            "--out",
+            "--force",
+        ] {
+            assert!(HELP.contains(flag), "{flag} is accepted but not documented");
+        }
+        // And the thing that made this command worth writing: the default is the safe
+        // one, and the help says so where a reader will hit it first.
+        assert!(HELP.contains("THE DEFAULT SIMULATES"));
+    }
+
+    #[test]
+    fn a_directory_of_attestations_names_each_file_after_its_run() {
+        let workflow = Workflow::parse(
+            "ci.yml",
+            "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        os: [linux, macos]\n    steps:\n      - run: make\n",
+        )
+        .unwrap();
+        let plan = Plan::build(&workflow, &Selector::default()).unwrap();
+        let mut taken = BTreeSet::new();
+        let names: Vec<String> = plan
+            .jobs
+            .iter()
+            .map(|job| manifest_file_name(job, &mut taken))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "build+os=linux.json".to_string(),
+                "build+os=macos.json".to_string()
+            ],
+            "one file per run, named so a rerun lands on the same name"
+        );
+    }
+
+    #[test]
+    fn a_file_name_is_a_file_name_whatever_a_job_is_called() {
+        assert_eq!(file_safe("build"), "build");
+        assert_eq!(file_safe("a/b c"), "a-b-c");
+        assert_eq!(file_safe("../../etc/passwd"), "..-..-etc-passwd");
+        assert_eq!(file_safe("///"), "run");
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
     }
 
     #[test]

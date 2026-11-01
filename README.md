@@ -247,6 +247,13 @@ attestation that says `tier: simulated` — and only runs the steps when given
 `--execute` inside a sandbox it could probe. See
 [provenance tiers](docs/provenance-tiers.md) for what each tier licenses you to believe.
 
+A workflow with more than one job is not a special case: name the job with
+`--job <id>` (or as a bare word), repeat `--job` to take several, or say `--all-jobs`
+for every run the workflow would produce — every job and every matrix arm. One
+attestation is one result, so several runs are several attestations: `--json` prints
+one canonical manifest per line, `--out` names a directory to write them in, and each
+run's manifest is byte-for-byte what running that job on its own produces.
+
 `gitiup digest` prints the `RunDigest` and `ResultDigest` of a run report — the same
 two numbers a third party recomputes from the signed attestation, from the same
 function. `--expect` makes "did this rerun converge?" a single command that exits 8

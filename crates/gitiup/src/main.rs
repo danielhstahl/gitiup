@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! gitiup run [OPTIONS] [JOB]            plan a workflow job (nothing is run)
+//! gitiup run --job <id> / --all-jobs   name the jobs to plan; several jobs are several
+//!                                      attestations, never one about two runs
 //! gitiup run --execute --sandbox <name> run it for real, and attest as `local`
 //! gitiup env [OPTIONS]                  this machine's environment fingerprint, and
 //!                                      whether a policy would accept it
@@ -118,6 +120,8 @@ USAGE:
 
 COMMANDS:
     run [OPTIONS] [JOB]            plan a workflow job; --execute to run it
+                                   (--job <id> / --all-jobs when the workflow has more
+                                   than one job: one attestation per run)
     env [OPTIONS]                  this machine's environment fingerprint, and whether
                                    a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides

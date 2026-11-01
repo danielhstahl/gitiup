@@ -95,6 +95,24 @@ jobs:
       - run: ./deploy.sh
 ";
 
+/// Several jobs, and one of them is a matrix: the shape that used to have no answer.
+const MANY_JOBS: &str = "\
+on:
+  push
+jobs:
+  lint:
+    steps:
+      - name: Lint
+        run: echo lint
+  test:
+    strategy:
+      matrix:
+        os: [linux, macos]
+    steps:
+      - name: Test
+        run: echo testing ${{ matrix.os }}
+";
+
 /// A workspace with one workflow file and a `.git` that knows its HEAD.
 fn workspace(workflow: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -692,4 +710,271 @@ fn a_job_needing_a_service_container_is_not_run_and_says_why() {
         &[],
     );
     assert_eq!(code(&output), 6, "{}", out_text(&output));
+}
+
+// -------------------------------------------------------------------------------------
+// A workflow with several jobs: the ticket.
+//
+// `--job <id>` is the spelling this command's own refusals, `gitiup change new --job`
+// and ADR-0003 D9 all use, so it has to be the spelling the parser takes. And naming
+// more than one job — or `--all-jobs` — has to produce one attestation per run, which
+// is the only shape that keeps "one attestation is one result" true.
+
+/// The canonical manifests `--json` printed, one per line when several runs ran.
+fn manifests(output: &Output) -> Vec<serde_json::Value> {
+    out_text(output)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|why| panic!("every --json line must be one manifest: {why}"))
+        })
+        .collect()
+}
+
+#[test]
+fn job_can_be_named_with_the_flag_every_other_command_advertises() {
+    let dir = workspace(TWO_JOBS);
+    let flagged = gitiup(dir.path(), &["run", "--job", "deploy"], &[]);
+    assert_eq!(code(&flagged), 0, "{}", err_text(&flagged));
+    assert!(
+        out_text(&flagged).contains("deploy.sh"),
+        "{}",
+        out_text(&flagged)
+    );
+
+    // The bare word and the flag are one request in two spellings: same bytes.
+    let bare = gitiup(dir.path(), &["run", "deploy"], &[]);
+    assert_eq!(out_text(&flagged), out_text(&bare));
+
+    // The inline form too, and a job that is not there is a refusal, not a guess.
+    let inline = gitiup(dir.path(), &["run", "--job=deploy"], &[]);
+    assert_eq!(code(&inline), 0, "{}", err_text(&inline));
+    assert_eq!(out_text(&inline), out_text(&bare));
+
+    let output = gitiup(dir.path(), &["run", "--job", "nope"], &[]);
+    assert_eq!(code(&output), 6);
+    assert!(err_text(&output).contains("nope"), "{}", err_text(&output));
+}
+
+#[test]
+fn naming_two_jobs_runs_two_jobs_and_writes_two_attestations() {
+    let dir = workspace(TWO_JOBS);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--job", "build", "--job", "deploy"],
+        &[],
+    );
+    assert_eq!(code(&output), 0, "{}", err_text(&output));
+    let stdout = out_text(&output);
+    // Both jobs, in the order asked, each with its own digests.
+    assert!(stdout.contains("run 1 of 2 — build"), "{stdout}");
+    assert!(stdout.contains("run 2 of 2 — deploy"), "{stdout}");
+    assert!(
+        stdout.contains("cargo build") && stdout.contains("deploy.sh"),
+        "{stdout}"
+    );
+    // And the reader was told, before anything ran, that this is several attestations.
+    assert!(
+        err_text(&output).contains("2 runs, so 2 attestations"),
+        "{}",
+        err_text(&output)
+    );
+
+    let json = gitiup(
+        dir.path(),
+        &["run", "--job", "build", "--job", "deploy", "--json"],
+        &[],
+    );
+    assert_eq!(code(&json), 0, "{}", err_text(&json));
+    let docs = manifests(&json);
+    assert_eq!(docs.len(), 2, "one manifest per run, not one for the pair");
+    assert_eq!(docs[0]["result"]["source"]["job"], "build");
+    assert_eq!(docs[1]["result"]["source"]["job"], "deploy");
+    assert_ne!(docs[0]["claims"]["run_id"], docs[1]["claims"]["run_id"]);
+    // Each line is exactly the bytes whose digest names it — no wrapper to undo.
+    let line = out_text(&json)
+        .lines()
+        .next()
+        .expect("two lines")
+        .to_string();
+    assert_eq!(docs[0]["claims"]["run_id"].as_str().unwrap().len(), 16);
+    assert!(
+        !line.contains('\n') && line.starts_with('{'),
+        "one canonical manifest per line"
+    );
+
+    // A directory, one manifest per run, each the file `gitiup attest push` reads.
+    std::fs::write(dir.path().join("plans.json"), "{\"allow_simulated\":true}").unwrap();
+    let output = gitiup(
+        dir.path(),
+        &[
+            "run",
+            "--job",
+            "build",
+            "--job",
+            "deploy",
+            "--policy",
+            "plans.json",
+            "--out",
+            "attestations",
+        ],
+        &[],
+    );
+    assert_eq!(code(&output), 0, "{}", err_text(&output));
+    assert_eq!(
+        listing(&dir.path().join("attestations")).len(),
+        2,
+        "one file per run"
+    );
+    let written: Vec<String> = std::fs::read_dir(dir.path().join("attestations"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(written.contains(&"build.json".to_string()), "{written:?}");
+    assert!(written.contains(&"deploy.json".to_string()), "{written:?}");
+    let one: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("attestations/deploy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(one["result"]["source"]["job"], "deploy");
+
+    // The gate is still the gate for every one of them: a kept set of plans is refused
+    // by the default policy, and nothing lands in the directory.
+    let output = gitiup(
+        dir.path(),
+        &["run", "--job", "build", "--job", "deploy", "--out", "kept"],
+        &[],
+    );
+    assert_eq!(code(&output), 6, "{}", out_text(&output));
+    assert!(!dir.path().join("kept").exists(), "the gate ran first");
+
+    // Several attestations do not fit in one file, and say so.
+    let output = gitiup(
+        dir.path(),
+        &[
+            "run",
+            "--job",
+            "build",
+            "--job",
+            "deploy",
+            "--policy",
+            "plans.json",
+            "--out",
+            "plans.json",
+        ],
+        &[],
+    );
+    assert_eq!(code(&output), 6, "{}", out_text(&output));
+    assert!(
+        err_text(&output).contains("directory"),
+        "{}",
+        err_text(&output)
+    );
+}
+
+#[test]
+fn every_job_of_a_workflow_runs_at_once_and_each_matrix_arm_is_its_own_run() {
+    let dir = workspace(MANY_JOBS);
+    let output = gitiup(dir.path(), &["run", "--all-jobs"], &[]);
+    assert_eq!(code(&output), 0, "{}", err_text(&output));
+    let stdout = out_text(&output);
+    assert!(stdout.contains("run 1 of 3 — lint"), "{stdout}");
+    assert!(stdout.contains("run 2 of 3 — test [os=linux]"), "{stdout}");
+    assert!(stdout.contains("run 3 of 3 — test [os=macos]"), "{stdout}");
+
+    let json = gitiup(dir.path(), &["run", "--all-jobs", "--json"], &[]);
+    let docs = manifests(&json);
+    assert_eq!(docs.len(), 3);
+    assert_eq!(docs[0]["result"]["source"]["job"], "lint");
+    assert_eq!(docs[1]["result"]["source"]["job"], "test");
+    assert_eq!(docs[1]["result"]["source"]["matrix"]["os"], "linux");
+    assert_eq!(docs[2]["result"]["source"]["matrix"]["os"], "macos");
+
+    // The property that makes this safe to script: a run of `--all-jobs` is byte for
+    // byte the same run somebody pinned by hand.
+    let pinned = gitiup(
+        dir.path(),
+        &["run", "--job", "test", "--matrix", "os=macos", "--json"],
+        &[],
+    );
+    assert_eq!(code(&pinned), 0, "{}", err_text(&pinned));
+    assert_eq!(
+        out_text(&pinned).trim_end(),
+        out_text(&json).lines().nth(2).unwrap()
+    );
+}
+
+#[test]
+fn a_workflow_of_several_jobs_says_how_to_name_one_and_still_refuses_to_guess() {
+    let dir = workspace(MANY_JOBS);
+    let output = gitiup(dir.path(), &["run"], &[]);
+    assert_eq!(code(&output), 6, "{}", out_text(&output));
+    let stderr = err_text(&output);
+    for spelling in ["--job", "--all-jobs"] {
+        assert!(stderr.contains(spelling), "{spelling}: {stderr}");
+    }
+
+    // Naming one job of a matrix still pins one arm: widening a job the user named
+    // into six runs is not what "run the test job" said.
+    let output = gitiup(dir.path(), &["run", "--job", "test"], &[]);
+    assert_eq!(code(&output), 6, "{}", out_text(&output));
+    let stderr = err_text(&output);
+    assert!(stderr.contains("--matrix"), "{stderr}");
+    assert!(stderr.contains("--all-jobs"), "{stderr}");
+    assert!(
+        stderr.contains("linux") && stderr.contains("macos"),
+        "{stderr}"
+    );
+
+    // And a name that is not a job is a refusal whichever spelling it arrives in.
+    let output = gitiup(dir.path(), &["run", "--all-jobs", "--job", "lint"], &[]);
+    assert_eq!(code(&output), 2, "{}", out_text(&output));
+    assert!(
+        err_text(&output).contains("--all-jobs"),
+        "{}",
+        err_text(&output)
+    );
+}
+
+#[test]
+fn executing_several_jobs_runs_every_one_of_them_in_the_same_sandbox() {
+    let dir = workspace(MANY_JOBS);
+    let before = listing(dir.path());
+    // The same tolerant contract as the single-job execute test: either this machine
+    // can sandbox and every run says it ran, or it says it cannot. Claiming `local`
+    // without running is the only wrong answer.
+    let output = gitiup(
+        dir.path(),
+        &["run", "--all-jobs", "--execute"],
+        &[("GITIUP_ENV_PROBE", "off")],
+    );
+    match code(&output) {
+        0 => {
+            let stdout = out_text(&output);
+            assert!(stdout.contains("ran job lint"), "{stdout}");
+            assert!(stdout.contains("ran job test [os=linux]"), "{stdout}");
+            assert!(stdout.contains("ran job test [os=macos]"), "{stdout}");
+            assert_eq!(
+                stdout
+                    .lines()
+                    .filter(|line| line.starts_with("tier           local"))
+                    .count(),
+                3,
+                "three runs, three local attestations: {stdout}"
+            );
+        }
+        6 => assert!(
+            err_text(&output).contains("sandbox"),
+            "{}",
+            err_text(&output)
+        ),
+        other => panic!("unexpected exit {other}: {}", out_text(&output)),
+    }
+    assert_eq!(
+        listing(dir.path()),
+        before,
+        "running writes nothing unasked"
+    );
 }
