@@ -24,6 +24,17 @@
 //! The shape, in one sketch: `Workflow::parse` → `Plan::build` → `sandbox::open` →
 //! `exec::execute` → [`manifest_for`](crate::manifest_for), which is where the tier and
 //! the sandbox names land in the bytes that get signed.
+//!
+//! # Reading a failure
+//!
+//! An attestation carries the *digest* of each step's output, never the text, so the
+//! moment a step fails the text is in exactly one place: this process's memory. That is
+//! why the reading helpers live here, next to the code that observed the exit code, and
+//! not in the CLI: [`diagnose`] turns an exit code and the step's own words into a
+//! sentence a person can act on ("`cargo` is not on this step's PATH", "killed by
+//! SIGKILL", "the sandbox refused that write"), and [`excerpt`] cuts a stream to the
+//! tail that is worth printing. A volunteer running a stranger's job — `gitiup work` —
+//! has the same problem and gets the same answer.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -221,8 +232,24 @@ pub fn execute(
             })?;
         let duration_us = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
         let exit_code = output.status.code().unwrap_or(-1) as i64;
+        // A process killed by a signal reports no exit code at all, and the report can
+        // only carry a number, so the number this run records (-1) says "no code" and
+        // nothing more. The signal itself goes into the annotations: the difference
+        // between SIGKILL from the OOM killer and SIGSEGV in the program is the whole
+        // story of a crash, and it belongs with the evidence rather than only on a
+        // terminal nobody was watching.
+        if output.status.code().is_none() {
+            notes.push(match signal_of(&output.status) {
+                Some(signal) => format!(
+                    "step {}: killed by signal {signal} ({}) rather than exiting",
+                    step.name,
+                    signal_name(signal)
+                ),
+                None => format!("step {}: the process could not be waited for", step.name),
+            });
+        }
         let stdout = clamp(captee(&output.stdout));
-        let stderr = captee(&output.stderr);
+        let stderr = clamp(captee(&output.stderr));
         if stdout.truncated || stderr.truncated {
             notes.push(format!(
                 "step {}: output beyond {MAX_LOG_BYTES} bytes was dropped before hashing",
@@ -536,4 +563,326 @@ fn render(value: &InputValue) -> String {
         InputValue::Int(number) => number.to_string(),
         InputValue::Bool(flag) => flag.to_string(),
     }
+}
+// -------------------------------------------------------------- reading ---
+
+/// The most of one step's stream worth putting in front of a human.
+///
+/// The digest covers everything up to [`MAX_LOG_BYTES`]; this limit is only about not
+/// burying the reason for a failure under a megabyte of progress bars, so it is much
+/// smaller than what is hashed — and it cuts from the front, because what killed a
+/// build is at the end.
+pub const MAX_DISPLAY_BYTES: usize = 64 << 10;
+
+/// The same limit in lines, for a stream made of many short ones.
+pub const MAX_DISPLAY_LINES: usize = 200;
+
+/// Why a step failed, as far as its exit code and its own words can say.
+///
+/// Deliberately narrow: this is what a process's death rattle means, not a theory about
+/// the caller's code. [`Diagnosis::hint`] is `None` whenever the honest answer is "the
+/// log says", because a guess about somebody else's tests is noise that teaches people
+/// to skip the line that actually mattered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnosis {
+    /// The exit code read as a sentence: "`cargo` was not found by the step's shell".
+    pub cause: String,
+    /// What to do about it, when there is something honest to do.
+    pub hint: Option<String>,
+}
+
+impl std::fmt::Display for Diagnosis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if let Some(hint) = &self.hint {
+            write!(f, " — {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The PATH a step really sees, so a hint can be checked against [`step_environment`]
+/// instead of remembered.
+const STEP_PATH: &str = "/usr/bin:/bin:/usr/local/bin";
+
+/// The strings that mean "the network was the problem", lower-cased.
+const NETWORK_FAILURES: &[&str] = &[
+    "network is unreachable",
+    "connection refused",
+    "connection timed out",
+    "no route to host",
+    "could not resolve host",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "couldn't connect to server",
+    "failed to fetch",
+];
+
+/// Read one step's failure.
+///
+/// `exit_code` is the observed code ([`execute`] records `-1` when the process was
+/// killed without reporting one) and `stderr` the step's own error stream, which is
+/// where a shell says *why* it exited 127 rather than merely *that* it did.
+///
+/// `None` means "the exit code is the program's own verdict and nothing here can
+/// improve on it" — the common case, and the case where the log text is the whole
+/// answer.
+pub fn diagnose(exit_code: i64, stderr: &str) -> Option<Diagnosis> {
+    // Killed rather than exited. A shell reports 128 + signal, and reports nothing at
+    // all when the signal took the reporting shell itself.
+    if exit_code < 0 {
+        return Some(Diagnosis {
+            cause: "the step's process was killed rather than exiting, so it reported no \
+                    exit code at all"
+                .to_string(),
+            hint: Some(
+                "the run's annotations name the signal: SIGKILL is the machine's own \
+                 out-of-memory killer or a `timeout -s KILL`, SIGSEGV is the program's own \
+                 bug, and SIGXCPU is the sandbox's cpu limit. The sandbox bounds address \
+                 space, cpu seconds, processes and file size — `gitiup doctor --sandbox` \
+                 prints the limits in force here"
+                    .to_string(),
+            ),
+        });
+    }
+    if exit_code > 128 {
+        let signal = exit_code - 128;
+        let hint = match signal {
+            9 => Some(
+                "SIGKILL is not a program deciding to stop: the usual sources are the \
+                 machine's out-of-memory killer and a `timeout -s KILL`. The sandbox also \
+                 bounds address space, cpu seconds, processes and file size — `gitiup \
+                 doctor --sandbox` prints the limits in force here",
+            ),
+            11 => Some(
+                "a segmentation fault: the step's own program, or a native library it \
+                 loaded, walked off its memory",
+            ),
+            6 => Some("an abort: usually a failed assertion inside the program itself"),
+            31 => Some(
+                "SIGSYS is what a seccomp filter hands back. This ladder refuses ptrace, \
+                 mount, unshare, setns, module loading and installing a filter of your \
+                 own; a step that needs one of those has to run somewhere that allows it",
+            ),
+            24 => Some("the cpu-seconds limit was reached, which is a hang rather than a crash"),
+            13 => Some(
+                "SIGPIPE: the program was writing into a pipe that had already closed — \
+                 look at whatever stood on the other end of it",
+            ),
+            _ => None,
+        };
+        return Some(Diagnosis {
+            cause: format!(
+                "killed by signal {signal} ({}) instead of exiting",
+                signal_name(signal)
+            ),
+            hint: hint.map(str::to_string),
+        });
+    }
+
+    // The shell's own two refusals: it could not find the program, or could not run it.
+    if let Some(program) = missing_program(stderr) {
+        if exit_code == 126 {
+            return Some(Diagnosis {
+                cause: format!("`{program}` was found but would not run (exit 126)"),
+                hint: Some(
+                    "exit 126 is the execute bit or a `#!` interpreter that is not there, \
+                     not a missing file: check the mode bits, then the script's first line"
+                        .to_string(),
+                ),
+            });
+        }
+        let hint = if program.contains('/') {
+            "the step named a path that is not there; a step starts in the checkout \
+             (`--workdir` moves it), so a script that lives somewhere else needs its path \
+             to say so"
+                .to_string()
+        } else {
+            format!(
+                "a step's PATH is {STEP_PATH} and nothing else unless the workflow says \
+                 otherwise with `env: PATH:` — install the tool, or name the directory it \
+                 lives in on the job or the step"
+            )
+        };
+        return Some(Diagnosis {
+            cause: format!("`{program}` was not found by the step's shell (exit {exit_code})"),
+            hint: Some(hint),
+        });
+    }
+
+    // What the sandbox refused, as opposed to what the program decided. These are the
+    // failures that read like a broken build and are really the confinement working.
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("read-only file system") {
+        return Some(Diagnosis {
+            cause: format!(
+                "a write was refused because the filesystem is read-only here (exit {exit_code})"
+            ),
+            hint: Some(
+                "a confined step may write to the checkout and to the run's scratch \
+                 directory and nowhere else; write there, or move the checkout with \
+                 --workdir — `gitiup doctor --sandbox` prints what the backend denies"
+                    .to_string(),
+            ),
+        });
+    }
+    if lower.contains("operation not permitted") {
+        return Some(Diagnosis {
+            cause: format!("the step attempted something this sandbox refuses (exit {exit_code})"),
+            hint: Some(
+                "both Landlock and seccomp answer EPERM: writes outside the checkout and \
+                 the scratch, ptrace, mount/unshare/setns and module loading are refused \
+                 by design here. `gitiup doctor --sandbox` says which layer is active, and \
+                 `--sandbox plain` — opt-in, for code you wrote — confines nothing"
+                    .to_string(),
+            ),
+        });
+    }
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        return Some(Diagnosis {
+            cause: format!("a file could not be opened the way the step asked (exit {exit_code})"),
+            hint: Some(
+                "two things say this and they look identical: the step's own rights (it \
+                 runs as this user, with this user's mode bits) and the sandbox's deny \
+                 list, which allows writes to the checkout and to the run's scratch \
+                 directory only. Check the path first, then the bits; `gitiup doctor \
+                 --sandbox` names the layer that is active"
+                    .to_string(),
+            ),
+        });
+    }
+    if NETWORK_FAILURES.iter().any(|needle| lower.contains(needle)) {
+        return Some(Diagnosis {
+            cause: format!("the step could not reach the network (exit {exit_code})"),
+            hint: Some(
+                "egress is deny-all in every backend this build offers and there is no \
+                 allowlist flag yet: a step that fetches has to be handed its inputs some \
+                 other way (docs/sandbox.md covers egress)"
+                    .to_string(),
+            ),
+        });
+    }
+    if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+        return Some(Diagnosis {
+            cause: format!("the disk filled up (exit {exit_code})"),
+            hint: Some(
+                "one step's log is capped at {MAX_LOG_BYTES} bytes before hashing, so a \
+                 full disk is the build's own output rather than its transcript; the \
+                 scratch directory this run wrote its scripts into lives in the temp \
+                 directory"
+                    .to_string(),
+            ),
+        });
+    }
+    if stderr.trim().is_empty() {
+        return Some(Diagnosis {
+            cause: format!("the step exited {exit_code} and wrote nothing to either stream"),
+            hint: Some(
+                "a program that dies without a word usually died in a start-up check of \
+                 its own; run the step's script by hand to see what it prints when \
+                 nothing is capturing it"
+                    .to_string(),
+            ),
+        });
+    }
+    None
+}
+
+/// The program a shell complained about, if it complained about one.
+///
+/// `sh` says `sh: 1: cargo: not found`, `bash` says `bash: line 1: cargo: command not
+/// found`, and both say `No such file or directory` about a path that is not there. In
+/// all three the name is the field before the last `:`.
+fn missing_program(stderr: &str) -> Option<String> {
+    for line in stderr.lines() {
+        let line = line.trim();
+        let lower = line.to_ascii_lowercase();
+        let complaint = lower.ends_with(": not found")
+            || lower.ends_with("command not found")
+            || lower.ends_with("no such file or directory");
+        if !complaint {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let name = fields[fields.len() - 2].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// The name of a signal a shell's `128 + n` answer can produce, for the ones it does.
+fn signal_name(signal: i64) -> &'static str {
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        31 => "SIGSYS",
+        _ => "an unnamed signal",
+    }
+}
+
+/// The tail of a captured stream, with the cut said out loud.
+///
+/// The digest covers the whole stream, so dropping the head here costs nobody anything
+/// they could be asked to verify — but the printout has to say the drop happened, or a
+/// reader assumes they saw the beginning.
+pub fn excerpt(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut start = lines.len();
+    let mut bytes = 0usize;
+    while start > 0 {
+        let line = lines[start - 1];
+        let cost = line.chars().count() + 1;
+        let kept = lines.len() - start;
+        if kept > 0 && (bytes + cost > MAX_DISPLAY_BYTES || kept >= MAX_DISPLAY_LINES) {
+            break;
+        }
+        bytes += cost;
+        start -= 1;
+    }
+    let kept = lines[start..].join("\n");
+    if start == 0 {
+        return format!("{kept}\n");
+    }
+    let dropped_bytes: usize = lines[..start]
+        .iter()
+        .map(|line| line.chars().count() + 1)
+        .sum();
+    format!(
+        "… {} earlier lines ({} bytes) are not printed here; the digest covers the whole \
+         stream\n{kept}\n",
+        start, dropped_bytes
+    )
+}
+
+/// The signal a process was killed by, when a signal killed it.
+///
+/// Unix-only, which is the whole platform set of this crate: the same code path runs on
+/// Linux and on macOS, where `wait(2)` reports the same fact.
+fn signal_of(status: &std::process::ExitStatus) -> Option<i64> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| signal as i64)
 }

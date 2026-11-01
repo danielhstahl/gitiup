@@ -360,6 +360,20 @@ it is not an `8`; the token beside it (`attempt_cap_exhausted`) is the machine-r
 See [docs/quorum.md](../quorum.md) and
 [`gitiup_quorum::escalate`](../../crates/gitiup-quorum/src/escalate.rs).
 
+**Amendment (giti-bh2, a step that failed).** Exit **10** is outside this table too, and for
+the same reason in a different direction: the codes above are verdicts about a *document*,
+and `gitiup run --execute`'s 10 is a fact about a *run*. The run happened, every step
+reported, the manifest is canonical and re-hashes to what it printed — so it is not a 6
+(nothing was refused; the failure is part of what the attestation honestly records and is
+still worth filing, because a quorum agrees on what happened rather than on green ticks)
+and not an 8 (nothing about a digest is wrong). It is not a 0 either, because the caller
+that decides what to do next must not have to read prose to learn the tests failed. What
+the run produced as its reason is the step's own output, printed by the command: this
+format carries the digest of each stream and never the text (D4), so the terminal is the
+only copy of a failed step's log that will ever exist. See
+[`gitiup_run::diagnose`](../../crates/gitiup-run/src/exec.rs) and
+[the quickstart](../quickstart.md#6b-when-a-step-fails).
+
 Limits are part of the format, because a volunteer parses strangers' claims (C7):
 1 MiB per canonical document, 32 containers of nesting, 4096 entries per list/map,
 4096 steps, 16 KiB per string, 64 signatures per document. Unknown fields are refused

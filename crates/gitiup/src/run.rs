@@ -28,24 +28,40 @@
 //! attestation about two runs, so a command that selects more than one run *prints or
 //! writes more than one attestation* — one canonical manifest per run.
 //!
+//! # When a step fails
+//!
+//! An attestation carries the **digest** of each step's stdout and stderr and never the
+//! text, so the instant a step fails its log exists in exactly one place: this
+//! terminal. So `--execute` says what it saw, at the moment it saw it — the failing
+//! step's streams by default (the `--logs` flag moves that line), a reading
+//! of the exit code where one has a reading ([`gitiup_run::diagnose`]), and a
+//! `checked / re-hashed / sandbox / logs` block saying what this command checked about
+//! its own bookkeeping before it handed the bytes over.
+//!
+//! A failed step also ends the command with **exit 10**. That is not a `6`: nothing was
+//! refused, the run happened, and the attestation says so honestly. It is not a `0`
+//! either, because "the tests failed" and "the tests passed" must not be the same
+//! number to the caller that decides what to do next.
+//!
 //! # Exit codes
 //!
 //! The same taxonomy as `gitiup digest` (ADR-0001 D7), so a merge gate branches on
 //! one set of numbers: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, or an
-//! ambiguous selection) · 8 mismatch.
+//! ambiguous selection) · 8 mismatch · 10 a step in the run failed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use gitiup_attest::run::{RunReport, WorkflowSource};
+use gitiup_attest::run::{Material, RunReport, WorkflowSource};
 use gitiup_attest::{
     Digest, EnvironmentRequirement, ErrorKind, GitOid, InputValue, POLICY_PATH_ENV, Policy,
-    PolicyFile, RunManifest, Tier, TimeUs,
+    PolicyFile, RunManifest, StepOutcome, Tier, TimeUs,
 };
 use gitiup_run::sandbox;
 use gitiup_run::{
-    Execution, MAX_MATRIX_ARMS, Plan, PlannedJob, Replay, Selector, Simulation, Workflow,
+    Execution, MAX_MATRIX_ARMS, Plan, PlannedJob, Replay, Selector, Simulation, Workflow, diagnose,
+    excerpt,
 };
 
 use crate::CliError;
@@ -86,6 +102,13 @@ OPTIONS:
                             used and named, otherwise this is required. `none` is
                             refused: an unconfined run earns no tier
         --sandboxes         list the sandboxes this build offers, then exit
+        --logs <when>       how much of a step's captured output to print (--execute
+                            only): `failed` is the default and prints the streams of
+                            the step that failed, `all` prints every step's, `none`
+                            prints neither. The attestation stores the DIGEST of each
+                            stream and not the text, so whatever this prints is the
+                            only copy of that log that will ever exist — scrollback and
+                            redirection are how you keep it
         --workdir <path>    directory to run in (default: the current one)
         --policy <path>     gate the attestation against a policy file (default:
                             $GITIUP_POLICY, then the built-in policy, which allows
@@ -115,8 +138,12 @@ More than one run is more than one attestation: with several runs selected, --js
 prints one canonical manifest per line and --out must name a DIRECTORY, which gets
 one manifest per run, named after the job and its matrix arm.
 
+When a step fails, its stdout and stderr are printed here (the attestation carries
+their digests, never their text) together with what the exit code means, and the
+command exits 10 — the run happened and is attestable, but the step said no.
+
 Exit codes: 0 ok · 2 usage · 3 I/O · 6 refused (tier, sandbox, ambiguous job) ·
-8 mismatch
+8 mismatch · 10 a step in the run failed
 ";
 
 /// What the user asked for, once the flags are sorted out.
@@ -139,6 +166,8 @@ struct Options {
     execute: bool,
     sandbox: Option<String>,
     list_sandboxes: bool,
+    /// How much step output to print; see [`LogMode`].
+    logs: Option<String>,
     workdir: Option<PathBuf>,
     policy: Option<String>,
     json: bool,
@@ -193,6 +222,7 @@ impl Options {
                 "--execute" => options.execute = true,
                 "--sandbox" => options.sandbox = Some(value()?),
                 "--sandboxes" => options.list_sandboxes = true,
+                "--logs" => options.logs = Some(value()?),
                 "--workdir" => options.workdir = Some(PathBuf::from(value()?)),
                 "--policy" => options.policy = Some(value()?),
                 "--json" => options.json = true,
@@ -249,6 +279,44 @@ impl Options {
         }
         Ok(named)
     }
+
+    /// The `--logs` answer, or a usage error naming the three things it accepts.
+    fn log_mode(&self) -> Result<LogMode, CliError> {
+        match self.logs.as_deref() {
+            None => Ok(LogMode::default()),
+            Some(text) => LogMode::parse(text),
+        }
+    }
+}
+
+/// How much of a step's captured output this command puts in front of the user.
+///
+/// The default is `failed` rather than `all` for one reason: a green run has nothing to
+/// read, and a wall of routine output is what makes people stop reading the output of a
+/// command that failed. `all` is there for the step that only misbehaves in context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LogMode {
+    /// The streams of the step that failed, and nothing else.
+    #[default]
+    Failed,
+    /// Every step's streams, in the order they ran.
+    All,
+    /// Nothing: the exit codes and the digests only.
+    None,
+}
+
+impl LogMode {
+    fn parse(text: &str) -> Result<LogMode, CliError> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "failed" | "fail" | "failures" => Ok(LogMode::Failed),
+            "all" | "everything" | "every" => Ok(LogMode::All),
+            "none" | "nothing" | "off" => Ok(LogMode::None),
+            other => Err(CliError::usage(format!(
+                "`--logs {other}` is not a thing this command can print: --logs takes \
+                 `failed` (the default), `all` or `none`"
+            ))),
+        }
+    }
 }
 
 /// `--input`/`--matrix` values: `name=value`, with the same plain-scalar sense a
@@ -294,6 +362,10 @@ struct Outcome {
     plan: Plan,
     job: PlannedJob,
     manifest: RunManifest,
+    /// The report behind the manifest: the step text the manifest only carries a digest
+    /// of, and the timings the manifest does not carry at all. Kept because the terminal
+    /// is the one and only copy of that text.
+    report: RunReport,
     executed: bool,
     /// The two digests, computed once: `run` is the name of the attestation,
     /// `result` is what two verifiers compare.
@@ -311,6 +383,7 @@ impl Outcome {
             plan: run.plan.clone(),
             job: run.job.clone(),
             manifest,
+            report: report.clone(),
             executed,
             run_digest,
             result_digest,
@@ -359,13 +432,25 @@ impl Outcome {
                     .unwrap_or("?")
             );
             for (index, step) in self.manifest.result.steps.iter().enumerate() {
-                let _ = writeln!(
-                    out,
-                    "  {:>2}. {} — exit {}",
-                    index + 1,
-                    step.name,
-                    step.exit_code
-                );
+                // A skipped step must not read as a passing one: the report gives it
+                // exit code 0 because it never ran, and "exit 0" on a line a reader
+                // skims is a green tick that was never earned.
+                let verdict = match step.outcome {
+                    StepOutcome::Skipped => "skipped (an earlier step failed)".to_string(),
+                    StepOutcome::Failure => format!("exit {} · FAILED", step.exit_code),
+                    StepOutcome::Success => format!("exit {}", step.exit_code),
+                };
+                let _ = writeln!(out, "  {:>2}. {} — {verdict}", index + 1, step.name);
+            }
+            // The notes the run collected while it happened — an unexpanded `${{ … }}`, a
+            // stream truncated before hashing, a step killed by a signal instead of
+            // exiting. They are in the attestation's annotations; repeating them here is
+            // the difference between a reader seeing them and not.
+            if let Some(notes) = self.report.claims.annotations.get("x_run_notes") {
+                for note in notes.split(" · ") {
+                    out.push_str(&field("note", note));
+                    out.push('\n');
+                }
             }
         } else {
             out.push_str(&self.plan.describe());
@@ -392,6 +477,250 @@ impl Outcome {
         );
         out
     }
+
+    /// What this command checked about the run before handing the bytes over.
+    ///
+    /// This is *not* the verification a gate does — that is `gitiup verify attestation`,
+    /// with keys, a trust list and a policy in it. These are the producer's own sums:
+    /// that every step the plan named is in the report, that the bytes a stranger would
+    /// read are canonical and re-hash to both numbers printed above, that the sandbox
+    /// the attestation names is the backend that actually ran, and what was hashed in
+    /// place of the log text they cannot see. Anything failing here is a bug in this
+    /// build, and comes out as exit 8 rather than as a line nobody reads.
+    fn verification(&self, backend: Option<&str>) -> Result<Vec<String>, CliError> {
+        if !self.executed {
+            return Ok(Vec::new());
+        }
+        let planned: Vec<&str> = self
+            .job
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect();
+        let reported: Vec<&str> = self
+            .manifest
+            .result
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect();
+        if planned != reported {
+            return Err(CliError::new(
+                ErrorKind::DigestMismatch,
+                format!(
+                    "job `{}`: the plan named {} steps and the attestation reports {} ({:?} \
+                     against {:?})",
+                    self.label(),
+                    planned.len(),
+                    reported.len(),
+                    planned,
+                    reported
+                ),
+                Some(
+                    "a step went missing between the plan and the attestation: this run \
+                     proves less than it claims, so nothing here should be trusted",
+                ),
+            ));
+        }
+        let ran = self
+            .manifest
+            .result
+            .steps
+            .iter()
+            .filter(|step| step.outcome != StepOutcome::Skipped)
+            .count();
+        let failed = self
+            .manifest
+            .result
+            .steps
+            .iter()
+            .filter(|step| step.outcome == StepOutcome::Failure)
+            .count();
+        let skipped = reported.len() - ran;
+        let mut lines = vec![format!(
+            "checked      {} step{} planned, {} reported: {failed} failed, {skipped} \
+             skipped, and every step the plan named is in the attestation",
+            planned.len(),
+            if planned.len() == 1 { "" } else { "s" },
+            reported.len()
+        )];
+        // The check a stranger can repeat: canonical bytes, re-parsed, re-validated, and
+        // both digests recomputed from what the parse produced rather than from what
+        // this command still holds in memory.
+        let bytes = self.manifest.canonical_bytes()?;
+        let again = RunManifest::from_canonical_bytes(&bytes).map_err(|why| {
+            CliError::new(
+                ErrorKind::DigestMismatch,
+                format!("the attestation this run just wrote does not re-parse: {why}"),
+                Some(
+                    "this build wrote bytes it itself refuses; that is a bug, and the \
+                     attestation should not leave this machine",
+                ),
+            )
+        })?;
+        let run_digest = again.digest()?.to_string();
+        let result_digest = again.result_digest()?.to_string();
+        if run_digest != self.run_digest || result_digest != self.result_digest {
+            return Err(CliError::new(
+                ErrorKind::DigestMismatch,
+                format!(
+                    "the digests printed above are not what the manifest's own bytes give: \
+                     {run_digest} / {result_digest}"
+                ),
+                Some(
+                    "a bug in this build, not in the workflow: the numbers a stranger \
+                     recomputes would not match the ones handed to them",
+                ),
+            ));
+        }
+        lines.push(
+            "re-hashed    the manifest's own canonical bytes re-parse, pass the format's \
+             checks, and give back both digests above"
+                .to_string(),
+        );
+        if let Some(name) = backend {
+            lines.push(format!(
+                "sandbox      {name} was probed immediately before the first step and is the \
+                 name the attestation carries"
+            ));
+        }
+        lines.push(format!(
+            "logs         hashed as normalised text (v{}): the attestation carries the \
+             digest of each stream, so what was printed above is the only copy of it",
+            self.manifest.result.provenance.normalisation_version
+        ));
+        Ok(lines)
+    }
+
+    /// Everything this run says about its own streams, printed as it finished.
+    ///
+    /// The attestation a stranger keeps will contain the *digest* of these bytes and
+    /// never the bytes, so this printout is the only copy of the log that will ever
+    /// exist; the last line says so, because a person who was hoping to `attest show`
+    /// their way back to a failed step's stderr is going to be disappointed later.
+    ///
+    /// Failures are printed in `Failed` mode (the default) and in `All` mode; in `All`
+    /// mode every step's streams come out, which is the only way to see the step that
+    /// was fine but printed the warning three steps before the one that died.
+    fn output_report(&self, mode: LogMode) -> Vec<String> {
+        let mut lines = Vec::new();
+        let failures = self
+            .report
+            .steps
+            .iter()
+            .filter(|step| step.outcome == Some(StepOutcome::Failure))
+            .count();
+        if mode == LogMode::None {
+            if failures > 0 {
+                let noun = if failures == 1 { "step" } else { "steps" };
+                lines.push(field(
+                    "note",
+                    &format!(
+                        "--logs none: the output of the {failures} failing {noun} was not \
+                         printed, and the attestation stores only the digest of it. Drop \
+                         --logs (or pass --logs failed) to read the reason."
+                    ),
+                ));
+            }
+            return lines;
+        }
+        for (index, step) in self.report.steps.iter().enumerate() {
+            let number = index + 1;
+            let failed = step.outcome == Some(StepOutcome::Failure);
+            if !failed && mode == LogMode::Failed {
+                continue;
+            }
+            let stderr = Outcome::stream_text(&step.stderr).unwrap_or_default();
+            if failed {
+                lines.push(field(
+                    "FAILED",
+                    &format!(
+                        "job `{}` step {number} '{}' — exit {}",
+                        self.label(),
+                        step.name,
+                        step.exit_code
+                    ),
+                ));
+                if let Some(reading) = diagnose(step.exit_code, &stderr) {
+                    lines.push(field("why", &reading.cause));
+                    if let Some(hint) = reading.hint {
+                        lines.push(field("hint", &hint));
+                    }
+                }
+            }
+            for (which, material) in [("stderr", &step.stderr), ("stdout", &step.stdout)] {
+                let Some(text) = Outcome::stream_text(material) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                lines.push(format!(
+                    "{:<width$}step {number} '{}' {which} — {} bytes, hashed into the \
+                     attestation as a digest",
+                    "log",
+                    step.name,
+                    text.chars().count(),
+                    width = 13
+                ));
+                let body = excerpt(&text);
+                for line in body.trim_end().lines() {
+                    lines.push(format!("  | {line}"));
+                }
+            }
+        }
+        if failures > 0 {
+            lines.push(field(
+                "note",
+                "the attestation carries the digest of every stream above and none of the \
+                 text: what was just printed is the only copy of this log there will \
+                 ever be, so redirect it, or keep --out so at least the digests survive",
+            ));
+        }
+        lines
+    }
+
+    /// The stream a step captured, as text this command can print.
+    ///
+    /// `execute` hands over text, so the pre-hashed arms are only reachable through a
+    /// report somebody else produced (`--replay-from`), where there is no text to give.
+    fn stream_text(material: &Material) -> Option<String> {
+        match material {
+            Material::Text(text) => Some(text.clone()),
+            Material::Parts(parts) => Some(parts.join("")),
+            Material::Digest(_) | Material::Files(_) => None,
+        }
+    }
+}
+
+/// One `label      text` entry, wrapped under the label's column.
+///
+/// The report reads as a column of fields, and a hint long enough to wrap still has to
+/// line up with them; the wrapped lines are what most people actually read.
+fn field(label: &str, text: &str) -> String {
+    const WIDTH: usize = 96;
+    const COLUMN: usize = 13;
+    let mut head = format!("{:width$}", label, width = COLUMN);
+    let mut out = String::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let fits = line.is_empty()
+            || head.chars().count() + line.chars().count() + 1 + word.chars().count() <= WIDTH;
+        if !fits {
+            out.push_str(&format!("{head}{line}\n"));
+            head = " ".repeat(COLUMN);
+            line = word.to_string();
+            continue;
+        }
+        if line.is_empty() {
+            line.push_str(word);
+        } else {
+            line.push(' ');
+            line.push_str(word);
+        }
+    }
+    out.push_str(&format!("{head}{line}\n"));
+    out.trim_end_matches('\n').to_string()
 }
 
 /// Both digests, or the reason there are none.
@@ -679,6 +1008,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         list_sandboxes();
         return Ok(());
     }
+    let log_mode = options.log_mode()?;
 
     let (workflow_path, workflow_text) = read_workflow(options.workflow.as_deref())?;
     let workflow = Workflow::parse(&workflow_path, &workflow_text)?;
@@ -713,6 +1043,10 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     let clock = now_us()?;
 
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(runs.len());
+    // Which backend confined the run, kept for the report: "the attestation names the
+    // sandbox that ran it" is a check this command can make, and only if it knows the
+    // name independently of the attestation.
+    let mut backend: Option<String> = None;
     if options.execute {
         // Open and probe before anything is spawned: `none`, a backend this build did
         // not implement, and a backend this machine cannot do are three different
@@ -726,6 +1060,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                 CliError::io(format!("cannot tell what directory I am in: {why}"))
             })?,
         };
+        let backend_name = sandbox.name().to_string();
+        backend = Some(backend_name);
         for run in &runs {
             let mut execution = Execution::new(
                 commit.clone(),
@@ -741,7 +1077,18 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
             execution.now_us = Some(clock);
             let report = gitiup_run::execute(&run.plan, &run.job, &*sandbox, &execution)
                 .map_err(|why| for_job(many, &run.label(), CliError::from(why)))?;
-            outcomes.push(Outcome::new(run, &report, true)?);
+            let outcome = Outcome::new(run, &report, true)?;
+            // Printed here, at the moment the streams stop existing anywhere else, and
+            // before the policy gate: a run that fails and is then refused by a policy
+            // has to leave both the refusal and the reason behind.
+            for line in outcome.output_report(log_mode) {
+                if options.json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            outcomes.push(outcome);
         }
     } else {
         if !options.secrets.is_empty() {
@@ -752,6 +1099,14 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                     options.secrets.join(",")
                 ),
                 "run with --execute --sandbox <name> to pass secrets for real, or drop --secret",
+            ));
+        }
+        if options.logs.is_some() {
+            return Err(CliError::refused(
+                "--logs has nothing to print in a simulated run: no step ran, so no stream \
+                 was captured",
+                "drop --logs (a plan prints its own text already), or run with --execute \
+                 --sandbox <name> to capture output for real",
             ));
         }
         let replay = match &options.replay_from {
@@ -780,7 +1135,36 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
             simulation.matrix = run.job.matrix.clone();
             simulation.replay = replay.clone();
             let report = gitiup_run::simulate_report(&run.plan, &run.job, &simulation)?;
-            outcomes.push(Outcome::new(run, &report, false)?);
+            let outcome = Outcome::new(run, &report, false)?;
+            // A replayed report can carry a failing exit code, and a reader who sees
+            // `exit 1` in a plan will look for the output that explains it. There is
+            // none, and saying so is the whole of the answer.
+            let failed: Vec<&str> = outcome
+                .report
+                .steps
+                .iter()
+                .filter(|step| step.exit_code != 0)
+                .map(|step| step.name.as_str())
+                .collect();
+            if !failed.is_empty() {
+                let line = field(
+                    "note",
+                    &format!(
+                        "{} ({}) exited non-zero in the report being replayed. Nothing ran \
+                         here, so there is no output to show: the exit code is a copy of \
+                         somebody else's observation, and `--execute` is how you make \
+                         your own",
+                        if failed.len() == 1 { "step" } else { "steps" },
+                        failed.join(", ")
+                    ),
+                );
+                if options.json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            outcomes.push(outcome);
         }
     }
 
@@ -815,6 +1199,63 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         }
     }
 
+    // The producer's own sums, computed for every run whether or not anybody asked to
+    // read them: a check that only runs on the pretty path would be a check that the
+    // `--json` caller — the one scripting this — never gets.
+    let mut checks: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
+    for outcome in &outcomes {
+        checks.push(outcome.verification(backend.as_deref())?);
+    }
+    // The one line that says what to do with what was just made, worded for whether a
+    // file now exists to do it with.
+    let next = if options.execute {
+        match &options.out {
+            Some(path) => {
+                let path = path.display();
+                match &options.policy {
+                    Some(policy) => field(
+                        "next",
+                        &format!(
+                            "gitiup verify attestation {path} --policy {policy} asks whether \
+                             these bytes may be acted on (0 accepted · 6 refused · 7 bad \
+                             signature · 8 digest mismatch); nothing here signed them, so \
+                             `gitiup attest push {path} --sign` is what makes them \
+                             somebody's proof"
+                        ),
+                    ),
+                    None => field(
+                        "next",
+                        &format!(
+                            "gitiup verify attestation {path} asks whether these bytes may be \
+                             acted on, against the built-in policy unless --policy or \
+                             $GITIUP_POLICY names another (0 accepted · 6 refused · 7 bad \
+                             signature · 8 digest mismatch); nothing here signed them, so \
+                             `gitiup attest push {path} --sign` is what makes them \
+                             somebody's proof"
+                        ),
+                    ),
+                }
+            }
+            None => field(
+                "next",
+                "nothing was written (--out names a file), so there is no attestation to \
+                 verify yet: the digests above are what a stored one would have to \
+                 reproduce, and `gitiup attest push <file> --sign` is what files it",
+            ),
+        }
+    } else {
+        String::new()
+    };
+    // Same lines either way; `--json` owes its stdout to the machine, so the human
+    // reading of the run goes to stderr there.
+    let say = |line: &str| {
+        if options.json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+
     if options.json {
         // The canonical bytes, verbatim: re-encoding them here would be a second
         // opinion about the encoding, which is exactly what ADR-0001 refuses. With
@@ -827,6 +1268,14 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
             print!("{text}");
             if many {
                 println!();
+            }
+        }
+        for checks in &checks {
+            for line in checks {
+                say(line);
+            }
+            if !next.is_empty() {
+                say(&next);
             }
         }
     } else {
@@ -843,6 +1292,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
                 );
             }
             print!("{}", outcome.to_text());
+            for line in &checks[index] {
+                println!("{line}");
+            }
+            if !next.is_empty() {
+                println!("{next}");
+            }
             if !outcome.executed {
                 // What the plan had to assume, repeated here rather than only in the
                 // attestation's annotations.
@@ -860,6 +1315,51 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
             write_attestation(path, &outcomes[0].manifest, options.force)?;
             println!("wrote        {}", path.display());
         }
+    }
+
+    // The run's own verdict, and the reason this command does not exit 0 beside a FAILED
+    // step: a caller that branches on the exit code must not have to read prose to learn
+    // the tests failed. 10 and not 6 because nothing was refused — the run happened, the
+    // attestation says so honestly, and the step is what said no.
+    let mut failed: Vec<String> = Vec::new();
+    for outcome in outcomes.iter().filter(|outcome| outcome.executed) {
+        for (index, step) in outcome.manifest.result.steps.iter().enumerate() {
+            if step.outcome == StepOutcome::Failure {
+                failed.push(format!(
+                    "job `{}` step {}: '{}' exited {}",
+                    outcome.label(),
+                    index + 1,
+                    step.name,
+                    step.exit_code
+                ));
+            }
+        }
+    }
+    if let Some(first) = failed.first() {
+        let message = if failed.len() == 1 {
+            first.clone()
+        } else {
+            format!(
+                "{first}, and {} more failing step{} in this command line",
+                failed.len() - 1,
+                if failed.len() == 2 { "" } else { "s" }
+            )
+        };
+        return Err(CliError::step_failed(
+            message,
+            format!(
+                "exit 10 is the step's own verdict, not a refusal by gitiup: every step \
+                 ran, the run is attestable, and the failure is part of what it attests. \
+                 The failing step's output was printed with this command{} — the \
+                 attestation carries only its digest, so keep the log if you need it \
+                 later",
+                if options.json {
+                    " on stderr (--json keeps stdout for the manifest)"
+                } else {
+                    ""
+                }
+            ),
+        ));
     }
     Ok(())
 }
@@ -1120,6 +1620,44 @@ mod tests {
     }
 
     #[test]
+    fn logs_takes_exactly_three_words_and_says_so() {
+        for (text, mode) in [
+            ("failed", LogMode::Failed),
+            ("fail", LogMode::Failed),
+            ("all", LogMode::All),
+            ("none", LogMode::None),
+            ("NONE", LogMode::None),
+        ] {
+            assert_eq!(LogMode::parse(text).unwrap(), mode, "{text}");
+        }
+        let error = LogMode::parse("sometimes").unwrap_err();
+        assert_eq!(error.code, 2);
+        for word in ["failed", "all", "none"] {
+            assert!(error.message.contains(word), "{}", error.message);
+        }
+        // Not asking is the default, and the default is the one that shows a failure.
+        assert_eq!(Options::default().log_mode().unwrap(), LogMode::Failed);
+    }
+
+    #[test]
+    fn a_wrapped_report_line_keeps_its_column() {
+        let wrapped = field(
+            "hint",
+            "a step's PATH is /usr/bin:/bin:/usr/local/bin and nothing else unless the \
+             workflow says otherwise with env: PATH: — install the tool, or name the \
+             directory it lives in on the job or the step",
+        );
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert!(lines.len() > 1, "that hint is long enough to wrap");
+        assert!(lines[0].starts_with("hint"), "{wrapped}");
+        for line in &lines[1..] {
+            assert!(line.starts_with(' '), "{line}");
+            assert_eq!(&line[..13], "             ", "{line}");
+        }
+        assert!(wrapped.contains("the step"), "{wrapped}");
+    }
+
+    #[test]
     fn flags_take_values_either_way_and_repeat_where_that_means_something() {
         let options = Options::parse(&[
             "--workflow=ci.yml".into(),
@@ -1241,6 +1779,7 @@ mod tests {
             "--execute",
             "--sandbox",
             "--sandboxes",
+            "--logs",
             "--workdir",
             "--policy",
             "--json",

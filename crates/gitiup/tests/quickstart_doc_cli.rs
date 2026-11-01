@@ -514,6 +514,7 @@ fn the_page_teaches_the_words_the_rest_of_the_docs_use() {
         "| 7 | a signature",
         "| 8 | digest mismatch",
         "| 9 | attempts exhausted",
+        "| 10 | a step in the run failed",
     ] {
         assert!(
             doc.contains(row),

@@ -512,3 +512,103 @@ fn a_job_that_needs_a_service_container_is_refused_rather_than_run_alone() {
     assert!(err.hint().unwrap().contains("--execute"), "{err}");
     std::fs::remove_dir_all(&workspace).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// giti-bh2 — reading a step's failure, which is the only reading a caller gets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_program_is_named_and_the_path_it_missed_is_named_with_it() {
+    // `sh` and `bash` word the same refusal differently; both have to give the same
+    // answer, because the answer is the fix.
+    for stderr in [
+        "sh: 1: cargo: not found\n",
+        "bash: line 1: cargo: command not found\n",
+        "/tmp/step-1.sh: 1: cargo: not found\n",
+    ] {
+        let why = gitiup_run::diagnose(127, stderr).expect("a 127 always has a reading");
+        assert!(why.cause.contains("`cargo`"), "{why}");
+        assert!(why.cause.contains("127"), "{why}");
+        let hint = why.hint.expect("a PATH hint");
+        assert!(hint.contains("/usr/bin:/bin:/usr/local/bin"), "{hint}");
+    }
+
+    // A path that is not there is a different mistake, and gets a different fix.
+    let why = gitiup_run::diagnose(127, "sh: 1: ./deploy.sh: not found\n").unwrap();
+    assert!(why.cause.contains("./deploy.sh"), "{why}");
+    assert!(why.hint.unwrap().contains("--workdir"), "path hint");
+}
+
+#[test]
+fn a_signal_is_read_as_the_signal_it_was() {
+    let why = gitiup_run::diagnose(137, "").unwrap();
+    assert!(why.cause.contains("SIGKILL"), "{why}");
+    assert!(
+        why.hint.unwrap().contains("out-of-memory"),
+        "the usual cause"
+    );
+
+    let why = gitiup_run::diagnose(159, "").unwrap();
+    assert!(why.cause.contains("SIGSYS"), "{why}");
+    assert!(
+        why.hint.unwrap().contains("seccomp"),
+        "that is the sandbox talking"
+    );
+
+    // No exit code at all: the signal took the process that would have reported it.
+    let why = gitiup_run::diagnose(-1, "").unwrap();
+    assert!(why.cause.contains("no exit code"), "{why}");
+}
+
+#[test]
+fn what_the_sandbox_refused_is_said_to_be_the_sandbox() {
+    let why = gitiup_run::diagnose(
+        1,
+        "cp: cannot create '/etc/passwd': Read-only file system\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("read-only"), "{why}");
+    assert!(why.hint.unwrap().contains("scratch"), "the writable roots");
+
+    let why = gitiup_run::diagnose(1, "ptrace: Operation not permitted\n").unwrap();
+    assert!(why.cause.contains("sandbox"), "{why}");
+
+    // Egress is deny-all, so a step that fetches has to be told that is the design and
+    // not a network outage on the machine.
+    let why =
+        gitiup_run::diagnose(4, "curl: (7) Failed to connect: Network is unreachable\n").unwrap();
+    assert!(why.cause.contains("network"), "{why}");
+    assert!(
+        why.hint.as_deref().unwrap_or("").contains("deny-all"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_plain_program_exit_with_a_plain_message_gets_no_invention() {
+    // The claim this function has to be able to refuse to make: 1 from a test runner is
+    // the test runner's verdict, and a guess about the caller's code is noise.
+    assert!(
+        gitiup_run::diagnose(1, "---- expected: 4\n++++ actual: 5\n").is_none(),
+        "a failing assertion is the log's story, not this function's"
+    );
+}
+
+#[test]
+fn an_excerpt_keeps_the_end_and_says_what_it_dropped() {
+    let text = format!("{}\nthe reason is at the end\n", "chatter\n".repeat(500));
+    let cut = gitiup_run::excerpt(&text);
+    assert!(
+        cut.contains("the reason is at the end"),
+        "the tail survives"
+    );
+    assert!(cut.contains("earlier lines"), "the cut is admitted: {cut}");
+    assert!(
+        cut.lines().count() <= gitiup_run::exec::MAX_DISPLAY_LINES + 1,
+        "an excerpt is bounded"
+    );
+
+    // A short stream is the stream: no marker, no rewriting.
+    assert_eq!(gitiup_run::excerpt("one line\n"), "one line\n");
+    assert_eq!(gitiup_run::excerpt("   \n"), "");
+}

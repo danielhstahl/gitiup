@@ -100,7 +100,7 @@ pub mod yaml;
 use gitiup_attest::run::RunReport;
 use gitiup_attest::{Error, Result, RunManifest, Tier};
 
-pub use exec::{Execution, execute};
+pub use exec::{Diagnosis, Execution, diagnose, excerpt, execute};
 pub use plan::{MAX_MATRIX_ARMS, Plan, PlannedJob, PlannedStep, Selector};
 pub use sandbox::{Backend, Sandbox, best, detect, implemented, open, require_one, spec_for};
 pub use simulate::{

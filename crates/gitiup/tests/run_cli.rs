@@ -95,6 +95,50 @@ jobs:
       - run: ./deploy.sh
 ";
 
+/// A run that fails in the middle, in a way every machine reproduces: the text to find
+/// is the step's own, the exit code is written out, and the step after it must show up
+/// as skipped rather than as a passing one.
+const FAILING_CI: &str = "\
+on: push
+jobs:
+  build:
+    steps:
+      - name: quiet
+        run: echo hello from the first step
+      - name: boom
+        run: |
+          echo \"the compiler said no\" 1>&2
+          exit 3
+      - name: never runs
+        run: echo never
+";
+
+/// The same, failing because the program is not on the step's PATH: the one exit code
+/// with an answer gitiup can give without reading the user's code.
+const MISSING_TOOL_CI: &str = "\
+on: push
+jobs:
+  build:
+    steps:
+      - name: needs a tool
+        run: definitely-not-a-real-tool --version
+";
+
+/// A run every machine can pass: one step, one `echo`, nothing to install.
+const GREEN_CI: &str = "\
+on: push
+jobs:
+  build:
+    steps:
+      - name: greet
+        run: echo hello from the only step
+";
+
+/// The opt-in backend that needs no runtime, so these tests can run a step for real
+/// wherever they are. It confines nothing — which is exactly the point of the opt-in —
+/// and nothing here asks the sandbox to hold, only that a step ran and failed.
+const UNSANDBOXED: &[(&str, &str)] = &[("GITIUP_UNSANDBOXED", "1"), ("GITIUP_ENV_PROBE", "off")];
+
 /// Several jobs, and one of them is a matrix: the shape that used to have no answer.
 const MANY_JOBS: &str = "\
 on:
@@ -293,7 +337,7 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
         &probe,
     );
     match code(&output) {
-        0 => assert!(
+        0 | 10 => assert!(
             out_text(&output).contains("ran job build"),
             "{}",
             out_text(&output)
@@ -324,7 +368,10 @@ fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
     // silently claiming `local` without running anything is the only wrong one.
     let output = gitiup(dir.path(), &["run", "--execute"], &probe);
     match code(&output) {
-        0 => {
+        // 10 because the step ran and failed (`cargo build` in a directory with no
+        // Cargo.toml): the tier moved to `local` either way, and the failure is the
+        // run's own answer, not a refusal by this command.
+        0 | 10 => {
             assert!(
                 out_text(&output).contains("ran job build"),
                 "{}",
@@ -951,7 +998,7 @@ fn executing_several_jobs_runs_every_one_of_them_in_the_same_sandbox() {
         &[("GITIUP_ENV_PROBE", "off")],
     );
     match code(&output) {
-        0 => {
+        0 | 10 => {
             let stdout = out_text(&output);
             assert!(stdout.contains("ran job lint"), "{stdout}");
             assert!(stdout.contains("ran job test [os=linux]"), "{stdout}");
@@ -977,4 +1024,200 @@ fn executing_several_jobs_runs_every_one_of_them_in_the_same_sandbox() {
         before,
         "running writes nothing unasked"
     );
+}
+
+// ---------------------------------------------------------------------------
+// giti-bh2 — a failure during a run has to be visible, not only hashed
+// ---------------------------------------------------------------------------
+
+/// The reason a step failed, in the run's own output: the attestation carries the
+/// *digest* of each stream, so if the command does not print the text then nobody ever
+/// sees it, and `exit 3` on its own tells the reader nothing.
+#[test]
+fn a_failing_step_prints_its_own_output_and_ends_the_command_with_10() {
+    let dir = workspace(FAILING_CI);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--execute", "--sandbox", "plain"],
+        UNSANDBOXED,
+    );
+    let stdout = out_text(&output);
+    assert_eq!(code(&output), 10, "{stdout}\n{}", err_text(&output));
+
+    // The step's own stderr, verbatim, is the whole point.
+    assert!(
+        stdout.contains("the compiler said no"),
+        "the failing step's stderr has to be on the terminal: {stdout}"
+    );
+    assert!(
+        stdout.contains("FAILED"),
+        "the step list must mark it: {stdout}"
+    );
+    assert!(
+        stdout.contains("job `build` step 2 'boom' — exit 3"),
+        "{stdout}"
+    );
+    // The step after a failure is skipped, and must not read as a passing one.
+    assert!(
+        stdout.contains("never runs — skipped (an earlier step failed)"),
+        "{stdout}"
+    );
+    // And the caller gets the same fact in the exit code and on stderr, not only in
+    // prose on stdout.
+    let stderr = err_text(&output);
+    assert!(stderr.contains("step 2"), "{stderr}");
+    assert!(stderr.contains("exit 10"), "{stderr}");
+    // The text is gone after this command: the attestation keeps a digest of it, so the
+    // command has to say that out loud rather than let the reader discover it later.
+    assert!(stdout.contains("only copy"), "{stdout}");
+}
+
+/// Every green run pays for its digest too: what ran, what was checked, and what to do
+/// with the bytes next.
+#[test]
+fn a_green_run_says_what_was_verified_and_still_exits_zero() {
+    let dir = workspace(GREEN_CI);
+    let output = gitiup(
+        dir.path(),
+        &[
+            "run",
+            "--execute",
+            "--sandbox",
+            "plain",
+            "--out",
+            "att.json",
+            "--logs",
+            "all",
+        ],
+        UNSANDBOXED,
+    );
+    let stdout = out_text(&output);
+    assert_eq!(code(&output), 0, "{stdout}\n{}", err_text(&output));
+    assert!(!stdout.contains("FAILED"), "{stdout}");
+    // --logs all shows a step that passed, which is the only way to see the warning
+    // printed three steps before the failure.
+    assert!(stdout.contains("hello from the only step"), "{stdout}");
+    assert!(stdout.contains("checked"), "{stdout}");
+    assert!(stdout.contains("re-hashed"), "{stdout}");
+    assert!(stdout.contains("logs        "), "{stdout}");
+    // The digests printed are the ones a stranger recomputes; the next line names the
+    // command that recomputes them and says the bytes are unsigned until `--sign`.
+    let next = field(&stdout, "next").expect("the next-step line");
+    assert!(
+        next.contains("gitiup verify attestation att.json"),
+        "{next}"
+    );
+    // (the line wraps, so the second half of the sentence is on the next row)
+    assert!(
+        stdout.contains("--sign") && stdout.contains("signed"),
+        "the next-step line has to say the bytes are unsigned until they are signed: {stdout}"
+    );
+}
+
+/// The one exit code with a general answer: 127 is the tool not being on the PATH a
+/// step is given, and the hint has to name that PATH because nothing else about a
+/// sandboxed 127 looks like a PATH problem.
+#[test]
+fn a_missing_program_is_explained_and_not_just_reported() {
+    let dir = workspace(MISSING_TOOL_CI);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--execute", "--sandbox", "plain"],
+        UNSANDBOXED,
+    );
+    let stdout = out_text(&output);
+    assert_eq!(code(&output), 10, "{stdout}\n{}", err_text(&output));
+    assert!(
+        stdout.contains("`definitely-not-a-real-tool` was not found by the step's shell"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("/usr/bin:/bin:/usr/local/bin"),
+        "the hint must name the PATH a step actually gets: {stdout}"
+    );
+}
+
+/// `--logs` moves the line about how much to print, and nothing else: the exit code and
+/// the digests are the run's, not a function of how much scrolled past.
+#[test]
+fn the_logs_flag_moves_the_output_and_not_the_verdict() {
+    for (args, shown) in [
+        (vec!["--logs", "none"], false),
+        (vec!["--logs", "all"], true),
+    ] {
+        let dir = workspace(FAILING_CI);
+        let mut argv = vec!["run", "--execute", "--sandbox", "plain"];
+        argv.extend(args.iter().copied());
+        let output = gitiup(dir.path(), &argv, UNSANDBOXED);
+        let stdout = out_text(&output);
+        assert_eq!(code(&output), 10, "{stdout}\n{}", err_text(&output));
+        assert_eq!(
+            stdout.contains("the compiler said no"),
+            shown,
+            "`--logs {}` decided how much to print: {stdout}",
+            args[1]
+        );
+        if !shown {
+            assert!(stdout.contains("--logs none"), "{stdout}");
+        }
+    }
+
+    // And a value that is none of the three is a usage error naming the three.
+    let dir = workspace(FAILING_CI);
+    let output = gitiup(
+        dir.path(),
+        &[
+            "run",
+            "--execute",
+            "--sandbox",
+            "plain",
+            "--logs",
+            "sometimes",
+        ],
+        UNSANDBOXED,
+    );
+    assert_eq!(code(&output), 2);
+    let stderr = err_text(&output);
+    for value in ["failed", "all", "none"] {
+        assert!(stderr.contains(value), "{stderr}");
+    }
+
+    // A simulated run captures no streams at all, so `--logs` there is a mistake about
+    // what the command did — the same kind of mistake `--secret` is.
+    let dir = workspace(FAILING_CI);
+    let output = gitiup(dir.path(), &["run", "--logs", "all"], &[]);
+    assert_eq!(code(&output), 6, "{}", out_text(&output));
+    assert!(
+        err_text(&output).contains("--execute"),
+        "{}",
+        err_text(&output)
+    );
+}
+
+/// `--json` owes its stdout to the machine that parses it. The failure block, the
+/// verification and the one-line reason all go to stderr instead, and stdout still
+/// parses as one canonical manifest.
+#[test]
+fn json_keeps_stdout_machine_readable_while_the_failure_is_on_stderr() {
+    let dir = workspace(FAILING_CI);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--execute", "--sandbox", "plain", "--json"],
+        UNSANDBOXED,
+    );
+    assert_eq!(code(&output), 10);
+    let stdout = out_text(&output);
+    let manifest: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("--json stdout is the manifest alone");
+    assert_eq!(manifest["result"]["provenance"]["tier"], "local");
+    assert!(
+        !stdout.contains("FAILED"),
+        "--json stdout is bytes only: {stdout}"
+    );
+
+    let stderr = err_text(&output);
+    assert!(stderr.contains("the compiler said no"), "{stderr}");
+    assert!(stderr.contains("FAILED"), "{stderr}");
+    assert!(stderr.contains("re-hashed"), "{stderr}");
+    assert!(stderr.contains("gitiup: job `build`"), "{stderr}");
 }
