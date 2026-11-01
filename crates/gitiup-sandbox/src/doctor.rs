@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::backend::{self, Backend};
 use crate::egress::Egress;
 use crate::kernel::{Availability, Kernel};
+use crate::mounts::{self, TMPFS_DESTINATIONS};
 use crate::platform::OS;
 use crate::spec::{Enforcement, Spec};
 
@@ -316,6 +317,8 @@ pub fn survey() -> Report {
         ));
     }
 
+    checks.push(mount_points(kernel.os()));
+
     let may_serve_jobs = backends
         .iter()
         .any(|candidate| candidate.available && !candidate.opt_in && candidate.serves_quorum);
@@ -409,6 +412,69 @@ impl Report {
 pub fn probe_spec() -> Spec {
     let scratch = std::env::temp_dir().join(format!("gitiup-doctor-{}", std::process::id()));
     Spec::new(&scratch, scratch.join("scratch"))
+}
+
+/// The spec shape a workflow step actually gets: **the checkout writable as well as the
+/// scratch**, because a build writes where it is checked out.
+///
+/// This is the shape in which the read-only and the writable grants meet, so it is the
+/// shape every mount clash is checked against. Duplicated from
+/// [`gitiup_run::sandbox::spec_for`] rather than imported — the sandbox crate does not
+/// depend on the runner — and pinned by a test in `gitiup-run` that asserts the two
+/// produce the same grants, so the report cannot describe a shape no step ever runs.
+pub fn step_spec() -> Spec {
+    let probe = probe_spec();
+    let workspace = probe.workspace.clone();
+    probe.with_writable(workspace)
+}
+
+/// The mount-point line, which is the line giti-0xi asked for.
+///
+/// A container keeps one mount per destination and refuses the whole run when two want
+/// one — `Duplicate mount point: '/work'` — and the step shape names its checkout twice,
+/// so that error was reachable by anyone who ran a workflow with `--sandbox docker`, and
+/// named neither of the grants that caused it. [`crate::mounts`] resolves it before any
+/// argv exists; this line is the same resolution, reported before anything is planned,
+/// and says which collisions gitiup cannot resolve and therefore refuses.
+fn mount_points(os: OS) -> Check {
+    let mut resolved: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    for (shape, spec) in [("a probe's", probe_spec()), ("a step's", step_spec())] {
+        match mounts::plan(&spec, &TMPFS_DESTINATIONS) {
+            Ok(plan) => {
+                count = count.max(plan.mounts.len());
+                resolved.extend(plan.notes.iter().cloned());
+            }
+            Err(why) => {
+                return Check::fail(
+                    "mount points",
+                    format!(
+                        "the spec shape of {shape} run cannot be mounted: {}",
+                        why.detail()
+                    ),
+                    why.hint()
+                        .unwrap_or("name a different scratch or workspace directory")
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let mut detail = format!(
+        "{count} mounts for a workflow step, each at its own destination: a container keys \
+         its mounts by destination and refuses a run that puts two there (`Duplicate mount \
+         point: '<path>'`, which names neither of the grants that collided), so a tree \
+         named twice is mounted once and the scratch cap keeps /tmp to itself"
+    );
+    if !resolved.is_empty() {
+        detail.push_str(&format!(" — {}", resolved.join("; ")));
+    }
+    if os == OS::MacOS {
+        detail.push_str(
+            " — note that on macOS /tmp, /var and /etc are symlinks into /private, so one \
+             directory can be spelled two ways; the host is asked, not the spelling",
+        );
+    }
+    Check::ok("mount points", detail)
 }
 
 #[cfg(test)]
@@ -526,5 +592,67 @@ mod tests {
         assert!(!plain.serves_quorum);
         assert!(plain.opt_in);
         assert_ne!(report.active.as_deref(), Some(crate::backend::PLAIN));
+    }
+
+    /// giti-0xi, in the shape the runner actually uses. The checkout is on the read list
+    /// because every workspace is and on the write list because a build writes where it
+    /// is checked out; handed to a container as two `-v` arguments, the runtime refused
+    /// the run with `Duplicate mount point: '/work'` and named neither grant.
+    #[test]
+    fn the_shape_a_step_runs_in_mounts_its_checkout_once() {
+        let plan =
+            mounts::plan(&step_spec(), &TMPFS_DESTINATIONS).expect("a step must be mountable");
+        let checkout = plan
+            .mounts
+            .iter()
+            .filter(|mount| mount.source == step_spec().workspace)
+            .collect::<Vec<_>>();
+        assert_eq!(checkout.len(), 1, "one destination, one mount: {plan:?}");
+        assert!(checkout[0].writable, "the step's checkout is writable");
+        for mount in &plan.mounts {
+            let same = plan
+                .mounts
+                .iter()
+                .filter(|other| other.destination == mount.destination)
+                .count();
+            assert_eq!(
+                same,
+                1,
+                "{} wanted twice: {plan:?}",
+                mount.destination.display()
+            );
+        }
+    }
+
+    /// The line the ticket asked for: "if this is unavoidable, `gitiup doctor` should say
+    /// so" — so the report carries the mount policy, and carries it as a fact rather
+    /// than as a complaint with no action in it.
+    #[test]
+    fn the_report_says_what_happens_when_two_mounts_want_one_address() {
+        let report = survey();
+        let line = report
+            .checks
+            .iter()
+            .find(|check| check.name == "mount points")
+            .expect("the report looks at mount points");
+        assert!(
+            line.detail.contains("Duplicate mount point") || line.detail.contains("mount once"),
+            "{line:?}"
+        );
+        assert!(
+            !matches!(line.status, Status::Warn | Status::Fail) || line.fix.is_some(),
+            "{line:?}"
+        );
+        assert!(report.text().contains("mount points"), "{}", report.text());
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert!(
+            value["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|check| check["name"] == "mount points"),
+            "{}",
+            report.json()
+        );
     }
 }

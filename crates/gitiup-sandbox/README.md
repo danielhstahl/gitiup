@@ -53,6 +53,7 @@ for warning in &admitted.warnings {
 | [`backend`](src/backend.rs) | the `Sandbox` trait, the preference order, `open`/`detect`/`best`, and `admit` — the gate that refuses before anything spawns |
 | [`backends`](src/backends/mod.rs) | `docker`, `podman`, `bwrap`, `landlock`, `unshare`, `plain` |
 | [`spec`](src/spec.rs) | what a job may read, write, reach and consume; `Purpose::{Local,Quorum}` and the `Enforcement` ladder |
+| [`mounts`](src/mounts.rs) | the mounts one spec asks for, with one mount per destination: a container keys mounts by destination and refuses `Duplicate mount point`, so the resolution happens here and is said out loud |
 | [`egress`](src/egress.rs) | default-deny, the allowlist, the loopback HTTP/CONNECT proxy, and the audit record of every decision |
 | [`dns`](src/dns.rs) | the allowlist-only resolver: a disallowed name is `NXDOMAIN`, not a leak |
 | [`linux`](src/linux.rs) | the Landlock ruleset, the seccomp filter, `no_new_privs`, privilege drop and rlimits |

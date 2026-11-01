@@ -448,6 +448,61 @@ fn a_step_writes_in_its_workspace_and_scratch_only() {
     );
 }
 
+/// `gitiup doctor --sandbox` reports the mount plan of "the shape a step runs in"
+/// ([`gitiup_sandbox::doctor::step_spec`]), which it cannot import from here — the
+/// sandbox crate does not depend on the runner. This is the other half of that deal: the
+/// shape it duplicates has to be the shape a step actually gets, or the report describes
+/// a run nobody does — and the mount clash it exists to catch (giti-0xi: the checkout
+/// readable *and* writable, `Duplicate mount point: '/work'`) would be caught in a shape
+/// no step is in.
+#[test]
+fn the_shape_the_sandbox_doctor_checks_is_the_shape_a_step_runs_in() {
+    use gitiup_sandbox::{doctor, mounts};
+
+    let step = sandbox::spec_for(Path::new("/work"), Path::new("/work/.scratch"));
+    let checked = doctor::step_spec();
+
+    // Both name the checkout twice: once as the workspace every backend mounts
+    // read-only, once as a writable tree. That is the collision, and it must be present
+    // in the shape the doctor checks rather than only in this one.
+    for spec in [&step, &checked] {
+        assert!(
+            spec.write_paths().contains(&spec.workspace),
+            "the checkout is writable: {:?}",
+            spec.write_paths()
+        );
+        assert!(
+            spec.read_paths().contains(&spec.workspace),
+            "the checkout is readable: {:?}",
+            spec.read_paths()
+        );
+    }
+
+    // And the two shapes resolve to the same number of mounts and the same number of
+    // resolutions — the paths differ (a temp directory there, a checkout here), the
+    // structure may not.
+    let planned = |spec: &gitiup_sandbox::spec::Spec| {
+        mounts::plan(spec, &[]).expect("a step's spec is mountable")
+    };
+    let (a, b) = (planned(&step), planned(&checked));
+    assert_eq!(
+        a.mounts.len(),
+        b.mounts.len(),
+        "{} vs {}",
+        a.list(true),
+        b.list(true)
+    );
+    assert_eq!(a.writable().len(), b.writable().len());
+    assert_eq!(a.read_only().len(), b.read_only().len());
+    assert_eq!(
+        a.notes.len(),
+        b.notes.len(),
+        "the same shape resolves the same number of clashes: {:?} vs {:?}",
+        a.notes,
+        b.notes
+    );
+}
+
 #[test]
 fn a_script_is_staged_verbatim_including_quotes_and_dollar_signs() {
     let _serial = serial();

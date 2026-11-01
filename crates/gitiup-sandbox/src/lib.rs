@@ -122,6 +122,7 @@ pub mod limits;
 /// The Linux syscalls the in-process backend is made of. Compiled only where they exist.
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod mounts;
 pub mod platform;
 pub mod policy;
 pub mod probe;

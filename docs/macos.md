@@ -174,6 +174,62 @@ The same warning is in the plan notes for a macOS run, printed by `gitiup run --
 --json`, because a reviewer should see it before the job runs rather than in a
 `no such file` at step three.
 
+### "Duplicate mount point: '/work'"
+
+The other mount-shaped failure on a Mac — and it is not Mac-specific, the Mac is just
+where it was found. A container runtime keys its mounts by **destination**, and refuses
+the whole container when two want one address:
+
+```text
+Error response from daemon: Duplicate mount point: '/work'
+```
+
+The spec a step runs in asks for exactly that. The checkout is on the read list because
+every workspace is mounted read-only, and on the write list because a build writes where
+it is checked out ([What a step may touch](sandbox.md#what-a-step-may-touch)). Two
+grants, one destination, one refused run — and the message names neither grant, which is
+how a spec bug ends up looking like a mystery about Docker on macOS.
+
+The mounts are now worked out before any `docker run` is built
+([`mounts`](../crates/gitiup-sandbox/src/mounts.rs)), under one destination, one mount:
+
+* **a tree named twice is mounted once, and writable wins.** The only way a read-only
+  and a writable grant meet at one destination is a spec that named the tree writable,
+  and an explicit `with_writable` is what the read-only default is traded against. That
+  trade is said out loud, in the plan notes and in `doctor`, because "read-only
+  workspace" just stopped being true:
+
+  ```console
+  $ gitiup doctor --sandbox
+  ok   mount points             10 mounts for a workflow step, each at its own destination: a
+                                container keys its mounts by destination and refuses a run that
+                                puts two there (`Duplicate mount point: '<path>'`, which names
+                                neither of the grants that collided), so a tree named twice is
+                                mounted once and the scratch cap keeps /tmp to itself —
+                                /tmp/gitiup-doctor-1975 is named as a readable tree and as a
+                                writable one: it is mounted read-write, so the read-only
+                                promise does not cover it
+  ```
+
+* **a destination the tool already claimed is a refusal that names the fix.** The
+  scratch cap is a size-capped tmpfs at `/tmp`, so a job whose scratch *is* `/tmp` —
+  common, because `TMPDIR` is `/tmp` in a great many containers — wants that address.
+  gitiup refuses it before the runtime does, and says to name `/tmp/gitiup-scratch`
+  instead, which keeps its cap.
+* **one directory spelled two ways is flagged when the two spellings get different
+  grants.** On macOS `/tmp`, `/var` and `/etc` are symlinks into `/private`, so
+  `/var/folders/…/T` and `/private/var/folders/…/T` are one place: a read-only grant
+  spelled one way is writable spelled the other. The host is asked (`realpath`), not the
+  spelling guessed at — which is also what catches `/bin` and `/usr/bin` being one
+  directory on a merged-usr Linux.
+
+Nothing is relocated to make a clash go away. Every tree is mounted at its own absolute
+path — that is what keeps the paths in the job's environment true inside the container —
+so a destination that two different directories want stays a refusal, with both of them
+named. `crates/gitiup-sandbox/tests/mount_points.rs` runs the whole thing against a
+runtime that enforces the daemon's one rule, so the case is a reproduction rather than
+an assertion about a data structure.
+
 ### The uid, and the image
 
 `--user $(id -u):$(id -g)` is passed on every platform: the job runs as the uid that

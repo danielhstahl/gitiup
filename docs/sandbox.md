@@ -65,6 +65,11 @@ list at all. [Running a workflow with `act`](act.md) says what it does promise;
 
 * **writable:** the checkout, and the scratch directory the step's script and output
   files were staged in. Everything else is read-only or invisible, depending on rung.
+* **mounted once:** the checkout is on both lists, and a container keys its mounts by
+  destination — two mounts at one destination is `Duplicate mount point: '/work'` and a
+  refused run. So the mounts are worked out before the command line is built, one mount
+  per destination, writable winning over read-only and the resolution printed
+  ([`mounts`](../crates/gitiup-sandbox/src/mounts.rs), [`macOS`](macos.md#duplicate-mount-point-work)).
 * **readable:** the system directories every build needs (`/usr`, `/bin`, `/lib`,
   `/etc`, …) plus the workspace. Granting the tool directory is explicit
   (`Spec::with_tool`) rather than guessed, because a confined process cannot execute a

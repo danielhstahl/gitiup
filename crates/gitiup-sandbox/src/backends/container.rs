@@ -15,7 +15,13 @@
 //! * **what the job sees must be what it gets.** Workspace and scratch are bind-mounted
 //!   at *their own absolute paths* so the paths in the job's environment stay true
 //!   inside the container. A sandbox that silently relocated the workspace would
-//!   produce logs that match nothing.
+//!   produce logs that match nothing. That rule has a consequence the runtime makes
+//!   unavoidable: mounts are keyed by destination, so a tree named twice (the checkout
+//!   is on the read list because every workspace is, and on the write list because a
+//!   build writes where it is checked out) is two mounts at one address, and the
+//!   runtime refuses the container with `Duplicate mount point: '/work'`. The mounts
+//!   are therefore worked out by [`crate::mounts`] before any argv exists, and a
+//!   collision the tool cannot resolve is gitiup's own refusal, naming both grants.
 //!
 //! The runtime's *own* CLI is a separate matter from the job it starts. The job gets
 //! an environment built from nothing; the CLI has to find its config, its credential
@@ -54,6 +60,7 @@ use crate::backend::{Env, Kind, Launch, Sandbox};
 use crate::egress::Egress;
 use crate::escape::Witness;
 use crate::kernel::Kernel;
+use crate::mounts::{self, Plan};
 use crate::platform::{OS, Platform};
 use crate::probe::Probe;
 use crate::spec::Enforcement;
@@ -175,7 +182,9 @@ impl Container {
     }
 
     /// The `run` arguments that implement the baseline policy for one job.
-    fn run_args(&self, spec: &Spec) -> Vec<String> {
+    ///
+    /// `mounts` is [`Container::mounts`] for the same spec, resolved once by the caller.
+    fn run_args(&self, spec: &Spec, mounts: &Plan) -> Vec<String> {
         let mut args = vec![
             "run".to_string(),
             "--rm".to_string(),
@@ -215,24 +224,41 @@ impl Container {
         args.push(format!("{}:{}", unsafe { libc::getuid() }, unsafe {
             libc::getgid()
         }));
-        for path in spec.read_paths() {
-            if path.exists() {
-                args.push("-v".to_string());
-                args.push(format!("{}:{}:ro", path.display(), path.display()));
+        // Every mount, read-only first, at its own cleaned destination, and exactly one
+        // per destination — see [`crate::mounts`]. A read-only mount whose host
+        // directory is not there is skipped rather than fatal: a container asked for a
+        // workspace that does not exist is a confusing mount error instead of a refusal
+        // that says so, and `/lib64` on a merged-usr distro is nobody's emergency.
+        for mount in &mounts.mounts {
+            if !mount.writable && !mount.source.exists() {
+                continue;
             }
-        }
-        for path in spec.write_paths() {
             args.push("-v".to_string());
-            args.push(format!("{}:{}:rw", path.display(), path.display()));
+            args.push(mount.volume_arg());
         }
         // The one place the scratch cap is enforced exactly rather than by
         // `RLIMIT_FSIZE`: a sized tmpfs.
         args.push("--tmpfs".to_string());
         args.push(format!("/tmp:rw,noexec,nosuid,size={}", spec.scratch_bytes));
         args.push("-w".to_string());
-        args.push(spec.workspace.display().to_string());
+        // The working directory is the workspace *as it is mounted*, which is its
+        // cleaned destination — the string the job's own paths have to match.
+        args.push(mounts::clean(&spec.workspace));
         args.push(self.image());
         args
+    }
+
+    /// The mounts this runtime will be asked to make for one spec, clashes already
+    /// resolved or refused.
+    ///
+    /// The runtime keeps one mount per destination and refuses a container that puts
+    /// two there — `Duplicate mount point: '/work'` — which is a thing a workflow step
+    /// asks for by default, because its checkout is both readable and writable.
+    /// [`crate::mounts`] is what makes that a decision gitiup makes and explains rather
+    /// than a daemon's error message; `gitiup doctor --sandbox` says the same thing
+    /// before a job finds it out.
+    pub fn mounts(&self, spec: &Spec) -> Result<Plan> {
+        mounts::plan(spec, &mounts::TMPFS_DESTINATIONS)
     }
 
     /// The baseline flags for a probe container: the same policy, no mounts.
@@ -641,7 +667,8 @@ impl Sandbox for Container {
             )
         })?;
         let mut prefix = vec![binary.display().to_string()];
-        prefix.extend(self.run_args(spec));
+        let mounts = self.mounts(spec)?;
+        prefix.extend(self.run_args(spec, &mounts));
         let mut launch = Launch {
             prefix,
             env_as_args: true,
@@ -668,14 +695,18 @@ impl Sandbox for Container {
                     .unwrap_or_else(|| "no proxy".to_string())
             )
         });
-        launch.notes.push(format!(
-            "read-only mounts: {}",
-            path_list(&spec.read_paths())
-        ));
-        launch.notes.push(format!(
-            "writable mounts: {}",
-            path_list(&spec.write_paths())
-        ));
+        // The mount notes are the *resolved* mounts, not the spec's wish list: a
+        // reviewer who reads "read-only mounts: /work" about a checkout that is
+        // mounted read-write has been told something false.
+        launch
+            .notes
+            .push(format!("read-only mounts: {}", mounts.list(false)));
+        launch
+            .notes
+            .push(format!("writable mounts: {}", mounts.list(true)));
+        for note in &mounts.notes {
+            launch.notes.push(format!("mount points: {note}"));
+        }
         if Platform::survey().os == OS::MacOS {
             // The one thing about a container on macOS that has bitten everyone: the
             // job runs in the desktop app's Linux VM, and a path the app has not
@@ -692,17 +723,6 @@ impl Sandbox for Container {
     }
 }
 
-fn path_list(paths: &[PathBuf]) -> String {
-    if paths.is_empty() {
-        return "(none)".to_string();
-    }
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,7 +736,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let scratch = workspace.path().join(".scratch");
         std::fs::create_dir_all(&scratch).unwrap();
-        let args = backend.run_args(&Spec::new(workspace.path(), &scratch));
+        let args = args_for(&backend, &Spec::new(workspace.path(), &scratch));
         let text = args.join(" ");
         assert!(text.contains("--cap-drop ALL"), "{text}");
         assert!(text.contains("no-new-privileges"), "{text}");
@@ -745,8 +765,7 @@ mod tests {
         let backend = Container::podman();
         let denied = Spec::new("/work", "/work/.scratch");
         assert!(
-            backend
-                .run_args(&denied)
+            args_for(&backend, &denied)
                 .join(" ")
                 .contains("--network none")
         );
@@ -757,13 +776,75 @@ mod tests {
         let allowed =
             Spec::new("/work", "/work/.scratch").with_egress(Egress::allow_registries().unwrap());
         assert!(
-            backend
-                .run_args(&allowed)
+            args_for(&backend, &allowed)
                 .join(" ")
                 .contains("--network bridge"),
             "{allowed:?}"
         );
         assert_eq!(backend.enforcement(&allowed.egress), Enforcement::Audited);
+    }
+
+    /// The shape `gitiup run --execute` gives every step: the checkout writable as well
+    /// as the scratch (see `gitiup_run::sandbox::spec_for`).
+    fn step(workspace: &str, scratch: &str) -> Spec {
+        Spec::new(workspace, scratch).with_writable(workspace)
+    }
+
+    /// The `run` arguments a spec produces, with the mounts resolved the way `plan`
+    /// resolves them — which is the whole point: the refusal and the argv come from the
+    /// same one computation.
+    fn args_for(backend: &Container, spec: &Spec) -> Vec<String> {
+        let mounts = backend
+            .mounts(spec)
+            .expect("the mounts for this spec resolve");
+        backend.run_args(spec, &mounts)
+    }
+
+    #[test]
+    fn a_checkout_named_readable_and_writable_is_mounted_once() {
+        // giti-0xi, and the reason this file does not build `-v` arguments from the two
+        // grant lists any more. The checkout is on the read list because every workspace
+        // is and on the write list because a build writes where it is checked out, so the
+        // two loops each emitted a mount for `/work`, and the runtime answered
+        // `Duplicate mount point: '/work'` — naming neither grant, on every OS.
+        let args = args_for(&Container::docker(), &step("/work", "/work/.scratch")).join(" ");
+        assert_eq!(args.matches("-v /work:").count(), 1, "{args}");
+        assert!(args.contains("/work:/work:rw"), "{args}");
+        assert!(
+            !args.contains("/work:/work:ro"),
+            "the writable grant won, so the read-only one must not still be there: {args}"
+        );
+        // The scratch inside the checkout is a nested mount, not a clash, and is still
+        // there and still writable.
+        assert!(args.contains("/work/.scratch:/work/.scratch:rw"), "{args}");
+        // And the job's working directory is the mount the job can actually see.
+        assert!(args.contains("-w /work "), "{args}");
+    }
+
+    #[test]
+    fn a_scratch_that_is_tmp_itself_is_refused_before_the_runtime_sees_it() {
+        // The other way to meet `Duplicate mount point`: the scratch is /tmp (TMPDIR is
+        // /tmp in a great many containers) and gitiup also mounts a size-capped tmpfs
+        // there. The cap is the point of the tmpfs, so the scratch moves, not the tmpfs.
+        let err = Container::docker()
+            .mounts(&Spec::new("/work", "/tmp"))
+            .unwrap_err();
+        assert!(err.detail().contains("/tmp"), "{err}");
+        assert!(err.hint().unwrap().contains("/tmp/gitiup-scratch"), "{err}");
+        // A scratch inside /tmp keeps its cap and its mount.
+        let args = args_for(
+            &Container::docker(),
+            &Spec::new("/work", "/tmp/gitiup-scratch"),
+        )
+        .join(" ");
+        assert!(
+            args.contains("/tmp/gitiup-scratch:/tmp/gitiup-scratch:rw"),
+            "{args}"
+        );
+        assert!(
+            args.contains("--tmpfs /tmp:rw,noexec,nosuid,size="),
+            "{args}"
+        );
     }
 
     #[test]
@@ -823,8 +904,7 @@ mod tests {
         let scratch = workspace.path().join(".scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         assert!(
-            backend
-                .run_args(&Spec::new(workspace.path(), &scratch))
+            args_for(&backend, &Spec::new(workspace.path(), &scratch))
                 .join(" ")
                 .contains("--pull never"),
             "a job never pulls"
