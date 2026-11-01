@@ -253,10 +253,19 @@ pub fn survey() -> Report {
 
     for candidate in &backends {
         checks.push(match (candidate.available, candidate.opt_in) {
-            (true, false) => Check::ok(
-                &format!("backend {}", candidate.name),
-                format!("{} — {}", candidate.enforcement.label(), candidate.note),
-            ),
+            (true, false) => match &candidate.fix {
+                // Available, and it still wants something: an operator should see the
+                // asking, even though the backend was not refused.
+                Some(fix) => Check::warn(
+                    &format!("backend {}", candidate.name),
+                    format!("{} — {}", candidate.enforcement.label(), candidate.note),
+                    fix.clone(),
+                ),
+                None => Check::ok(
+                    &format!("backend {}", candidate.name),
+                    format!("{} — {}", candidate.enforcement.label(), candidate.note),
+                ),
+            },
             (true, true) => Check::warn(
                 &format!("backend {}", candidate.name),
                 format!("available only as an explicit opt-in: {}", candidate.note),
@@ -265,10 +274,21 @@ pub fn survey() -> Report {
                     active.as_deref().unwrap_or("a real backend")
                 ),
             ),
-            (false, _) => Check::info(
-                &format!("backend {}", candidate.name),
-                candidate.note.clone(),
-            ),
+            (false, _) => match &candidate.fix {
+                // The line that pays for the report: not "docker is unusable" but the
+                // command that changes that, because a person reading this has a job
+                // to run. "Install the runtime" needs no second line, which is why an
+                // absent binary stays an `info` with its note and no `fix:`.
+                Some(fix) => Check::warn(
+                    &format!("backend {}", candidate.name),
+                    candidate.note.clone(),
+                    fix.clone(),
+                ),
+                None => Check::info(
+                    &format!("backend {}", candidate.name),
+                    candidate.note.clone(),
+                ),
+            },
         });
     }
 
@@ -437,6 +457,62 @@ mod tests {
             report.json()
         );
         assert!(value["backends"].is_array());
+    }
+
+    /// The line the ticket asked for: an unavailable backend that could name an action
+    /// is a warning carrying that action, printed under the line it belongs to — not a
+    /// paragraph a person has to read for the command inside it.
+    #[test]
+    fn a_backend_that_named_an_action_prints_it_as_a_fix() {
+        let mut report = survey();
+        report.checks.push(Check::warn(
+            "backend docker",
+            "`alpine:3.20` is not present locally",
+            "put the image where the runtime can see it first: `docker pull alpine:3.20`",
+        ));
+        let text = report.text();
+        assert!(
+            text.contains(
+                "fix: put the image where the runtime can see it first: `docker pull alpine:3.20`"
+            ),
+            "{text}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert!(
+            value["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|check| check["fix"]
+                    .as_str()
+                    .is_some_and(|fix| fix.contains("docker pull"))),
+            "the same action in the report a script reads: {}",
+            report.json()
+        );
+    }
+
+    /// The invariant behind that line, whatever this machine happens to be missing: a
+    /// backend that offered an action must be the warning that shows it.
+    #[test]
+    fn every_offered_action_is_shown() {
+        let report = survey();
+        for candidate in &report.backends {
+            let Some(fix) = &candidate.fix else {
+                continue;
+            };
+            let line = report
+                .checks
+                .iter()
+                .find(|check| check.name == format!("backend {}", candidate.name))
+                .expect("every backend gets a line");
+            assert_eq!(
+                line.fix.as_deref(),
+                Some(fix.as_str()),
+                "`{}` offered an action that the report dropped",
+                candidate.name
+            );
+            assert_eq!(line.status, Status::Warn, "{line:?}");
+        }
     }
 
     #[test]

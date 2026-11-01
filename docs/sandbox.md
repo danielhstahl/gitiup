@@ -107,10 +107,23 @@ A probe that fails is a refusal with `exit 6`, raised **before** anything is spa
 $ gitiup run --execute --sandbox docker      # no docker on this host
 gitiup: sandbox: the `docker` sandbox is not usable here: runtime failed — no `docker` binary on PATH
 hint: … `gitiup doctor --sandbox` says what to change about this machine
+$ gitiup run --execute --sandbox docker      # docker, but the job's image is not in it
+gitiup: sandbox: the `docker` sandbox is not usable here: image failed — `alpine:3.20` is not
+        present locally in `docker`, and gitiup does not pull an image while running a job …
+hint: put the image where the runtime can see it first: `docker pull alpine:3.20` …
 $ gitiup run --execute --sandbox none
 gitiup: sandbox: `--sandbox none` asks for an unconfined execution
 hint: an unconfined run may not attest as `local` …
 ```
+
+The middle one is worth dwelling on, because a container's image is an **input**. Every
+`docker`/`podman` run carries `--pull never`: the job's network is denied, an image that
+can move between runs is not something a report should be quiet about, and a runtime that
+fetches an image mid-job is a tool making the operator's decision. So the image is
+pulled by whoever set `GITIUP_SANDBOX_IMAGE`, and `gitiup doctor --sandbox` and
+`gitiup run --sandboxes` both say so — with the command, not just the fact.
+([docs/macos.md](macos.md) is the longer version, including the
+`error getting credentials` message a missing image used to turn into.)
 
 A policy may name the rungs it will accept
 (`Policy::allowed_sandboxes`, narrowed by

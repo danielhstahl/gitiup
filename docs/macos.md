@@ -158,7 +158,7 @@ $ gitiup doctor --sandbox
 backends, in the order gitiup prefers them:
   docker: available (container, kernel-enforced) — the job runs in a container with no
       capabilities, no new privileges, its own pid namespace and its own filesystem …
-      observed: runtime, daemon, image, tcp-egress
+      observed: runtime, daemon, image, container-starts, tcp-egress
       unchecked: mount-visibility — a container could not read a file the host just wrote
                      into a directory it was given as `-v`: the job would not find its own
                      checkout. On macOS this means the directory is not in the runtime's
@@ -183,9 +183,75 @@ the sharing layer — but it does mean a job cannot `chown` its way out of anyth
 was the point.
 
 The job's image is `GITIUP_SANDBOX_IMAGE` (default `alpine:3.20`), and on Apple silicon
-it has to be an `arm64` image. The runtime cannot pull anything while egress is denied, so
-pull it yourself or point the variable at a digest you already have; the probe says which
-of the two is true rather than discovering it mid-build.
+it has to be an `arm64` image.
+
+### The image is an input, and pulling it is your job
+
+Every container gitiup starts carries `--pull never`. That is a decision, not an
+omission: the job's network is denied by default, so a pull could not be relied on
+anyway; an image that can move between two runs is not the reproducible input a signed
+report claims to describe; and a runtime that fetches someone's tag halfway through a
+job is the tool making a decision the operator should have made. So the image is
+expected where it can be seen, and the tool says so **before** the run rather than in
+the middle of it:
+
+```console
+$ gitiup run --execute --sandbox docker --workflow .github/workflows/build.yml
+gitiup: sandbox: the `docker` sandbox is not usable here: image failed — `alpine:3.20` is not
+        present locally in `docker`, and gitiup does not pull an image while running a job: …
+hint: put the image where the runtime can see it first: `docker pull alpine:3.20` — gitiup will
+      not pull it during a run; or set GITIUP_SANDBOX_IMAGE to an image that is already here
+```
+
+The same sentence is in `gitiup doctor --sandbox`, under the backend it belongs to, and
+in `gitiup run --sandboxes` — which is the answer to "how would I have known before
+trying?":
+
+```console
+$ gitiup doctor --sandbox
+…
+warn backend docker           the `docker` sandbox is not usable here: image failed —
+                              `alpine:3.20` is not present locally in `docker`, …
+                              fix: put the image where the runtime can see it first:
+                                    `docker pull alpine:3.20` — gitiup will not pull it
+                                    during a run; or set GITIUP_SANDBOX_IMAGE to an image
+                                    that is already here
+```
+
+A refusal is a refusal: `docker` counts as unavailable until its image exists, and the
+ladder falls through to the next rung. That is deliberate — a backend that cannot start
+a container cannot confine one.
+
+### "Unable to find image 'alpine:3.20' locally"
+
+That message, followed by
+
+```text
+error getting credentials - err: exit status 1, out: ``
+```
+
+is the second-most-common thing wrong with a container sandbox on a Mac, and it fooled
+everyone who saw it because both lines are about something other than the problem. The
+first says the image is not here. The second is the runtime CLI failing to ask its
+credential helper (`docker-credential-osxkeychain`, or `docker-credential-desktop`) for
+docker.io credentials — which it cannot do when it was started without a `PATH` to find
+the helper in or a `HOME` to find `~/.docker/config.json` in. It is a sentence about a
+keychain, produced by a stripped environment, caused by a missing image.
+
+Both halves are closed. The CLI gets a small allowlist of its own variables — `PATH`,
+`HOME`, `USER`, `LOGNAME`, `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, and the
+`DOCKER_*` / `CONTAINER_*` names that say which daemon to talk to — because the
+runtime's CLI has a different environment from the job's, and the job's is still built
+from nothing and passed as `-e` arguments. And with `--pull never` the pull that
+produced the message is never attempted: gitiup's own refusal, naming
+`docker pull alpine:3.20`, is what arrives instead.
+
+One more trap on the same path, and a Mac-shaped one: an image that *is* present but
+cannot be booted — an `amd64`-only tag on Apple silicon, or a `FROM scratch` image with
+no `/bin/sh` — looks exactly like a sandbox that denies everything to a probe made of
+denials, because nothing gets written and nothing gets reached. So the container probe
+starts one container that has to print a marker before either canary is believed, and
+reports `container-starts` failed rather than green.
 
 ## Option 3 — the `seatbelt` rung, native and in-process
 

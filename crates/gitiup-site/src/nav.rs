@@ -28,6 +28,7 @@ pub const GUIDES: &[&str] = &[
     "sandbox",
     "macos",
     "environment",
+    "act",
     "run-report",
     "provable-output",
     "reproducibility",

@@ -220,6 +220,10 @@ pub struct Backend {
     pub available: bool,
     /// Why not, or what it guarantees. Printed verbatim.
     pub note: String,
+    /// What to change about this machine for the backend to work, when the probe could
+    /// name an action (`docker pull alpine:3.20`). `None` when the note already is the
+    /// instruction or when there is nothing to do.
+    pub fix: Option<String>,
     /// What the probe managed to check just now, empty when the backend is not
     /// available at all. A backend that guarantees a lot and checked nothing is a
     /// different sentence from one that checked everything, and the reader should be
@@ -236,6 +240,11 @@ impl Backend {
                 name: sandbox.name().to_string(),
                 available: true,
                 note: sandbox.guarantees().to_string(),
+                fix: if probe.fixes().is_empty() {
+                    None
+                } else {
+                    Some(probe.fixes().join(" · "))
+                },
                 // The probe's own summary goes with it: `guarantees` is the promise,
                 // the summary is what this machine let us check just now.
                 observed: probe.summary(),
@@ -244,6 +253,7 @@ impl Backend {
                 name: sandbox.name().to_string(),
                 available: false,
                 note: why.detail().to_string(),
+                fix: backend::fix_of(&why).map(str::to_string),
                 observed: String::new(),
             },
         }

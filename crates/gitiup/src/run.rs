@@ -1784,6 +1784,12 @@ fn list_sandboxes() {
             },
             backend.note
         );
+        // The reason a backend is out is worth one more line if it has a cure: an
+        // unavailable docker on a Mac is usually a `docker pull` away from working, and
+        // a person should not have to know that.
+        if let Some(fix) = &backend.fix {
+            println!("  {:<9} {:<11} fix: {fix}", "", "");
+        }
     }
     println!(
         "  (with none available there is no --execute: a simulated plan is the only \

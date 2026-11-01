@@ -82,6 +82,17 @@ pub struct Launch {
     /// Set when the backend passes environment as *arguments* (`docker -e`), in which
     /// case the wrapper's own environment is deliberately empty.
     pub env_as_args: bool,
+    /// Environment the **wrapper program itself** needs, as opposed to the job's.
+    ///
+    /// A container runtime is a CLI with its own expectations: it has to find its
+    /// binary's siblings (`docker-credential-osxkeychain`), its config
+    /// (`~/.docker/config.json`), and sometimes a daemon that is only reachable at an
+    /// endpoint named by `$DOCKER_HOST` or a rootless socket under `$XDG_RUNTIME_DIR`.
+    /// Clearing the environment is right for the *job* and wrong for the *CLI*, and
+    /// the two are separate processes' worth of environment: the job's arrives as `-e`
+    /// arguments, so whatever is set here never reaches the container. Left empty by
+    /// backends that are not a separate CLI.
+    pub wrapper_env: Env,
     /// The working directory inside the confinement, when it differs from the host
     /// path (`/workspace` in a container).
     pub cwd: Option<PathBuf>,
@@ -191,6 +202,11 @@ pub struct Backend {
     pub serves_quorum: bool,
     /// What it guarantees (available) or why it is not (unavailable). Printed verbatim.
     pub note: String,
+    /// What to change to make it available, when the probe could name an action.
+    ///
+    /// `None` when the note already is the instruction ("no `docker` binary on PATH")
+    /// or when there is nothing to do; `Some` when there is a command to type.
+    pub fix: Option<String>,
     /// The probe properties that were watched, when available.
     pub observed: Vec<String>,
     /// The probe properties that could not be watched, when available.
@@ -217,6 +233,11 @@ impl Backend {
                 opt_in: sandbox.opt_in_only(),
                 serves_quorum: sandbox.serves_quorum(),
                 note: sandbox.guarantees().to_string(),
+                fix: if probe.fixes().is_empty() {
+                    None
+                } else {
+                    Some(probe.fixes().join(" · "))
+                },
                 observed: probe
                     .observed()
                     .iter()
@@ -237,6 +258,7 @@ impl Backend {
                 opt_in: sandbox.opt_in_only(),
                 serves_quorum: sandbox.serves_quorum(),
                 note: error.detail().to_string(),
+                fix: fix_of(&error).map(str::to_string),
                 observed: Vec::new(),
                 unchecked: Vec::new(),
             },
@@ -382,6 +404,21 @@ pub fn open(name: &str) -> Result<Box<dyn Sandbox>> {
         })
 }
 
+/// The action a probe's refusal named, if it named one.
+///
+/// Every refusal from a probe carries a hint, and most of them carry the generic one
+/// that just says "ask doctor". This is `None` for those, so a report prints `fix:`
+/// only where there is an action to take (`docker pull alpine:3.20`) rather than
+/// sending the reader to the report they are already reading.
+pub fn fix_of(error: &Error) -> Option<&str> {
+    let hint = error.hint()?;
+    if hint == crate::probe::GENERIC_FIX || hint.is_empty() {
+        None
+    } else {
+        Some(hint)
+    }
+}
+
 /// Every backend, probed, in preference order.
 ///
 /// This spawns processes (a probe is a real attempt), so it belongs to `doctor` and
@@ -508,7 +545,9 @@ pub fn admit(backend: &dyn Sandbox, spec: &Spec) -> Result<Admitted> {
 ///
 /// The environment is *cleared* first, always. A confined job that inherits the
 /// runner's environment inherits its tokens, and then the attestation describes a run
-/// nobody else could repeat.
+/// nobody else could repeat. The one exception is [`Launch::wrapper_env`]: a wrapper
+/// that cannot find its own daemon or credential helper does not confine anything, it
+/// fails — and those variables are the wrapper's, never the job's.
 pub fn command(
     backend: &dyn Sandbox,
     spec: &Spec,
@@ -528,6 +567,11 @@ pub fn command(
     let mut command = Command::new(&full[0]);
     command.args(&full[1..]);
     command.env_clear();
+    // The wrapper's own environment goes first and is only ever what the wrapper needs
+    // to find its daemon; the job's environment is still exactly `env`.
+    for (key, value) in launch.wrapper_env.iter() {
+        command.env(key, value);
+    }
     if !launch.env_as_args {
         for (key, value) in env.iter().chain(launch.env.iter()) {
             command.env(key, value);
@@ -671,6 +715,50 @@ mod tests {
         );
         assert_eq!(argv.last().unwrap(), "/bin/true");
         assert!(!argv.iter().any(|argument| argument == "--"));
+    }
+
+    #[test]
+    fn the_wrappers_environment_is_not_the_jobs() {
+        // Two processes' worth of environment, and mixing them is the bug that made a
+        // missing image look like a keychain fault: the runtime's CLI needs a PATH and
+        // a HOME of its own, and the job must still be given nothing but what it was
+        // handed.
+        let spec = Spec::new("/tmp/work", "/tmp/scratch");
+        let launch = Launch {
+            prefix: vec!["docker".into(), "run".into(), "img".into()],
+            env_as_args: true,
+            wrapper_env: Env::from([
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("HOME".to_string(), "/home/runner".to_string()),
+            ]),
+            ..Launch::default()
+        };
+        let mut job = Env::new();
+        job.insert("TOKEN".to_string(), "s3cret".to_string());
+        let command = command(
+            &backends::plain::Plain,
+            &spec,
+            &launch,
+            &["/bin/true".to_string()],
+            &job,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        let given: Vec<String> = command
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(given.contains(&"PATH".to_string()), "{given:?}");
+        assert!(
+            !given.contains(&"TOKEN".to_string()),
+            "the job's environment travels as arguments: {given:?}"
+        );
+        assert!(
+            command
+                .get_args()
+                .any(|argument| argument == "TOKEN=s3cret"),
+            "and the job still gets exactly what it was handed"
+        );
     }
 
     #[test]
