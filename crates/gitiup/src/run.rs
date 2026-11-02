@@ -1223,6 +1223,19 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
             sandbox.probe()?;
             let backend_name = sandbox.name().to_string();
             backend = Some(backend_name);
+            // What the confinement decided, said before the first step rather than
+            // inferred from its failure: the mounts it will ask for, where the job's
+            // `/usr` comes from, and — on a Mac — the file-sharing rule that decides
+            // whether the checkout is inside the container at all. These are the
+            // sentences `gitiup doctor --sandbox` prints, read off the plan these very
+            // steps will run under; a step that cannot find its own checkout or its own
+            // compiler is a different conversation once the mounts are on the table.
+            // Stderr, because `--json` owns stdout.
+            if let Ok(scratch) = gitiup_run::scratch_dir(&clock) {
+                for note in sandbox.plan_notes(&workdir, &scratch) {
+                    eprintln!("{}", field("note", &format!("sandbox: {note}")));
+                }
+            }
             for run in &runs {
                 let mut execution = Execution::new(
                     commit.clone(),

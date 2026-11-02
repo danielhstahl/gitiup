@@ -147,9 +147,10 @@ pub fn execute(
             ),
         )
         .with_hint(
-            "run the services yourself and point the workflow at them, or plan without \
-             --execute — a job that silently runs without its database is the worst \
-             outcome here, because its attestation would look clean",
+            "run with --engine act, which starts the job's services in their own containers \
+             (docs/act.md), run the services yourself and point the workflow at them, or \
+             plan without --execute — a job that silently runs without its database is the \
+             worst outcome here, because its attestation would look clean",
         ));
     }
     if !plan
@@ -202,9 +203,12 @@ pub fn execute(
                 ),
             )
             .with_hint(
-                "either simulate the run (the default, and it plans `uses:` steps \
-                 honestly) or pin and vendor the action first (giti-bgy.4); skipping a \
-                 step while attesting that the run happened is not an option",
+                "run with --engine act, which fetches and runs actions and understands the \
+                 expression language (docs/act.md, and its attestation says `sandbox: act` \
+                 because the containment was act's); or simulate the run (the default, and \
+                 it plans `uses:` steps honestly); or pin and vendor the action first \
+                 (giti-bgy.4). Skipping a step while attesting that the run happened is not \
+                 an option",
             ));
         };
         for (name, value) in &step.inputs {
@@ -516,7 +520,13 @@ fn shell_command(
 }
 
 /// A private scratch directory for step scripts and output files.
-fn scratch_dir(now_us: &i64) -> Result<PathBuf, Error> {
+///
+/// Public because the confinement notes a run prints *before* it starts name this
+/// directory — the scratch is one of the two writable mounts, so a caller that printed a
+/// plan made from a different path would be printing a plan that is not the one the step
+/// runs under. Deterministic for a given clock, and idempotent: calling it twice is the
+/// same directory.
+pub fn scratch_dir(now_us: &i64) -> Result<PathBuf, Error> {
     let path = std::env::temp_dir().join(format!("gitiup-run-{}-{now_us}", std::process::id()));
     std::fs::create_dir_all(&path).map_err(|why| {
         Error::new(
@@ -605,6 +615,22 @@ impl std::fmt::Display for Diagnosis {
 /// instead of remembered.
 const STEP_PATH: &str = "/usr/bin:/bin:/usr/local/bin";
 
+/// The strings that mean "the container runtime, not the job, decided this".
+///
+/// Every one of them is a daemon's sentence about its own configuration, and none of
+/// them is a verdict about the code under test. They are matched in the text rather
+/// than by exit code because the daemon's message arrives whatever the code is, and
+/// because the same refusal has exited 125 on one runtime and 1 on another.
+const RUNTIME_REFUSALS: &[&str] = &[
+    "mounts denied",
+    "is not shared from the host",
+    "duplicate mount point",
+    "no such image",
+    "error getting credentials",
+    "error response from daemon",
+    "oci runtime",
+];
+
 /// The strings that mean "the network was the problem", lower-cased.
 const NETWORK_FAILURES: &[&str] = &[
     "network is unreachable",
@@ -680,6 +706,70 @@ pub fn diagnose(exit_code: i64, stderr: &str) -> Option<Diagnosis> {
         });
     }
 
+    // The runtime's own refusal, which is not the step's verdict at all. A container
+    // runtime answers 125 when the container never started, and its sentence — a mount
+    // it will not make, an image it does not have, a destination two grants wanted — is
+    // the only account of what it refused. This is read before the sandbox denials below
+    // because the two are easy to confuse and are opposite facts: "read-only file system"
+    // from a daemon that mounted a directory over one the image owns, and "read-only file
+    // system" from a sandbox refusing a write the job actually made.
+    let lower = stderr.to_ascii_lowercase();
+    if let Some(needle) = RUNTIME_REFUSALS
+        .iter()
+        .find(|needle| lower.contains(**needle))
+    {
+        // The daemon usually says the refusal in two lines: which refusal, then the
+        // path or image it is about. One of them alone is the less useful half.
+        let said = {
+            let lines: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            let index = lines
+                .iter()
+                .position(|line| line.to_ascii_lowercase().contains(needle))
+                .unwrap_or(0);
+            let raw = lines.get(index).copied().unwrap_or(needle);
+            let head = raw.trim_end_matches(':').trim();
+            match (head.len() < raw.trim().len(), lines.get(index + 1)) {
+                (true, Some(more)) => format!("{head}: {more}"),
+                _ => head.to_string(),
+            }
+        };
+        return Some(Diagnosis {
+            cause: format!("the container runtime refused the job rather than running it: {said}"),
+            hint: Some(
+                "nothing of the step ran, so nothing here is a verdict about the code: the \
+                 refusal is about the container gitiup asked for. The two paths it always \
+                 mounts are the checkout and the run's scratch directory, and the scratch \
+                 follows `$TMPDIR` — on macOS, pointing TMPDIR at a directory the desktop \
+                 app will share is the fix that needs no settings change. `gitiup run \
+                 --execute` prints every mount it asked for before the first step; \
+                 `gitiup doctor --sandbox` says what this machine's runtime will share, and \
+                 whether the image is present — and gitiup never pulls one during a run, so \
+                 an image the runtime has never seen is refused by name"
+                    .to_string(),
+            ),
+        });
+    }
+    if exit_code == 125 {
+        return Some(Diagnosis {
+            cause: "the step exited 125, which is what a container runtime answers when the \
+                    container never started: no step command ran"
+                .to_string(),
+            hint: Some(
+                "the runtime's own words are in the output above, and they are the only \
+                 account of what it refused. `gitiup run --execute` prints the mounts it \
+                 asked for before the first step, and `gitiup doctor --sandbox` says what \
+                 this machine's runtime will share. If this step did not run in a \
+                 container, 125 is the program's own exit code and its output above is \
+                 the answer"
+                    .to_string(),
+            ),
+        });
+    }
+
     // The shell's own two refusals: it could not find the program, or could not run it.
     if let Some(program) = missing_program(stderr) {
         if exit_code == 126 {
@@ -712,7 +802,6 @@ pub fn diagnose(exit_code: i64, stderr: &str) -> Option<Diagnosis> {
 
     // What the sandbox refused, as opposed to what the program decided. These are the
     // failures that read like a broken build and are really the confinement working.
-    let lower = stderr.to_ascii_lowercase();
     if lower.contains("read-only file system") {
         return Some(Diagnosis {
             cause: format!(

@@ -647,6 +647,56 @@ fn what_the_sandbox_refused_is_said_to_be_the_sandbox() {
 }
 
 #[test]
+fn a_runtime_that_refused_the_container_is_not_read_as_the_jobs_verdict() {
+    // The sentence that got a Mac user blaming their own folders: a container that never
+    // started, diagnosed as a sandbox refusing a write, because exit 125 was not read as
+    // "the runtime said no". The daemon's own words are the whole of the answer, so the
+    // diagnosis has to carry them rather than invent a sandbox denial.
+    let why = gitiup_run::diagnose(
+        125,
+        "Mounts denied: \nThe path /Library is not shared from the host and is not known to Docker.\n",
+    )
+    .expect("a refusal by the runtime has a reading");
+    assert!(why.cause.contains("runtime"), "{why}");
+    assert!(why.cause.contains("not shared from the host"), "{why}");
+    assert!(
+        !why.cause.contains("read-only"),
+        "the container never started, so no write of the job's was refused: {why}"
+    );
+    assert!(
+        why.hint.unwrap().contains("doctor"),
+        "and where to see what this machine's runtime will share"
+    );
+
+    // Two other daemon sentences, whichever exit code they arrive with.
+    let why = gitiup_run::diagnose(
+        125,
+        "Error response from daemon: Duplicate mount point: '/work'\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("Duplicate mount point"), "{why}");
+    let why = gitiup_run::diagnose(
+        1,
+        "Unable to find image 'alpine:3.20' locally\nError: No such image: alpine:3.20\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("No such image"), "{why}");
+
+    // A 125 with nothing to say is still not the job's verdict.
+    let why = gitiup_run::diagnose(125, "").unwrap();
+    assert!(why.cause.contains("never started"), "{why}");
+
+    // And the denial that *is* the sandbox's — a write the job made, in a container that
+    // started and ran it — still reads as the sandbox's.
+    let why = gitiup_run::diagnose(
+        1,
+        "cp: cannot create '/etc/passwd': Read-only file system\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("read-only"), "{why}");
+}
+
+#[test]
 fn a_plain_program_exit_with_a_plain_message_gets_no_invention() {
     // The claim this function has to be able to refuse to make: 1 from a test runner is
     // the test runner's verdict, and a guess about the caller's code is noise.

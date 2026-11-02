@@ -304,6 +304,48 @@ fn the_digest_of_a_pinned_plan_is_a_known_answer() {
     );
 }
 
+/// The confinement's own sentences, printed before the first step: which trees are
+/// mounted and how, where the job's toolchain comes from, what the network may do, and —
+/// on a Mac — which paths the runtime will refuse to share. A step that cannot find its
+/// checkout or its compiler is a different conversation once the mounts are on the table,
+/// which is why they are printed on the way in rather than needed on the way out.
+#[test]
+fn executing_says_what_the_sandbox_decided_before_the_first_step() {
+    let dir = workspace(GREEN_CI);
+    let output = gitiup(
+        dir.path(),
+        &["run", "--execute", "--sandbox", "plain"],
+        UNSANDBOXED,
+    );
+    assert!(
+        [0, 10].contains(&code(&output)),
+        "{}{}",
+        out_text(&output),
+        err_text(&output)
+    );
+    let notes = err_text(&output);
+    assert!(
+        notes.contains("note         sandbox: "),
+        "the backend's plan notes belong to the run that is about to happen: {notes}"
+    );
+    // The scratch is one of the two writable trees; a note that did not name it would be
+    // a note about somebody else's run.
+    assert!(
+        notes.contains("scratch") || notes.contains("rlimits") || notes.contains("UNSANDBOXED"),
+        "the plain backend's own sentences: {notes}"
+    );
+    // A simulated run has no confinement to describe, and prints none of it: these lines
+    // are for the run that is about to touch the machine.
+    let output = gitiup(dir.path(), &["run"], &[]);
+    assert_eq!(code(&output), 0, "{}", out_text(&output));
+    assert!(
+        !out_text(&output).contains("sandbox: ") && !err_text(&output).contains("sandbox: "),
+        "a plan that spawns nothing has no mounts to report: {}{}",
+        out_text(&output),
+        err_text(&output)
+    );
+}
+
 #[test]
 fn execute_needs_a_sandbox_that_exists_and_refuses_the_absence_of_one() {
     let dir = workspace(CI);

@@ -170,9 +170,54 @@ backends, in the order gitiup prefers them:
                      about the sandbox
 ```
 
-The same warning is in the plan notes for a macOS run, printed by `gitiup run --plan
---json`, because a reviewer should see it before the job runs rather than in a
-`no such file` at step three.
+The same warning is in the confinement notes a run prints before its first step: `gitiup
+run --execute --sandbox docker` says, on stderr, the mounts it is about to ask for, where
+the job's toolchain comes from, and this sentence — because a reviewer should see it
+before the job runs rather than in a `no such file` at step three.
+
+### `exec: "-e": executable file not found in $PATH`
+
+The least obvious thing that can be wrong with a container sandbox, because nothing about
+the sandbox is wrong:
+
+```console
+$ gitiup run --execute --sandbox docker --workflow .github/workflows/build.yml
+FAILED       job `build` step 1 'build' — exit 127
+  | exec: "-e": executable file not found in $PATH
+```
+
+A container that started, in a sandbox that had just watched a write fail to land and a
+connection refused, immediately asked to exec a program called `-e`. The reason is an
+argument-order rule that is invisible until it bites: **`docker run` stops reading its own
+options at the image**, and gives everything after the image to the container as its
+command. The job's environment travels as `-e KEY=VALUE` arguments, so building them
+after the image turned thirteen options into thirteen arguments — and the step's
+environment is never empty, so this was every executed step, on every OS, with the Mac
+just being where it was noticed.
+
+The image is now appended last and the `-e` pairs go in front of it
+([`Launch::env_at`](../crates/gitiup-sandbox/src/backend.rs)), and
+`crates/gitiup-sandbox/tests/container_environment.rs` runs a planned step against a
+runtime that enforces its own grammar, so the ordering is a reproduction and not an
+assertion about a vector. The same rule is why a plan's notes are printed before the
+first step rather than after the last: an argument order that a runtime refuses with a
+message about a missing program is a thing a reader has to be told in advance.
+
+A daemon's refusal is read as the daemon's now, and not as the job's. `exit 125` means
+"the container never started", and it used to be diagnosed as a sandbox refusing a write,
+which is how a Mac user was sent reading their folder permissions for a container that
+never existed:
+
+```console
+$ gitiup run --execute --sandbox docker --workflow .github/workflows/build.yml
+FAILED       job `build` step 1 'build' — exit 125
+why          the container runtime refused the job rather than running it: Mounts denied:
+             The path /var/folders/…/T/gitiup-run-1 is not shared from the host and is not
+             known to Docker.
+hint         … the two paths it always mounts are the checkout and the run's scratch
+             directory, and the scratch follows `$TMPDIR` — on macOS, pointing TMPDIR at a
+             directory the desktop app will share is the fix that needs no settings change
+```
 
 ### "Duplicate mount point: '/work'"
 
@@ -445,9 +490,11 @@ weaken it), and the property they underwrite is reported as unchecked:
 ```
 
 Why a wrapper binary instead of `sandbox_init` in a `pre_exec` hook: `sandbox-exec -p
-'<profile>' <command>` is **argv**, so `gitiup run --plan` prints the exact confinement a
-reviewer can copy, paste and read; and calling `sandbox_init` between `fork` and `execve`
-means doing `malloc` there, which is exactly what a `pre_exec` hook must not do. The
+'<profile>' <command>` is **argv**, so the confinement a reviewer reads is the command
+line itself — copyable, and checkable against the profile's shape that `gitiup run
+--execute` prints in its notes ("seatbelt profile: 34 rules, denies all egress and the
+credential list"); and calling `sandbox_init` between `fork` and `execve` means doing
+`malloc` there, which is exactly what a `pre_exec` hook must not do. The
 rlimits that have no SBPL equivalent (process count, file size, cpu seconds, no core
 dumps) are still applied in the child.
 

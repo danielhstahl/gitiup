@@ -94,6 +94,13 @@ list at all. [Running a workflow with `act`](act.md) says what it does promise;
   "what this uid is already running, plus the slack the job asked for"), file size, no
   core dumps, and a wall-clock deadline enforced by the runner.
 
+All of that is decided before the first step, and said there too: `gitiup run --execute`
+prints the confinement's own sentences on stderr — the mounts it will ask for and in which
+mode, where the job's `/usr` comes from, what the network may do — before anything is
+spawned, because a mount a runtime will not make and a tool an image does not carry both
+look like a broken build from the inside
+([`macOS`](macos.md#exec--e-executable-file-not-found-in-path)).
+
 ## Probes, refusals, and `doctor`
 
 `gitiup doctor --sandbox` prints the kernel facts, every backend's probe, and a verdict.

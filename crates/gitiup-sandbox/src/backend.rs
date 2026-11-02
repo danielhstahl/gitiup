@@ -82,6 +82,26 @@ pub struct Launch {
     /// Set when the backend passes environment as *arguments* (`docker -e`), in which
     /// case the wrapper's own environment is deliberately empty.
     pub env_as_args: bool,
+    /// Where in [`prefix`](Self::prefix) the `-e` arguments go, when
+    /// [`env_as_args`](Self::env_as_args) is set: an index into `prefix`, before which
+    /// they are inserted. `None` means "at the end of the prefix", which is right for a
+    /// wrapper that takes options up to its `separator`.
+    ///
+    /// It is not right for a container runtime, and the difference is not cosmetic:
+    /// `docker run` stops reading its own options at the image name and hands everything
+    /// after it to the container as *the command to run*. `docker run img -e K=V /bin/sh
+    /// s.sh` therefore starts a container whose argv is `["-e", "K=V", "/bin/sh",
+    /// "s.sh"]`, and the job dies at once with
+    ///
+    /// ```text
+    /// exec: "-e": executable file not found in $PATH
+    /// ```
+    ///
+    /// — exit 126 or 127, from a container that did start, in a sandbox that did work,
+    /// with a message that names neither the environment nor the image. A backend whose
+    /// options must precede a positional argument sets this to the index of that
+    /// argument.
+    pub env_at: Option<usize>,
     /// Environment the **wrapper program itself** needs, as opposed to the job's.
     ///
     /// A container runtime is a CLI with its own expectations: it has to find its
@@ -108,15 +128,20 @@ impl Launch {
         Launch::default()
     }
 
-    /// The full argv to spawn: wrapper, its `-e` style environment, the separator,
-    /// then the job's own command.
+    /// The full argv to spawn: wrapper, its `-e` style environment at
+    /// [`env_at`](Self::env_at), the separator, then the job's own command.
     pub fn argv(&self, command: &[String], caller_env: &Env) -> Vec<String> {
         let mut argv = self.prefix.clone();
         if self.env_as_args {
-            for (key, value) in caller_env.iter().chain(self.env.iter()) {
-                argv.push("-e".to_string());
-                argv.push(format!("{key}={value}"));
-            }
+            let given: Vec<String> = caller_env
+                .iter()
+                .chain(self.env.iter())
+                .flat_map(|(key, value)| ["-e".to_string(), format!("{key}={value}")])
+                .collect();
+            // Spliced, not appended: an option that has to sit in front of a positional
+            // argument (a container's `-e` before its image) cannot be added afterwards.
+            let at = self.env_at.unwrap_or(argv.len()).min(argv.len());
+            argv.splice(at..at, given);
         }
         argv.extend(self.separator.iter().cloned());
         argv.extend(command.iter().cloned());
@@ -715,6 +740,49 @@ mod tests {
         );
         assert_eq!(argv.last().unwrap(), "/bin/true");
         assert!(!argv.iter().any(|argument| argument == "--"));
+    }
+
+    #[test]
+    fn a_wrappers_options_can_be_closed_by_a_positional_argument() {
+        // `docker run` is the wrapper that does this: the image is a positional argument
+        // that ends option parsing, so `-e` after it is the job's argv and not a flag.
+        // The launch has to know that, because the environment is built here and not by
+        // the backend that knows its own grammar.
+        let launch = Launch {
+            prefix: vec!["docker".into(), "run".into(), "--rm".into(), "img".into()],
+            env_as_args: true,
+            env_at: Some(3),
+            ..Launch::default()
+        };
+        let mut env = Env::new();
+        env.insert("K".to_string(), "V".to_string());
+        let argv = launch.argv(&["/bin/true".to_string()], &env);
+        assert_eq!(
+            argv,
+            vec![
+                "docker".to_string(),
+                "run".to_string(),
+                "--rm".to_string(),
+                "-e".to_string(),
+                "K=V".to_string(),
+                "img".to_string(),
+                "/bin/true".to_string()
+            ]
+        );
+        // No position, and the old append behaviour stands: a wrapper that takes options
+        // up to its separator wants them at the end.
+        let appended = Launch {
+            env_as_args: true,
+            env_at: None,
+            ..launch
+        };
+        let argv = appended.argv(&["/bin/true".to_string()], &env);
+        assert_eq!(argv.last(), Some(&"/bin/true".to_string()));
+        assert!(
+            argv.iter().position(|a| a == "img").unwrap()
+                < argv.iter().position(|a| a == "-e").unwrap(),
+            "{argv:?}"
+        );
     }
 
     #[test]

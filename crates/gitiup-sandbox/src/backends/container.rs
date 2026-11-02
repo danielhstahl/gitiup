@@ -2,7 +2,7 @@
 //!
 //! A container is the only backend here that gives the job a filesystem of its own, so
 //! a write that succeeds inside it is not a write to your disk at all. That is worth
-//! preferring when it is available — and it comes with three debts this module pays out
+//! preferring when it is available — and it comes with four debts this module pays out
 //! loud rather than quiet:
 //!
 //! * **the image has to be there, and gitiup never pulls one for you.** A job's
@@ -46,6 +46,20 @@
 //! "that image is not here" into `error getting credentials - err: exit status 1`, a
 //! message about a keychain when the fact was about an image, so [`Launch::wrapper_env`]
 //! hands the CLI exactly the variables it needs and nothing else.
+//!
+//! The fourth debt is the plainest and was the last to be paid: **`docker run` stops
+//! reading its own options at the image**, and hands everything after the image to the
+//! container as its command. The job's environment travels as `-e` arguments, so
+//! building them after the image asks the container to exec a program called `-e`:
+//!
+//! ```text
+//! exec: "-e": executable file not found in $PATH
+//! ```
+//!
+//! — exit 126/127 from a container that started fine, under a sandbox that had passed
+//! every canary, with a message that blames neither the environment nor the caller. The
+//! image is therefore appended last, and [`Launch::env_at`] says where the `-e` pairs go
+//! in front of it.
 //!
 //! Egress: `--network=none` whenever the job asks for nothing, which is
 //! kernel-enforced. When the job names registries, the container gets the runtime's
@@ -200,6 +214,12 @@ impl Container {
     /// The `run` arguments that implement the baseline policy for one job.
     ///
     /// `mounts` is [`Container::mounts`] for the same spec, resolved once by the caller.
+    ///
+    /// **The image is not in here.** `docker run` stops reading options at the image and
+    /// gives everything after it to the container as its command, so the image has to be
+    /// the last thing before the job — which is why [`plan`] appends it and hands
+    /// [`Launch::env_at`] the index it occupies: the `-e` arguments belong in front of
+    /// it, and after it they are a program called `-e` that the job is asked to exec.
     fn run_args(&self, spec: &Spec, mounts: &Plan) -> Vec<String> {
         let mut args = vec![
             "run".to_string(),
@@ -260,7 +280,6 @@ impl Container {
         // The working directory is the workspace *as it is mounted*, which is its
         // cleaned destination — the string the job's own paths have to match.
         args.push(mounts::clean(&spec.workspace));
-        args.push(self.image());
         args
     }
 
@@ -696,9 +715,16 @@ impl Sandbox for Container {
         let mut prefix = vec![binary.display().to_string()];
         let mounts = self.mounts(spec)?;
         prefix.extend(self.run_args(spec, &mounts));
+        // The image is the last option and the first thing the container sees: the `-e`
+        // arguments for the job have to be inserted in front of it, not after it, or the
+        // runtime hands them to the job as its own argv and the step dies trying to exec
+        // a program called `-e` (see [`Launch::env_at`]).
+        let env_at = prefix.len();
+        prefix.push(self.image());
         let mut launch = Launch {
             prefix,
             env_as_args: true,
+            env_at: Some(env_at),
             wrapper_env: cli_env(),
             cwd: Some(spec.workspace.clone()),
             wall_clock: spec.limits.wall_clock,
@@ -831,12 +857,15 @@ mod tests {
 
     /// The `run` arguments a spec produces, with the mounts resolved the way `plan`
     /// resolves them — which is the whole point: the refusal and the argv come from the
-    /// same one computation.
+    /// same one computation. The image is appended as `plan` appends it, so what the
+    /// tests read is the option list the runtime will actually be handed.
     fn args_for(backend: &Container, spec: &Spec) -> Vec<String> {
         let mounts = backend
             .mounts(spec)
             .expect("the mounts for this spec resolve");
-        backend.run_args(spec, &mounts)
+        let mut args = backend.run_args(spec, &mounts);
+        args.push(backend.image());
+        args
     }
 
     #[test]
@@ -952,6 +981,35 @@ mod tests {
         let c = cargo.display().to_string();
         assert!(text.contains(&format!("-v {t}:{t}:ro")), "{text}");
         assert!(text.contains(&format!("-v {c}:{c}:ro")), "{text}");
+    }
+
+    #[test]
+    fn run_args_stop_at_the_image_leaving_room_for_the_environment() {
+        // The image ends the runtime's options and starts the job's argv, so `-e` after
+        // it is not an option at all: the container starts and immediately tries to exec
+        // a program called `-e` (`exec: "-e": executable file not found in $PATH`), in a
+        // sandbox that passed every canary. `plan` puts them there; this says the option
+        // list it builds leaves exactly that room. (The argv as a whole, with a runtime
+        // that enforces the contract, is `tests/container_environment.rs`.)
+        let backend = Container::docker();
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = workspace.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let spec = step(
+            &workspace.path().display().to_string(),
+            &scratch.display().to_string(),
+        );
+        let mounts = backend.mounts(&spec).unwrap();
+        let options = backend.run_args(&spec, &mounts);
+        assert!(
+            !options.iter().any(|arg| arg == &backend.image()),
+            "the image is appended by plan, after the -e arguments: {options:?}"
+        );
+        assert_eq!(
+            options.last().map(|arg| arg.as_str()),
+            Some(mounts::clean(&spec.workspace).as_str()),
+            "the last option is the working directory, so the image goes right after it: {options:?}"
+        );
     }
 
     #[test]
