@@ -20,7 +20,7 @@ that probed.
 
 | backend    | what does the isolating | what it denies | what it does **not** deny |
 |------------|-------------------------|----------------|---------------------------|
-| `docker`   | a container runtime     | writes outside the mounts, all egress (`--network=none`), every capability, setuid, new privileges; resources via `--memory`/`--pids-limit` | reads of what is mounted in; a job that can reach the docker socket (it never can) |
+| `docker`   | a container runtime     | writes outside the mounts, all egress (`--network=none`), every capability, setuid, new privileges; resources via `--memory`/`--pids-limit` | reads of what is mounted in; a job that can reach the docker socket (it never can). Its **own** filesystem is the point: the image, not the host, provides `/usr`, `/bin`, `/lib` and `/etc` |
 | `podman`   | as `docker`, rootless where possible | as `docker` | as `docker` |
 | `bwrap`    | `bubblewrap` namespaces | the filesystem except the binds (workspace read-only, scratch read-write, `/proc`, sized `/tmp`), all egress unless an allowlist was asked for, `--dev-bind /` never | nothing outside the namespaces, but the user namespace means root inside is not root outside |
 | `landlock` | Landlock + seccomp + rlimits applied to the child before `execve` | writes outside the scratch, every TCP port the job was not given (ABI 4+), `ptrace`/`process_vm_readv`, `mount`/`unshare`/`setns`/module loading/`open_by_handle_at`, the privilege syscalls, installing a seccomp filter of one's own, core dumps, cpu/address/process/file rlimits | **reads** — anything the runner's uid can read is readable; the process table is still this machine's |
@@ -71,10 +71,16 @@ list at all. [Running a workflow with `act`](act.md) says what it does promise;
   per destination, writable winning over read-only and the resolution printed
   ([`mounts`](../crates/gitiup-sandbox/src/mounts.rs), [`macOS`](macos.md#duplicate-mount-point-work)).
 * **readable:** the system directories every build needs (`/usr`, `/bin`, `/lib`,
-  `/etc`, …) plus the workspace. Granting the tool directory is explicit
-  (`Spec::with_tool`) rather than guessed, because a confined process cannot execute a
-  program it has no execute right on — the failure to grant it looks like `EACCES` on
-  `execve`, which is why `Spec::tool_dirs` exists.
+  `/etc`, …) plus the workspace — **for a job that runs on this machine's filesystem**.
+  A container is the exception, and it is the one place the distinction saves the run:
+  its job has a root filesystem of its own, out of the image, so the host's are not
+  mounted ([`SystemDirs`](../crates/gitiup-sandbox/src/mounts.rs)). Binding them in was
+  a read-only copy of one OS laid over the toolchain the image was built for, and on a
+  Mac a `Mounts denied` refusal for paths the desktop app does not share
+  ([`macOS`](macos.md#a-write-was-refused-because-the-filesystem-is-read-only)).
+  Granting a tool directory is explicit (`Spec::with_tool`) rather than guessed, because
+  a confined process cannot execute a program it has no execute right on — the failure
+  to grant it looks like `EACCES` on `execve`, which is why `Spec::tool_dirs` exists.
 * **egress:** none. No host, no port, no DNS. A job that needs the network needs an
   explicit allowlist, and the allowlist comes with a loopback proxy and an
   allowlist-only resolver

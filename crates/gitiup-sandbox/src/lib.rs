@@ -24,8 +24,8 @@
 //!
 //! | backend | what does the work | filesystem | egress, default-deny | egress, allowlist | needs |
 //!|---------|--------------------|------------|----------------------|-------------------|-------|
-//!| `docker`, `podman` | a container runtime | its own; workspace bind-mounted read-only | `--network=none`: **kernel** | proxy, **audited** | runtime + local image |
-//!| `bwrap` | mount/pid/net namespaces | rebuilt; workspace read-only | no route: **kernel** | proxy, **audited** | `bubblewrap` package |
+//!| `docker`, `podman` | a container runtime | its own, out of the image — the host's `/usr`, `/bin` and `/etc` are never mounted over it; workspace bind-mounted read-only | `--network=none`: **kernel** | proxy, **audited** | runtime + local image |
+//!| `bwrap` | mount/pid/net namespaces | rebuilt from binds of the **host's** directories (its `/usr` and `/bin` are the job's); workspace read-only | no route: **kernel** | proxy, **audited** | `bubblewrap` package |
 //!| `landlock` | Landlock + seccomp in the child | writes refused outside the scratch | no TCP rights: **kernel** (ABI 4+) | only the proxy's port: **kernel** (ABI 4+) | Linux ≥ 5.13 with Landlock |
 //!| `seatbelt` | an XNU kernel sandbox profile, applied by `sandbox-exec` | writes outside the scratch refused, *and* the credential directories too | `deny network*`: **kernel** | the proxy's address only: **kernel** | macOS with `sandbox-exec` (every release so far) |
 //!| `unshare` | user + net namespaces | *not isolated* | no route: **kernel** | no effect: deny-all only | `unshare(1)`, userns allowed |

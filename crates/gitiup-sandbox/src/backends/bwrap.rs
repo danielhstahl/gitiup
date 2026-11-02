@@ -31,8 +31,12 @@ pub struct Bubblewrap;
 impl Bubblewrap {
     /// The mounts `bwrap` will be asked to make, with its own `/tmp`, `/proc` and `/dev`
     /// already claimed (see [`crate::mounts`]: one destination, one mount).
+    ///
+    /// `bwrap` builds a filesystem out of binds, so the job's `/usr` and `/bin` *are*
+    /// the host's and have to be granted: this is the [`SystemDirs::Hosts`](mounts::SystemDirs)
+    /// world, and the contrast is with a container, whose job has a root of its own.
     pub fn mounts(spec: &Spec) -> Result<mounts::Plan> {
-        mounts::plan(spec, &mounts::BWRAP_DESTINATIONS)
+        mounts::plan(spec, &mounts::BWRAP_DESTINATIONS, mounts::SystemDirs::Hosts)
     }
 
     /// The binary, if it is installed.

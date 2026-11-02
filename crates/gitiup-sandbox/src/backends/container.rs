@@ -2,7 +2,7 @@
 //!
 //! A container is the only backend here that gives the job a filesystem of its own, so
 //! a write that succeeds inside it is not a write to your disk at all. That is worth
-//! preferring when it is available — and it comes with two debts this module pays out
+//! preferring when it is available — and it comes with three debts this module pays out
 //! loud rather than quiet:
 //!
 //! * **the image has to be there, and gitiup never pulls one for you.** A job's
@@ -22,6 +22,22 @@
 //!   runtime refuses the container with `Duplicate mount point: '/work'`. The mounts
 //!   are therefore worked out by [`crate::mounts`] before any argv exists, and a
 //!   collision the tool cannot resolve is gitiup's own refusal, naming both grants.
+//!
+//! * **the image's filesystem is the job's filesystem, so the host's is not mounted
+//!   over it.** This is the third debt, and the one giti-ej2 paid: the read list every
+//!   backend needs on the host (`/usr`, `/bin`, `/lib`, `/etc`, and on a Mac
+//!   `/Applications`, `/Library`, `/opt/local`) was handed to `docker -v` along with
+//!   the workspace, so the container got a read-only copy of *this* machine's toolchain
+//!   on top of the one its image was built for. On Linux that meant a musl image
+//!   quietly given a glibc `/usr` and a `/bin/sh` that was not busybox; on macOS it was
+//!   worse, because the desktop app only mounts directories it has agreed to share and
+//!   refuses the ones it has not — `Mounts denied: the path /Library is not shared
+//!   from the host`, `exit 125` — and the paths it does share arrived read-only, so a
+//!   job that wrote where its image keeps its own files was told the filesystem is
+//!   read-only. A container run therefore mounts the trees the spec **named** and
+//!   nothing implicit ([`crate::mounts::SystemDirs::JobOwnsThem`]): the checkout, the
+//!   scratch, and whatever an operator names because the image does not carry it. What
+//!   is in the image is what the job has, and the plan says so.
 //!
 //! The runtime's *own* CLI is a separate matter from the job it starts. The job gets
 //! an environment built from nothing; the CLI has to find its config, its credential
@@ -253,12 +269,22 @@ impl Container {
     ///
     /// The runtime keeps one mount per destination and refuses a container that puts
     /// two there — `Duplicate mount point: '/work'` — which is a thing a workflow step
-    /// asks for by default, because its checkout is both readable and writable.
-    /// [`crate::mounts`] is what makes that a decision gitiup makes and explains rather
-    /// than a daemon's error message; `gitiup doctor --sandbox` says the same thing
-    /// before a job finds it out.
+    /// asks for by default, because its checkout is both readable and writable
+    /// (giti-0xi). [`crate::mounts`] is what makes that a decision gitiup makes and
+    /// explains rather than a daemon's error message; `gitiup doctor --sandbox` says the
+    /// same thing before a job finds it out.
+    ///
+    /// The other thing decided here is whose system directories the job gets, and the
+    /// answer is the image's ([`mounts::SystemDirs::JobOwnsThem`], giti-ej2): mounting
+    /// the host's `/usr`, `/bin` and `/etc` read-only over the image's buries the
+    /// toolchain the image was built for, and on macOS gets the container refused for
+    /// paths the desktop app does not share. Only the trees the spec named are mounted.
     pub fn mounts(&self, spec: &Spec) -> Result<Plan> {
-        mounts::plan(spec, &mounts::TMPFS_DESTINATIONS)
+        mounts::plan(
+            spec,
+            &mounts::TMPFS_DESTINATIONS,
+            mounts::SystemDirs::JobOwnsThem,
+        )
     }
 
     /// The baseline flags for a probe container: the same policy, no mounts.
@@ -453,9 +479,10 @@ impl Sandbox for Container {
     fn guarantees(&self) -> &'static str {
         "the job runs in a container with no capabilities, no new privileges, its own \
          pid namespace and its own filesystem; the workspace is bind-mounted read-only \
-         and only the scratch and a size-capped /tmp are writable; egress is \
-         --network=none unless the job named registries, in which case the proxy policy \
-         is audited rather than kernel-enforced"
+         and only the scratch and a size-capped /tmp are writable; the image, not the \
+         host, provides /usr, /bin, /lib and /etc, so the host's system directories are \
+         never mounted; egress is --network=none unless the job named registries, in \
+         which case the proxy policy is audited rather than kernel-enforced"
     }
 
     fn probe(&self) -> Result<Probe> {
@@ -684,6 +711,13 @@ impl Sandbox for Container {
             self.image(),
             self.pull_command()
         ));
+        launch.notes.push(format!(
+            "that image is the job's toolchain, not this machine's: its /bin/sh, git and \
+             compiler are the image's, and the host's are deliberately not mounted — a \
+             step that fails with `not found` is asking for a tool the image does not \
+             carry, so build it into {IMAGE_ENV} (a job that cannot pull during a run \
+             cannot install one either) or name the directory to mount"
+        ));
         launch.notes.push(if spec.egress.is_denied() {
             "network none: nothing can be reached".to_string()
         } else {
@@ -710,11 +744,16 @@ impl Sandbox for Container {
         if Platform::survey().os == OS::MacOS {
             // The one thing about a container on macOS that has bitten everyone: the
             // job runs in the desktop app's Linux VM, and a path the app has not
-            // agreed to share mounts as an empty directory with no warning at all.
+            // agreed to share mounts as an empty directory with no warning at all —
+            // or, for a path the runtime can tell is on the host and was not shared,
+            // is refused outright (`exit 125`). This is the second reason the host's
+            // system directories are not mounted: most of them are not shared.
             launch.notes.push(
                 "this container runs in the runtime's Linux VM: every mounted path above must \
                  be in the desktop app's file-sharing list, or the job will find an empty \
-                 directory where its checkout should be (docs/macos.md)"
+                 directory where its checkout should be (or the runtime will refuse the run \
+                 with `Mounts denied`); the mounts above are only the job's own trees, which \
+                 is why a checkout under a shared directory is what works here (docs/macos.md)"
                     .to_string(),
             );
         }
@@ -845,6 +884,74 @@ mod tests {
             args.contains("--tmpfs /tmp:rw,noexec,nosuid,size="),
             "{args}"
         );
+    }
+
+    #[test]
+    fn the_hosts_system_directories_are_never_mounted_into_the_job() {
+        // giti-ej2, and the shape of the thing that went wrong: the per-OS system list
+        // was mounted into the container alongside the workspace, so the job's `/usr`,
+        // `/bin` and `/etc` became read-only copies of the *host's*. On a Mac the desktop
+        // app does not even share `/Library`, `/Applications` or `/opt/local`, and the
+        // daemon refused the container (`exit 125`) rather than explain itself.
+        let backend = Container::docker();
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = workspace.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        for spec in [
+            Spec::new(workspace.path(), &scratch),
+            step(
+                &workspace.path().display().to_string(),
+                &scratch.display().to_string(),
+            ),
+        ] {
+            let text = args_for(&backend, &spec).join(" ");
+            for system in crate::platform::system_read_only() {
+                assert!(
+                    !text.contains(&format!("-v {system}:{system}:")),
+                    "`{system}` is the image's own directory: {text}"
+                );
+            }
+            // The job's own trees are all that is mounted, and they are still there.
+            let w = workspace.path().display().to_string();
+            let s = scratch.display().to_string();
+            assert!(text.contains(&format!("-v {s}:{s}:rw")), "{text}");
+            assert!(
+                text.contains(&format!("-v {w}:{w}:")),
+                "the checkout is mounted: {text}"
+            );
+        }
+        // And the guarantees sentence — the one that lands beside a signed report — says
+        // where the job's toolchain comes from, because "its own filesystem" on its own
+        // is exactly the phrase a reader could take the wrong way.
+        assert!(
+            Container::docker()
+                .guarantees()
+                .contains("not the host, provides /usr"),
+            "{}",
+            Container::docker().guarantees()
+        );
+    }
+
+    #[test]
+    fn a_tree_the_operator_names_is_mounted_into_the_container() {
+        // "Nothing implicit" is not "nothing but the checkout": a toolchain the image
+        // does not carry is mounted when someone names it, because they are the one who
+        // knows the job needs it. (Real directories: a read-only mount whose source is
+        // not there is skipped rather than fatal, so a made-up path would prove nothing.)
+        let backend = Container::docker();
+        let outside = tempfile::tempdir().unwrap();
+        let toolchain = outside.path().join("toolchain");
+        let cargo = outside.path().join("cargo-bin");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        std::fs::create_dir_all(&cargo).unwrap();
+        let spec = Spec::new("/work", "/work/.scratch")
+            .with_read_path(&toolchain)
+            .with_tool(cargo.join("cargo"));
+        let text = args_for(&backend, &spec).join(" ");
+        let t = toolchain.display().to_string();
+        let c = cargo.display().to_string();
+        assert!(text.contains(&format!("-v {t}:{t}:ro")), "{text}");
+        assert!(text.contains(&format!("-v {c}:{c}:ro")), "{text}");
     }
 
     #[test]

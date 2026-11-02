@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::backend::{self, Backend};
 use crate::egress::Egress;
 use crate::kernel::{Availability, Kernel};
-use crate::mounts::{self, TMPFS_DESTINATIONS};
+use crate::mounts::{self, BWRAP_DESTINATIONS, TMPFS_DESTINATIONS, WITHHELD_SYSTEM_DIRS};
 use crate::platform::OS;
 use crate::spec::{Enforcement, Spec};
 
@@ -436,34 +436,68 @@ pub fn step_spec() -> Spec {
 /// named neither of the grants that caused it. [`crate::mounts`] resolves it before any
 /// argv exists; this line is the same resolution, reported before anything is planned,
 /// and says which collisions gitiup cannot resolve and therefore refuses.
+///
+/// It is checked in both mount worlds, because they grant different sets: a container's
+/// job has a root of its own and is mounted only the trees the spec named (giti-ej2), a
+/// namespace's job runs on this filesystem and is granted the host's system directories
+/// too. A clash hiding in either is a refused run.
 fn mount_points(os: OS) -> Check {
     let mut resolved: Vec<String> = Vec::new();
+    // Two counts, because the two worlds grant different sets and a reader needs to know
+    // which number they are looking at: the namespace-backed one is the wider (it is
+    // granted this machine's system directories), the container's is the short list of
+    // trees the spec named.
     let mut count = 0usize;
+    let mut container_count = 0usize;
     for (shape, spec) in [("a probe's", probe_spec()), ("a step's", step_spec())] {
-        match mounts::plan(&spec, &TMPFS_DESTINATIONS) {
-            Ok(plan) => {
-                count = count.max(plan.mounts.len());
-                resolved.extend(plan.notes.iter().cloned());
-            }
-            Err(why) => {
-                return Check::fail(
-                    "mount points",
-                    format!(
-                        "the spec shape of {shape} run cannot be mounted: {}",
-                        why.detail()
-                    ),
-                    why.hint()
-                        .unwrap_or("name a different scratch or workspace directory")
-                        .to_string(),
-                );
+        for (reserved, system, is_container) in [
+            (
+                &TMPFS_DESTINATIONS[..],
+                mounts::SystemDirs::JobOwnsThem,
+                true,
+            ),
+            (&BWRAP_DESTINATIONS[..], mounts::SystemDirs::Hosts, false),
+        ] {
+            match mounts::plan(&spec, reserved, system) {
+                Ok(plan) => {
+                    count = count.max(plan.mounts.len());
+                    if is_container {
+                        container_count = container_count.max(plan.mounts.len());
+                    }
+                    // The container's resolutions are the ones that read as findings, and
+                    // the standing "the image is the job's /usr" statement is not one — it
+                    // is said in its own words below rather than repeated here.
+                    if is_container {
+                        resolved.extend(
+                            plan.notes
+                                .iter()
+                                .filter(|note| !note.contains(WITHHELD_SYSTEM_DIRS))
+                                .cloned(),
+                        );
+                    }
+                }
+                Err(why) => {
+                    return Check::fail(
+                        "mount points",
+                        format!(
+                            "the spec shape of {shape} run cannot be mounted: {}",
+                            why.detail()
+                        ),
+                        why.hint()
+                            .unwrap_or("name a different scratch or workspace directory")
+                            .to_string(),
+                    );
+                }
             }
         }
     }
     let mut detail = format!(
-        "{count} mounts for a workflow step, each at its own destination: a container keys \
-         its mounts by destination and refuses a run that puts two there (`Duplicate mount \
-         point: '<path>'`, which names neither of the grants that collided), so a tree \
-         named twice is mounted once and the scratch cap keeps /tmp to itself"
+        "{count} mounts for a namespace-backed workflow step, each at its own destination: \
+         a container keys its mounts by destination and refuses a run that puts two there \
+         (`Duplicate mount point: '<path>'`, which names neither of the grants that \
+         collided), so a tree named twice is mounted once and the scratch cap keeps /tmp to \
+         itself — a container run asks for {container_count} only, because the image and \
+         not the host provides its /usr, /bin, /lib and /etc"
     );
     if !resolved.is_empty() {
         detail.push_str(&format!(" — {}", resolved.join("; ")));
@@ -600,8 +634,12 @@ mod tests {
     /// the run with `Duplicate mount point: '/work'` and named neither grant.
     #[test]
     fn the_shape_a_step_runs_in_mounts_its_checkout_once() {
-        let plan =
-            mounts::plan(&step_spec(), &TMPFS_DESTINATIONS).expect("a step must be mountable");
+        let plan = mounts::plan(
+            &step_spec(),
+            &TMPFS_DESTINATIONS,
+            mounts::SystemDirs::JobOwnsThem,
+        )
+        .expect("a step must be mountable");
         let checkout = plan
             .mounts
             .iter()

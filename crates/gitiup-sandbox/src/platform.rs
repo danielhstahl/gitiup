@@ -199,6 +199,13 @@ pub fn binary(name: &str) -> Option<PathBuf> {
 /// has no `/lib` or `/lib64` (the shared libraries live under the SDK and in
 /// `/usr/lib`), and its `/etc` is a symlink into `/private/etc` — which is why the
 /// grants are made on canonical paths by the backends that need exact matching.
+///
+/// **This is the list for a job that runs on this machine's filesystem.** It is not a
+/// list of things to bind-mount into a container: that job has a root filesystem of its
+/// own out of its image, and the host's `/usr`, `/bin`, `/Library` or `/Applications`
+/// landing read-only on top of the image's buries the toolchain the image was built for
+/// — and, on a Mac, gets the whole run refused for a directory the desktop app does not
+/// share (giti-ej2). See [`crate::mounts::SystemDirs`] for which backend grants what.
 pub fn system_read_only() -> &'static [&'static str] {
     match Platform::survey().os {
         OS::MacOS => &[

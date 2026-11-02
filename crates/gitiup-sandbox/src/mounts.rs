@@ -36,6 +36,17 @@
 //!    `/private`, and on a merged-usr Linux `/bin` *is* `/usr/bin`; a tree mounted
 //!    read-only under one spelling is writable through the other. Nothing is guessed
 //!    from the shape of the string — the host is asked, with `realpath`.
+//! 4. **the job's system directories come from wherever *its* filesystem keeps them**
+//!    ([`SystemDirs`]). Every backend that runs the job on this machine's filesystem is
+//!    handed the per-OS list (`/usr`, `/bin`, `/lib`, `/etc`, …), because a build that
+//!    cannot `exec` a compiler is a refusal with extra steps. A container is not: its
+//!    job has a root filesystem of its own, out of the image, and binding the host's
+//!    `/usr` over the image's buries the image's `/bin/sh`, its `git` and its loader
+//!    under a read-only copy of a *different* operating system's — which on a Mac is
+//!    worse again, because `/Library`, `/Applications` and `/opt/local` are not in the
+//!    desktop app's file-sharing list and the daemon refuses the container outright
+//!    (giti-ej2). A backend that gives the job its own root says so, and gets only the
+//!    trees the spec named.
 //!
 //! Two paths count as the same *destination* when the runtime would say so: compared
 //! after a lexical clean, because a runtime cleans the destination before keying it, so
@@ -55,6 +66,29 @@ pub const TMPFS_DESTINATIONS: [&str; 1] = ["/tmp"];
 /// The destinations `bwrap` claims besides the tmpfs: it builds `/proc` and `/dev`
 /// itself, so a spec that also names them would be mounting over its own work.
 pub const BWRAP_DESTINATIONS: [&str; 3] = ["/tmp", "/proc", "/dev"];
+
+/// The sentence [`plan`] adds when the job's own root supplies the system directories,
+/// and the sentence a caller looks for to tell that standing statement apart from a
+/// resolution it should print. Named because two places have to agree on it: the plan
+/// notes say it, `doctor` says the same thing in its own line and does not repeat it.
+pub const WITHHELD_SYSTEM_DIRS: &str = "the host's system directories are not mounted";
+
+/// Where the job's `/usr`, `/bin` and `/lib` come from.
+///
+/// The question is not a detail: it decides whether the implicit per-OS system list is
+/// a mount at all. Getting it wrong for a container is not a missing tool, it is the
+/// host's read-only `/usr` landing on top of the image's — `EACCES` for a tool that is
+/// really there, `EROFS` for a write into a directory the image owns, and on macOS a
+/// `Mounts denied` refusal for the paths the desktop app does not share (giti-ej2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemDirs {
+    /// The host's, so they have to be granted: the job runs on this machine's
+    /// filesystem (`bwrap`, `landlock`, `seatbelt`, `unshare`, `plain`).
+    Hosts,
+    /// The job's own, out of its image: nothing implicit is mounted, and what the spec
+    /// names by hand still is ([`Spec::named_read_paths`]).
+    JobOwnsThem,
+}
 
 /// One mount the runtime will be asked to make.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,11 +181,20 @@ impl Plan {
 /// `reserved` names destinations the backend has already claimed for itself —
 /// [`TMPFS_DESTINATIONS`] for `docker` and `podman`, [`BWRAP_DESTINATIONS`] for
 /// `bwrap`. A spec mount that lands on one is refused, with the fix.
-pub fn plan(spec: &Spec, reserved: &[&str]) -> Result<Plan> {
+///
+/// `system` says whose system directories the job gets ([`SystemDirs`]): a job running
+/// on this machine's filesystem is granted them, a job with a root of its own is not,
+/// and the difference is *said* in [`Plan::notes`] rather than left for someone to
+/// notice because `git` had vanished from the container.
+pub fn plan(spec: &Spec, reserved: &[&str], system: SystemDirs) -> Result<Plan> {
     // Read-only asks first: the writable ones overwrite, and asking second is what
     // makes "writable wins" the observable order as well as the stated one.
     let mut asks: Vec<(PathBuf, bool)> = Vec::new();
-    for path in spec.read_paths() {
+    let reads = match system {
+        SystemDirs::Hosts => spec.read_paths(),
+        SystemDirs::JobOwnsThem => spec.named_read_paths(),
+    };
+    for path in reads {
         asks.push((path, false));
     }
     for path in spec.write_paths() {
@@ -220,6 +263,18 @@ pub fn plan(spec: &Spec, reserved: &[&str]) -> Result<Plan> {
                 // same request.
             }
         }
+    }
+    if system == SystemDirs::JobOwnsThem {
+        // Said because it is the thing a reader of the command line is missing: the
+        // mounts below are *all* of them, and a tool that lives in the host's `/usr` is
+        // not in the job. The image is the answer, and it is named in the same plan.
+        plan.notes.push(format!(
+            "{WITHHELD_SYSTEM_DIRS}: this job's /usr, /bin, /lib and /etc come from its own \
+             root filesystem, and binding the host's over them would bury the toolchain its \
+             image was built for under a read-only copy of another operating system's — a \
+             tool the job needs that is not in that image belongs in the image, or is named \
+             explicitly so it is mounted",
+        ));
     }
     alias_notes(&mut plan);
     // Shallowest destination first, so a parent is always mounted before something
@@ -334,8 +389,12 @@ mod tests {
         // giti-0xi, exactly. Before this module these two grants became
         // `-v /work:/work:ro` and `-v /work:/work:rw`, and the runtime answered
         // `Duplicate mount point: '/work'` — naming neither grant.
-        let plan = plan(&step("/work", "/work/.scratch"), &TMPFS_DESTINATIONS)
-            .expect("the shape every workflow step uses must not clash");
+        let plan = plan(
+            &step("/work", "/work/.scratch"),
+            &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
+        )
+        .expect("the shape every workflow step uses must not clash");
         assert_eq!(count(&plan, "/work"), 1, "{:?}", keys(&plan));
         let work = at(&plan, "/work")[0];
         assert!(work.writable, "the explicit writable grant wins");
@@ -350,7 +409,12 @@ mod tests {
 
     #[test]
     fn a_read_only_workspace_stays_read_only_and_says_nothing() {
-        let plan = plan(&Spec::new("/work", "/work/.scratch"), &TMPFS_DESTINATIONS).unwrap();
+        let plan = plan(
+            &Spec::new("/work", "/work/.scratch"),
+            &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
+        )
+        .unwrap();
         let work = at(&plan, "/work")[0];
         assert!(
             !work.writable,
@@ -375,7 +439,7 @@ mod tests {
         let spec = Spec::new("/work", "/work/.scratch")
             .with_writable("/work")
             .with_read_path("/work/sub");
-        let plan = plan(&spec, &TMPFS_DESTINATIONS).unwrap();
+        let plan = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::Hosts).unwrap();
         let keys = keys(&plan);
         let at = |want: &str| {
             keys.iter()
@@ -404,7 +468,7 @@ mod tests {
             .with_read_path("/work")
             .with_read_path("/work/")
             .with_read_path("/work/.");
-        let plan = plan(&spec, &TMPFS_DESTINATIONS).unwrap();
+        let plan = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::Hosts).unwrap();
         for destination in keys(&plan) {
             assert_eq!(count(&plan, &destination), 1, "{destination} mounted twice");
         }
@@ -416,7 +480,12 @@ mod tests {
         // `-v /tmp:/tmp:rw` beside `--tmpfs /tmp:…,size=…` is the other way to lose a
         // run to `Duplicate mount point`, and the scratch *being* /tmp is more common
         // than anyone admits — TMPDIR is /tmp in a great many containers.
-        let err = plan(&Spec::new("/work", "/tmp"), &TMPFS_DESTINATIONS).unwrap_err();
+        let err = plan(
+            &Spec::new("/work", "/tmp"),
+            &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
+        )
+        .unwrap_err();
         assert!(err.detail().contains("/tmp"), "{err}");
         assert!(err.detail().contains("scratch cap"), "{err}");
         assert!(err.hint().unwrap().contains("/tmp/gitiup-scratch"), "{err}");
@@ -425,12 +494,14 @@ mod tests {
         plan(
             &Spec::new("/work", "/tmp/gitiup-scratch"),
             &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap();
         // And a destination a backend builds itself is refused the same way.
         let err = plan(
             &Spec::new("/work", "/work/.scratch").with_read_path("/proc"),
             &BWRAP_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap_err();
         assert!(err.detail().contains("/proc"), "{err}");
@@ -438,6 +509,7 @@ mod tests {
         plan(
             &Spec::new("/work", "/work/.scratch").with_read_path("/proc"),
             &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap();
     }
@@ -457,6 +529,7 @@ mod tests {
         let plan = plan(
             &Spec::new("/work", "/work/.scratch").with_read_path("/work/"),
             &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap();
         assert_eq!(count(&plan, "/work"), 1, "{:?}", keys(&plan));
@@ -477,7 +550,7 @@ mod tests {
         let spec = Spec::new("/work", "/work/.scratch")
             .with_read_path(&alias)
             .with_writable(&real);
-        let resolved = plan(&spec, &TMPFS_DESTINATIONS).unwrap();
+        let resolved = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::Hosts).unwrap();
         assert!(
             resolved
                 .notes
@@ -492,6 +565,7 @@ mod tests {
                 .with_read_path(&alias)
                 .with_read_path(&real),
             &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap();
         assert!(resolved.notes.is_empty(), "{:?}", resolved.notes);
@@ -511,6 +585,7 @@ mod tests {
                 &dir.path().join("scratch").display().to_string(),
             ),
             &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
         )
         .unwrap();
         let keys = keys(&plan);
@@ -554,7 +629,12 @@ mod tests {
 
     #[test]
     fn the_plan_lists_what_a_reviewer_is_owed() {
-        let plan = plan(&step("/work", "/work/.scratch"), &TMPFS_DESTINATIONS).unwrap();
+        let plan = plan(
+            &step("/work", "/work/.scratch"),
+            &TMPFS_DESTINATIONS,
+            SystemDirs::Hosts,
+        )
+        .unwrap();
         let lists = |writable: bool| -> Vec<String> {
             plan.list(writable)
                 .split(", ")
@@ -577,5 +657,105 @@ mod tests {
             lists(false)
         );
         assert_eq!(Plan::default().list(true), "(none)");
+    }
+
+    #[test]
+    fn a_job_with_a_root_of_its_own_is_not_given_the_hosts_system_directories() {
+        // giti-ej2, and the reason `plan` asks the question at all. The step shape was
+        // mounted with the host's `/usr`, `/bin`, `/lib`, `/etc` and (on a Mac)
+        // `/Applications`, `/Library` and `/opt/local` on top of the image's own — a
+        // read-only copy of a *different* operating system's toolchain landing on the
+        // one the image was built for. On a Mac the daemon refused the container outright
+        // for the paths the desktop app does not share; where it did not refuse, the job
+        // found its own `git` gone and its writes refused.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("checkout");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scratch = dir.path().join("scratch");
+        let spec = step(
+            &workspace.display().to_string(),
+            &scratch.display().to_string(),
+        );
+        let host = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::Hosts).unwrap();
+        let own = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::JobOwnsThem).unwrap();
+        // The host-backed job is granted them, and needs them.
+        let granted: Vec<String> = host
+            .mounts
+            .iter()
+            .map(|mount| mount.destination.display().to_string())
+            .collect();
+        for needed in ["/usr", "/bin"] {
+            assert!(
+                granted.iter().any(|key| key == needed),
+                "a job on the host's filesystem must still be able to exec: {granted:?}"
+            );
+        }
+        // The job with its own root is not granted a single one of them.
+        let mounted: Vec<String> = own
+            .mounts
+            .iter()
+            .map(|mount| mount.destination.display().to_string())
+            .collect();
+        for system in crate::platform::system_read_only() {
+            assert!(
+                !mounted.iter().any(|key| key == system),
+                "`{system}` is the image's own directory, not one to bind over: {mounted:?}"
+            );
+        }
+        // …but it still gets the two trees the spec named, at their own paths, in the
+        // modes the spec asked for: this is the shape a workflow step runs in.
+        let w = workspace.display().to_string();
+        let s = scratch.display().to_string();
+        assert!(
+            own.mounts
+                .iter()
+                .any(|mount| mount.source == workspace && mount.writable),
+            "the checkout is still writable: {mounted:?}"
+        );
+        assert!(
+            own.mounts
+                .iter()
+                .any(|mount| mount.source == scratch && mount.writable),
+            "the scratch is still writable: {mounted:?}"
+        );
+        assert!(!w.is_empty() && !s.is_empty());
+        // And the withholding is said, because a reviewer reading the command line
+        // would otherwise conclude the job has no `/usr`.
+        assert!(
+            own.notes
+                .iter()
+                .any(|note| note.contains(crate::mounts::WITHHELD_SYSTEM_DIRS)),
+            "{:?}",
+            own.notes
+        );
+        assert!(
+            !host
+                .notes
+                .iter()
+                .any(|note| note.contains(crate::mounts::WITHHELD_SYSTEM_DIRS)),
+            "a job that IS given them is not told it was not: {:?}",
+            host.notes
+        );
+    }
+
+    #[test]
+    fn a_tree_named_by_hand_is_mounted_for_a_container_too() {
+        // The rule is "nothing implicit", not "nothing but the checkout": a toolchain
+        // the operator named is mounted, because the operator is the one who knows the
+        // image does not carry it.
+        let spec = Spec::new("/work", "/work/.scratch")
+            .with_read_path("/opt/toolchain")
+            .with_tool("/opt/cargo/bin/cargo");
+        let plan = plan(&spec, &TMPFS_DESTINATIONS, SystemDirs::JobOwnsThem).unwrap();
+        let keys = keys(&plan);
+        assert!(keys.iter().any(|key| key == "/opt/toolchain"), "{keys:?}");
+        assert!(keys.iter().any(|key| key == "/opt/cargo/bin"), "{keys:?}");
+        assert!(keys.iter().any(|key| key == "/work"), "{keys:?}");
+        // And the per-OS list is still not in there, whatever the host happens to have.
+        for system in crate::platform::system_read_only() {
+            if system.starts_with("/opt/") {
+                assert!(!keys.iter().any(|key| key == system), "{keys:?}");
+            }
+        }
     }
 }

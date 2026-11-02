@@ -480,27 +480,34 @@ fn the_shape_the_sandbox_doctor_checks_is_the_shape_a_step_runs_in() {
 
     // And the two shapes resolve to the same number of mounts and the same number of
     // resolutions — the paths differ (a temp directory there, a checkout here), the
-    // structure may not.
-    let planned = |spec: &gitiup_sandbox::spec::Spec| {
-        mounts::plan(spec, &[]).expect("a step's spec is mountable")
-    };
-    let (a, b) = (planned(&step), planned(&checked));
-    assert_eq!(
-        a.mounts.len(),
-        b.mounts.len(),
-        "{} vs {}",
-        a.list(true),
-        b.list(true)
-    );
-    assert_eq!(a.writable().len(), b.writable().len());
-    assert_eq!(a.read_only().len(), b.read_only().len());
-    assert_eq!(
-        a.notes.len(),
-        b.notes.len(),
-        "the same shape resolves the same number of clashes: {:?} vs {:?}",
-        a.notes,
-        b.notes
-    );
+    // structure may not. In **both** mount worlds: a container's job has a root of its
+    // own and mounts fewer trees than a namespace's, which is granted the host's system
+    // directories (giti-ej2), and the shapes have to agree whichever one a step lands in.
+    for (reserved, system) in [
+        (&[][..], gitiup_sandbox::mounts::SystemDirs::JobOwnsThem),
+        (&[][..], gitiup_sandbox::mounts::SystemDirs::Hosts),
+    ] {
+        let planned = |spec: &gitiup_sandbox::spec::Spec| {
+            mounts::plan(spec, reserved, system).expect("a step's spec is mountable")
+        };
+        let (a, b) = (planned(&step), planned(&checked));
+        assert_eq!(
+            a.mounts.len(),
+            b.mounts.len(),
+            "{} vs {}",
+            a.list(true),
+            b.list(true)
+        );
+        assert_eq!(a.writable().len(), b.writable().len());
+        assert_eq!(a.read_only().len(), b.read_only().len());
+        assert_eq!(
+            a.notes.len(),
+            b.notes.len(),
+            "the same shape resolves the same number of clashes: {:?} vs {:?}",
+            a.notes,
+            b.notes
+        );
+    }
 }
 
 #[test]

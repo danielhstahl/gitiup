@@ -201,14 +201,16 @@ The mounts are now worked out before any `docker run` is built
 
   ```console
   $ gitiup doctor --sandbox
-  ok   mount points             10 mounts for a workflow step, each at its own destination: a
-                                container keys its mounts by destination and refuses a run that
-                                puts two there (`Duplicate mount point: '<path>'`, which names
-                                neither of the grants that collided), so a tree named twice is
-                                mounted once and the scratch cap keeps /tmp to itself —
-                                /tmp/gitiup-doctor-1975 is named as a readable tree and as a
-                                writable one: it is mounted read-write, so the read-only
-                                promise does not cover it
+  ok   mount points             10 mounts for a namespace-backed workflow step, each at its
+                                own destination: a container keys its mounts by destination
+                                and refuses a run that puts two there (`Duplicate mount
+                                point: '<path>'`, which names neither of the grants that
+                                collided), so a tree named twice is mounted once and the
+                                scratch cap keeps /tmp to itself — a container run asks for 2
+                                only, because the image and not the host provides its /usr,
+                                /bin, /lib and /etc — /tmp/gitiup-doctor-1975 is named as a
+                                readable tree and as a writable one: it is mounted read-write,
+                                so the read-only promise does not cover it
   ```
 
 * **a destination the tool already claimed is a refusal that names the fix.** The
@@ -229,6 +231,87 @@ so a destination that two different directories want stays a refusal, with both 
 named. `crates/gitiup-sandbox/tests/mount_points.rs` runs the whole thing against a
 runtime that enforces the daemon's one rule, so the case is a reproduction rather than
 an assertion about a data structure.
+
+### "a write was refused because the filesystem is read-only"
+
+The third mount-shaped failure, and the one that looked least like a mount problem. It
+came in while a job was cloning a repository:
+
+```text
+a write was refused because the filesystem is read-only here (exit 125)
+```
+
+`exit 125` is the runtime's "the container never started", and "read-only" was a job
+refused a write in a filesystem it had been told was its own. Both came from one line of
+code: the read list every backend needs **on the host** — `/usr`, `/bin`, `/lib`, `/etc`,
+and on a Mac also `/Applications`, `/Library`, `/opt/homebrew` and `/opt/local` — was
+handed to `docker -v` beside the checkout, so the container was asked to mount a
+read-only copy of *this* machine's toolchain on top of the one its image was built for.
+
+On a Mac that request cannot be honoured, in two different ways depending on which path
+the desktop app has agreed to *share*:
+
+* a path it has not shared is refused outright, and the container never starts:
+
+  ```text
+  Mounts denied:
+  The path /Library is not shared from the host and is not known to Docker.
+  ```
+
+  which is the `exit 125` of the report;
+* a path it *has* shared arrives `ro`, because that is what was asked for — so the job's
+  own `/bin`, `/usr`, `/etc` and `/dev` were the host's, read-only, and a write the job
+  made in a directory its image owns came back as "the filesystem is read-only". Which
+  of the two a given machine answers with depends on the path and on how the desktop app
+  is configured; both are the same handful of host directories on the mount list.
+
+Nothing was wrong with the sharing settings, and nothing was wrong with the checkout: the
+workspace and the scratch were mounted `rw` the whole time. The job had simply been given
+a batch of read-only mounts it never asked for, and the reporter's instinct — "the
+folders are getting mounted into docker as read only (why??)" — was the right question.
+
+It is not Mac-only, which is what the reporter guessed and what makes the fix worth
+stating as a rule rather than a workaround. An `alpine` job on a glibc Linux host, handed
+the host's `/usr` and `/bin`, gets a `/bin/sh` that is not busybox and a `git` that is
+not there, over a filesystem it cannot write to.
+
+So: **a container's job has a root filesystem of its own, and the host's system
+directories are never mounted into it**
+([`SystemDirs`](../crates/gitiup-sandbox/src/mounts.rs)). The rule is stated per backend,
+not guessed per mount:
+
+| the job's `/usr`, `/bin`, `/lib` | who provides them | what is mounted |
+|----------------------------------|-------------------|-----------------|
+| `docker`, `podman` | the **image** | only the trees the spec named: the checkout, the scratch, and whatever an operator names because the image does not carry it |
+| `bwrap`, `landlock`, `seatbelt`, `unshare`, `plain` | **this machine** | the checkout, the scratch, and the per-OS system list, because a build that cannot `exec` a compiler is a refusal with extra steps |
+
+Two consequences a reader of a plan should see, and does:
+
+* **the image is the toolchain.** A tool the job needs that is not in `GITIUP_SANDBOX_IMAGE`
+  is not in the job; it belongs in the image, or it is named explicitly (`Spec::with_tool`,
+  `Spec::with_read_path`) so it is mounted — an explicit grant is still a grant, it is the
+  *implicit* list that stopped applying. `gitiup doctor --sandbox` prints the counts side
+  by side (the sample above: 10 mounts for a namespace-backed step, 2 for a container),
+  and every container plan carries the sentence:
+
+  ```text
+  mount points: the host's system directories are not mounted: this job's /usr, /bin, /lib
+  and /etc come from its own root filesystem, and binding the host's over them would bury
+  the toolchain its image was built for under a read-only copy of another operating
+  system's — a tool the job needs that is not in that image belongs in the image, or is
+  named explicitly so it is mounted
+  ```
+
+* **the mounts a Mac can honour are the short list.** With only the checkout and the
+  scratch mounted, every path a container run asks for is one the user chose, which is
+  also the only set the sharing layer was ever going to accept. That is why the plan note
+  for a macOS run says *the mounts above are only the job's own trees* rather than
+  repeating a warning about `/Library`.
+
+`crates/gitiup-sandbox/tests/host_system_mounts.rs` runs the case against two fake
+runtimes — one that refuses a source outside its sharing list with `Mounts denied` and
+`exit 125`, one that refuses a destination the image owns — so both halves of the
+reporter's error are a reproduction, on any OS, with no daemon in sight.
 
 ### The uid, and the image
 
