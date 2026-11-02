@@ -130,6 +130,13 @@ fn try_connect(address: SocketAddr) -> i32 {
 }
 
 /// Try to read the memory of another process, two ways.
+///
+/// The two ways are Linux's: `process_vm_readv` (the quiet one, no debugging at all)
+/// and `PTRACE_ATTACH` (the loud one the ticket names). macOS has `ptrace` but not the
+/// `PEEKDATA` request, and no `process_vm_readv`, so it gets its own version below;
+/// what counts as an escape is the same on either — the job reached, or stopped, a
+/// process it was never given.
+#[cfg(target_os = "linux")]
 fn try_ptrace(pid: u32) -> i32 {
     let pid = pid as libc::pid_t;
     let mut notes: Vec<String> = Vec::new();
@@ -206,6 +213,39 @@ fn try_ptrace(pid: u32) -> i32 {
     }
 }
 
+/// The macOS version: `PT_ATTACH` is the whole attempt, because stopping the runner is
+/// already the escape (and macOS `ptrace` has no memory-read request to attempt after
+/// it — attaching is the capability, and it is the one a sandbox has to refuse).
+#[cfg(target_os = "macos")]
+fn try_ptrace(pid: u32) -> i32 {
+    let pid = pid as libc::pid_t;
+    let attached = unsafe { libc::ptrace(libc::PT_ATTACH, pid, std::ptr::null_mut(), 0) };
+    if attached == 0 {
+        // Get out of the way at once: an attached process is a stopped process, and
+        // leaving the runner stopped is a denial of service of our own making.
+        unsafe {
+            libc::ptrace(libc::PT_DETACH, pid, std::ptr::null_mut(), 0);
+        }
+        println!("ESCAPED ptrace attached to {pid}");
+        return ESCAPED;
+    }
+    // `process_vm_readv` has no macOS equivalent; naming its substitute is the
+    // honest version of "this is the only thing tried here".
+    println!(
+        "DENIED ptrace: {} (no process_vm_readv on macOS, so PT_ATTACH is the attempt)",
+        std::io::Error::last_os_error()
+    );
+    DENIED
+}
+
+/// A platform with no way to attempt this at all: say so, and let the suite call the
+/// check unchecked rather than pretending a denial happened.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn try_ptrace(_pid: u32) -> i32 {
+    println!("DENIED no ptrace interface on this platform, so nothing was attempted");
+    DENIED
+}
+
 /// Try to start `count` live children, and report how many there were.
 ///
 /// The children stay alive briefly on purpose: a fork bomb is measured by how many
@@ -239,13 +279,14 @@ fn try_fork(count: usize) -> i32 {
     // the sandbox installed the limit it claims to install, because whether the limit
     // *binds* depends on everything else running as this uid at the same moment.
     let cap = process_cap();
-    let running = crate::linux::current_nproc();
+    let running = crate::limits::current_nproc();
     let mut started: Vec<i32> = Vec::new();
     let mut refusal: Option<std::io::Error> = None;
     for _ in 0..count {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             // In the child: die with us, take no output, and hold a slot for a moment.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
             }

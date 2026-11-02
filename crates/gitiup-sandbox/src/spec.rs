@@ -315,18 +315,37 @@ impl Spec {
     /// not a sandbox, it is a refusal with extra steps. It is also why "the
     /// filesystem is isolated" is never a claim this crate makes: reads are wide on
     /// the in-process backends, narrow on the containers.
+    ///
+    /// The list is only *right* for a backend whose job runs on this machine's
+    /// filesystem; a backend that gives the job a root of its own uses
+    /// [`Spec::named_read_paths`] instead (giti-ej2).
     pub fn read_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.workspace.clone()];
-        paths.extend(self.read_only.iter().cloned());
-        // The canary's directory too: a probe that cannot exec its own canary has not
-        // observed anything, whatever it reports.
-        paths.extend(self.tool_dirs());
-        for system in SYSTEM_READ_ONLY {
+        let mut paths = self.named_read_paths();
+        for system in crate::platform::system_read_only() {
             let path = Path::new(system);
             if !paths.contains(&path.to_path_buf()) {
                 paths.push(path.to_path_buf());
             }
         }
+        paths
+    }
+
+    /// The trees the *spec* named: the workspace, the extra read-only trees and the
+    /// tool directories — [`Spec::read_paths`] without the implicit system list.
+    ///
+    /// This is the read set for a backend whose job has a root filesystem of its own.
+    /// A container image brings its own `/usr`, `/bin`, `/lib` and `/etc`, and they are
+    /// the ones its own `/bin/sh`, its own `git` and its own loader need; binding the
+    /// host's over them replaces the image's toolchain with a read-only copy of a
+    /// *different* operating system's, which is how a Mac's `docker` job ended up
+    /// refused for writing into a read-only filesystem (giti-ej2). A tree the operator
+    /// names by hand is still mounted — it is the *implicit* list that does not apply.
+    pub fn named_read_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.workspace.clone()];
+        paths.extend(self.read_only.iter().cloned());
+        // The canary's directory too: a probe that cannot exec its own canary has not
+        // observed anything, whatever it reports.
+        paths.extend(self.tool_dirs());
         paths
     }
 
@@ -400,6 +419,10 @@ impl Spec {
 
 /// The directories a build needs to read and execute, so a sandbox is a cage and not
 /// a brick wall.
+///
+/// The Linux list. The real answer is per-OS and comes from
+/// [`crate::platform::system_read_only`]; this is kept as a named constant because the
+/// Linux list is the one every container mount and Landlock grant is written against.
 pub const SYSTEM_READ_ONLY: [&str; 8] = [
     "/usr", "/bin", "/sbin", "/lib", "/lib64", "/libexec", "/etc", "/opt",
 ];
@@ -499,6 +522,49 @@ mod tests {
             spec.tool_dirs()
         );
         assert_eq!(spec.tools.len(), 1);
+    }
+
+    #[test]
+    // The read set of a job with a root of its own: what the spec named, and nothing the
+    // host implies. `read_paths` is this list plus the per-OS system directories.
+    fn the_named_read_set_is_the_read_set_minus_the_system_list() {
+        let spec = Spec::new("/work", "/tmp/s")
+            .with_read_path("/opt/toolchain")
+            .with_tool("/opt/cargo/bin/cargo");
+        let named = spec.named_read_paths();
+        assert!(
+            named.contains(&PathBuf::from("/work")),
+            "the workspace is always the tree the job is about: {named:?}"
+        );
+        assert!(
+            named.contains(&PathBuf::from("/opt/toolchain")),
+            "a named tree is a grant, whoever mounts it: {named:?}"
+        );
+        assert!(
+            named.contains(&PathBuf::from("/opt/cargo/bin")),
+            "a named tool is granted by its directory: {named:?}"
+        );
+        for system in crate::platform::system_read_only() {
+            assert!(
+                !named.contains(&PathBuf::from(*system)),
+                "`{system}` is implicit, and implicit is what a container does not mount: {named:?}"
+            );
+        }
+        // And the wide list is exactly this one plus the system list — the two are the
+        // same decision made twice, not two decisions that can drift.
+        let wide = spec.read_paths();
+        for path in &named {
+            assert!(wide.contains(path), "{path:?} vanished from read_paths");
+        }
+        assert_eq!(
+            wide.len(),
+            named.len()
+                + crate::platform::system_read_only()
+                    .iter()
+                    .filter(|system| !named.contains(&PathBuf::from(*system)))
+                    .count(),
+            "read_paths is named_read_paths plus the system list, and nothing else"
+        );
     }
 
     #[test]

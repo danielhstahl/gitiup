@@ -76,6 +76,22 @@ pub trait Sandbox: std::fmt::Debug {
         workspace: &Path,
         scratch: &Path,
     ) -> Result<Command>;
+
+    /// What the confinement decided about *this* workspace and scratch, in sentences: the
+    /// mounts it will ask for and why, where the job's `/usr` comes from, what a runtime
+    /// on this OS will refuse to share.
+    ///
+    /// These are the same sentences `gitiup doctor --sandbox` prints and the same ones the
+    /// backend attaches to its plan. They are worth printing before a step runs because
+    /// they are the sentences that make a step's failure legible: a job that cannot find
+    /// `git` is a sentence about the image, a checkout that mounts empty is a sentence
+    /// about a Mac's file sharing, and neither of them looks like a sandbox from the
+    /// inside. Nothing is spawned and nothing is written: this is a second read of the
+    /// same plan, and a caller that cannot plan prints nothing rather than failing.
+    fn plan_notes(&self, workspace: &Path, scratch: &Path) -> Vec<String> {
+        let _ = (workspace, scratch);
+        Vec::new()
+    }
 }
 
 /// The spec a workflow step runs under.
@@ -139,6 +155,17 @@ impl Sandbox for Rung {
             environment,
             workspace,
         )
+    }
+
+    fn plan_notes(&self, workspace: &Path, scratch: &Path) -> Vec<String> {
+        // The plan the step will actually run under, read for its notes: same spec, same
+        // backend, so what a reader is told is what the confinement does. A spec that
+        // cannot be planned (a relative workspace, say) says nothing here and is refused
+        // properly when the step is built.
+        self.inner
+            .plan(&spec_for(workspace, scratch), &backend::Env::new())
+            .map(|launch| launch.notes)
+            .unwrap_or_default()
     }
 }
 
@@ -220,6 +247,10 @@ pub struct Backend {
     pub available: bool,
     /// Why not, or what it guarantees. Printed verbatim.
     pub note: String,
+    /// What to change about this machine for the backend to work, when the probe could
+    /// name an action (`docker pull alpine:3.20`). `None` when the note already is the
+    /// instruction or when there is nothing to do.
+    pub fix: Option<String>,
     /// What the probe managed to check just now, empty when the backend is not
     /// available at all. A backend that guarantees a lot and checked nothing is a
     /// different sentence from one that checked everything, and the reader should be
@@ -236,6 +267,11 @@ impl Backend {
                 name: sandbox.name().to_string(),
                 available: true,
                 note: sandbox.guarantees().to_string(),
+                fix: if probe.fixes().is_empty() {
+                    None
+                } else {
+                    Some(probe.fixes().join(" · "))
+                },
                 // The probe's own summary goes with it: `guarantees` is the promise,
                 // the summary is what this machine let us check just now.
                 observed: probe.summary(),
@@ -244,6 +280,7 @@ impl Backend {
                 name: sandbox.name().to_string(),
                 available: false,
                 note: why.detail().to_string(),
+                fix: backend::fix_of(&why).map(str::to_string),
                 observed: String::new(),
             },
         }
@@ -286,12 +323,26 @@ mod tests {
     fn an_unknown_backend_is_refused_with_the_ladder() {
         let err = open("kvm").unwrap_err();
         assert!(err.detail().contains("kvm"), "{err}");
-        assert!(err.hint().unwrap().contains("landlock"), "{err}");
+        // The ladder of *this* OS: the point of the hint is that the names in it are
+        // names this machine can be given, which on a Mac does not include `landlock`.
+        let this_os = if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "landlock"
+        };
+        assert!(err.hint().unwrap().contains(this_os), "{err}");
+        assert!(err.hint().unwrap().contains("docker"), "{err}");
     }
 
     #[test]
     fn names_are_typable() {
+        // The in-process rung's name, whichever OS this is: `landlock` on Linux,
+        // `seatbelt` on macOS, and `--sandbox darwin` accepted as an alias for the
+        // latter so a typist arrives either way.
+        #[cfg(target_os = "linux")]
         assert_eq!(open(" LANDLOCK ").unwrap().name(), "landlock");
+        #[cfg(target_os = "macos")]
+        assert_eq!(open(" SEATBELT ").unwrap().name(), "seatbelt");
     }
 
     #[test]
@@ -307,6 +358,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_confinement_notes_come_from_the_plan_the_step_runs_under() {
+        // The sentences printed before a step are the backend's own plan notes, so they
+        // cannot drift from what the step is confined by: same spec, same function.
+        let sandbox = open("plain").unwrap();
+        let notes = sandbox.plan_notes(Path::new("/work"), Path::new("/tmp/gitiup-run-1"));
+        assert!(
+            !notes.is_empty(),
+            "the backend that isolates nothing still says so"
+        );
+        assert!(
+            notes.iter().all(|note| !note.trim().is_empty()),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("scratch")),
+            "the scratch is one of the two writable trees: {notes:?}"
+        );
     }
 
     #[test]

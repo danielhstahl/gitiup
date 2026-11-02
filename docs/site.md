@@ -31,7 +31,7 @@ python3 -m http.server -d _site
 
 ```console
 $ gitiup-site build --out _site
-built 29 pages (34 files, 1517544 bytes) into _site
+built 32 pages (37 files, 1649422 bytes) into _site
 ```
 
 The output is ordinary files: open `_site/index.html` in a browser and it works,

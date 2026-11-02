@@ -17,6 +17,13 @@
 //! image would refuse to run on a minimal container image — but it does turn into a
 //! line in `gitiup doctor`, because an unverified property is exactly what a reviewer
 //! should ask about.
+//!
+//! A refusal may carry a **fix**: the command or setting that would make the property
+//! hold. "Not usable" is not an action, and a refusal that names one (`docker pull
+//! alpine:3.20`) is the difference between a bug report and a two-second fix. Fixes
+//! travel with the refusal — into the error hint, and into `gitiup doctor`'s `fix:`
+//! line — because the probe is the only place that knows which of the two the machine
+//! is short of.
 
 use serde::Serialize;
 
@@ -65,6 +72,12 @@ pub struct Probe {
     /// Loud messages that belong with the result — the UNSANDBOXED banner lives here,
     /// so anything that prints a probe prints the warning too.
     pub warnings: Vec<String>,
+    /// What to change to make this backend usable, one imperative sentence each.
+    ///
+    /// Usually empty: a backend that probes clean needed nothing. It is filled by the
+    /// checks that refused — or would refuse — and it is what turns `unavailable` into
+    /// an instruction.
+    pub fixes: Vec<String>,
 }
 
 impl Probe {
@@ -74,6 +87,7 @@ impl Probe {
             backend: backend.into(),
             properties: Vec::new(),
             warnings: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -84,6 +98,11 @@ impl Probe {
             .filter(|property| property.observed == Observed::Yes)
             .map(|property| property.name.as_str())
             .collect()
+    }
+
+    /// What to change about this machine, if anything.
+    pub fn fixes(&self) -> &[String] {
+        &self.fixes
     }
 
     /// The properties nobody could check — the honest part of the report.
@@ -114,12 +133,22 @@ impl Probe {
     }
 }
 
+/// The hint a refusal carries when the probe could not name an action.
+///
+/// Named so `Backend::of` can tell "the probe said what to do" from "the probe said to
+/// ask doctor", and only put a `fix:` in front of a human where one exists.
+pub(crate) const GENERIC_FIX: &str = "until a sandbox holds up, gitiup run will only \
+                                      simulate — which is the safe default, and gitiup \
+                                      doctor --sandbox says what to change about this \
+                                      machine";
+
 /// Builds a probe, then refuses if a check said no.
 #[derive(Debug)]
 pub struct ProbeBuilder {
     backend: String,
     properties: Vec<Property>,
     warnings: Vec<String>,
+    fixes: Vec<String>,
 }
 
 impl ProbeBuilder {
@@ -141,6 +170,17 @@ impl ProbeBuilder {
     /// A warning to carry with the result.
     pub fn warn(&mut self, warning: impl Into<String>) {
         self.warnings.push(warning.into());
+    }
+
+    /// What the operator should do to make this backend usable: an imperative,
+    /// normally a command to type. Recorded whether or not the probe goes on to
+    /// refuse, because the reason a backend is not usable is exactly the reason a
+    /// person needs.
+    pub fn fix(&mut self, fix: impl Into<String>) {
+        let fix = fix.into();
+        if !fix.trim().is_empty() && !self.fixes.contains(&fix) {
+            self.fixes.push(fix);
+        }
     }
 
     fn push(&mut self, name: &str, observed: Observed, note: impl Into<String>) {
@@ -168,6 +208,14 @@ impl ProbeBuilder {
                 .iter()
                 .map(|property| property.note.as_str())
                 .collect();
+            let hint = if self.fixes.is_empty() {
+                GENERIC_FIX.to_string()
+            } else {
+                // Joined verbatim: `Backend::of` shows this string as doctor's `fix:`,
+                // so it has to read as an instruction in that mouth too, not as a
+                // sentence about the command being run from somewhere else.
+                self.fixes.join(" · ")
+            };
             return Err(gitiup_attest::Error::new(
                 gitiup_attest::ErrorKind::Policy,
                 "sandbox",
@@ -178,15 +226,13 @@ impl ProbeBuilder {
                     notes.join("; ")
                 ),
             )
-            .with_hint(
-                "until a sandbox holds up, gitiup run will only simulate — which is the safe \
-                 default, and gitiup doctor --sandbox says what to change about this machine",
-            ));
+            .with_hint(hint));
         }
         Ok(Probe {
             backend: self.backend.clone(),
             properties: self.properties.clone(),
             warnings: self.warnings.clone(),
+            fixes: self.fixes.clone(),
         })
     }
 }
@@ -235,5 +281,33 @@ mod tests {
             "{}",
             probe.summary()
         );
+    }
+
+    /// The whole point of a `fix`: a refusal has to be actionable on its own, in
+    /// whatever command printed it.
+    #[test]
+    fn a_refusal_that_could_name_the_command_does() {
+        let mut builder = Probe::builder("docker");
+        builder.fix("put the image where the runtime can see it first: `docker pull alpine:3.20`");
+        builder.failed("image", "`alpine:3.20` is not present locally");
+        let err = builder.finish().unwrap_err();
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("docker pull alpine:3.20"), "{hint}");
+        assert_eq!(
+            crate::backend::fix_of(&err),
+            Some(hint),
+            "the action survives into doctor's `fix:` line"
+        );
+    }
+
+    /// …and a refusal that could not name one must not fake one: doctor keeps those
+    /// lines plain, because "install the runtime" is already in the note.
+    #[test]
+    fn a_refusal_with_no_action_says_so_rather_than_inventing_one() {
+        let mut builder = Probe::builder("bwrap");
+        builder.failed("bubblewrap", "no `bwrap` binary on PATH");
+        let err = builder.finish().unwrap_err();
+        assert!(err.hint().unwrap().contains("doctor"), "{err}");
+        assert_eq!(crate::backend::fix_of(&err), None);
     }
 }

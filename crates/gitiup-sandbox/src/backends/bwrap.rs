@@ -19,6 +19,7 @@ use crate::backend::{Env, Kind, Launch, Sandbox};
 use crate::egress::Egress;
 use crate::escape;
 use crate::kernel::Kernel;
+use crate::mounts;
 use crate::probe::Probe;
 use crate::spec::Enforcement;
 use crate::spec::Spec;
@@ -28,13 +29,24 @@ use crate::spec::Spec;
 pub struct Bubblewrap;
 
 impl Bubblewrap {
+    /// The mounts `bwrap` will be asked to make, with its own `/tmp`, `/proc` and `/dev`
+    /// already claimed (see [`crate::mounts`]: one destination, one mount).
+    ///
+    /// `bwrap` builds a filesystem out of binds, so the job's `/usr` and `/bin` *are*
+    /// the host's and have to be granted: this is the [`SystemDirs::Hosts`](mounts::SystemDirs)
+    /// world, and the contrast is with a container, whose job has a root of its own.
+    pub fn mounts(spec: &Spec) -> Result<mounts::Plan> {
+        mounts::plan(spec, &mounts::BWRAP_DESTINATIONS, mounts::SystemDirs::Hosts)
+    }
+
     /// The binary, if it is installed.
     pub fn binary() -> Option<std::path::PathBuf> {
         Kernel::binary("bwrap")
     }
 
     /// The namespace and safety flags, plus the mounts one spec asks for.
-    fn args(&self, spec: &Spec) -> Vec<String> {
+    fn args(&self, spec: &Spec) -> Result<Vec<String>> {
+        let mounts = Bubblewrap::mounts(spec)?;
         let mut args = vec![
             // A sandbox that outlives the process that made it is a leak.
             "--die-with-parent".to_string(),
@@ -60,27 +72,26 @@ impl Bubblewrap {
         args.push(mib);
         args.push("--tmpfs".to_string());
         args.push("/tmp".to_string());
-        for path in spec.read_paths() {
-            // `-try` so a missing `/lib64` on a merged-usr distro is not a refusal.
-            args.push("--ro-bind-try".to_string());
-            args.push(path.display().to_string());
-            args.push(path.display().to_string());
-        }
-        for path in spec.write_paths() {
-            args.push("--bind".to_string());
-            args.push(path.display().to_string());
-            args.push(path.display().to_string());
+        for mount in &mounts.mounts {
+            if mount.writable {
+                args.push("--bind".to_string());
+            } else {
+                // `-try` so a missing `/lib64` on a merged-usr distro is not a refusal.
+                args.push("--ro-bind-try".to_string());
+            }
+            args.push(mount.source.display().to_string());
+            args.push(mount.destination.display().to_string());
         }
         args.push("--setenv".to_string());
         args.push("HOME".to_string());
-        args.push(spec.scratch.display().to_string());
+        args.push(mounts::clean(&spec.scratch));
         args.push("--setenv".to_string());
         args.push("TMPDIR".to_string());
-        args.push(spec.scratch.display().to_string());
+        args.push(mounts::clean(&spec.scratch));
         args.push("--setenv".to_string());
         args.push("PATH".to_string());
-        args.push(crate::linux::default_path().to_string_lossy().into_owned());
-        args
+        args.push(crate::limits::default_path().to_string_lossy().into_owned());
+        Ok(args)
     }
 }
 
@@ -192,7 +203,7 @@ impl Sandbox for Bubblewrap {
             })?;
         }
         let mut prefix = vec![binary.display().to_string()];
-        prefix.extend(self.args(spec));
+        prefix.extend(self.args(spec)?);
         let mut launch = Launch {
             prefix,
             separator: Some("--".to_string()),
@@ -231,7 +242,7 @@ mod tests {
     #[test]
     fn the_namespace_flags_are_the_ones_that_matter() {
         let spec = Spec::new("/work", "/work/.scratch");
-        let args = Bubblewrap.args(&spec);
+        let args = Bubblewrap.args(&spec).unwrap();
         let text = args.join(" ");
         assert!(text.contains("--unshare-all"), "{text}");
         assert!(text.contains("--die-with-parent"), "{text}");
@@ -253,7 +264,13 @@ mod tests {
         let backend = Bubblewrap;
         let allowed =
             Spec::new("/work", "/work/.scratch").with_egress(Egress::allow_registries().unwrap());
-        assert!(backend.args(&allowed).join(" ").contains("--share-net"));
+        assert!(
+            backend
+                .args(&allowed)
+                .unwrap()
+                .join(" ")
+                .contains("--share-net")
+        );
         assert_eq!(backend.enforcement(&allowed.egress), Enforcement::Audited);
         assert_eq!(
             backend.enforcement(&Egress::deny_all()),

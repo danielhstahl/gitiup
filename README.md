@@ -22,7 +22,7 @@ has no forge — and every command line on that page is executed by
 | crate           | what it is                                                       |
 |-----------------|------------------------------------------------------------------|
 | `gitiup`        | the command line: `gitiup run` plans (or, told to, runs) a workflow job, `gitiup digest` turns a local run report into the digests a stranger can check, `gitiup attest push/list/show/gc/migrate` files a signed attestation in a host store and reads it back, `gitiup change new/submit/list/show` drafts and publishes a signed change record to any store — `submit` also opens the quorum rounds the store's published policy asks for, one per job per matrix arm — and `change merge` merges one under compare-and-swap, `gitiup verify attestation` decides whether a proof may be acted on (exit 0/6/7/8, `--json` for a merge gate), `gitiup select` shows (or opens) the quorum for one change, `gitiup quorum verdict` tallies every round a store holds for a change — verified / failed / insufficient, exit 0/6/7/8, `--publish` files the signed verdict, `gitiup quorum dispute` reads the evidence behind that answer out loud — the distinct result digests and their counts, the seats with the sandbox rung each used and each machine's environment fingerprint, and the losing logs as a raw diff and a normalised one side by side — and `gitiup quorum retry` escalates a disputed job to `attempt + 1` with a fresh seed and selection under the policy's attempt cap (exit 9 once it is exhausted) — `gitiup work` is the volunteer's loop (poll for rounds addressed to this key, check the invitation, lease a seat, run the job in a sandbox, sign it, publish it — and on a sealed round, commit to the bytes before revealing them), `gitiup policy publish/show` signs the policy a merge gate applies into the store and says which one is in force, `gitiup policy check/explain` asks whether one commit or change satisfies it, `gitiup hook install pre-receive` puts that answer in front of the refs themselves — a `refs/heads/**` update whose new head has no policy-satisfying proof set is refused and the ref does not move, `refs/changes/**` and `refs/gitiup/**` stay open by design, and `gitiup hook status` / `doctor --hooks` say which policy is in force and whether proof is required at all — the only crate that reads files, so the format crate can stay I/O-free |
-| `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact |
+| `gitiup-run`    | workflow planning and provenance: reads a workflow file, expands a matrix into runs, and produces either a **simulated** report (the default: nothing spawned, nothing read) or an **executed** one inside a sandbox that was probed first — which is where the tier is decided, because that is the only place the difference between "planned" and "ran" is a fact; and it is where a step's failure gets read (`diagnose`), because an attestation carries the digest of a log and never its text |
 | `gitiup-host`   | the host abstraction: `RefStore` + `BlobStore` + `Host`, the `fs`, `s3` (bucket-as-forge) and plain-git hosts (a bare repo over `file://`, `ssh://` or HTTP), `gitiup.toml` remote config, and where attestations live — `kv/attestation/<digest>` advertised by `refs/attestations/<subject>/<digest>`, with the retention policy (`max age`, `max per commit`) and the rule above it: an object another live ref still points at is never pruned — and the credential scope: a token belongs to the one origin its own remote names, and a redirect, a rewrite or a host read out of somebody else's `gitiup.toml` is refused with exit 3 naming both hosts |
 | `gitiup-host-github` | the github adapter, behind the CLI's `hosts-github` feature: the pull request database as `ChangeRecord`s, check runs as `AttestationRecord`s, token auth, pagination and rate limits — every forge call in the workspace, in one optional crate the core does not know exists |
 | `gitiup-host-tests` | the host conformance suite: one set of bodies every host must satisfy (empty store, CAS conflict, pack round-trip, huge pack, paged listings, ref deletion, refused credentials, unsupported operations, forgetting one object, `cas = false`, the change workflow from proposal to merge, a stale base refused with the same kind everywhere, a public store read by a stranger with nothing to show, and a credential driven at a redirect that must never deliver it), run against the `fs`, plain-git, bucket and forge hosts — plus a change published on the bucket and merged through the plain-git host, with identical digests from both — in CI, against real backends |
@@ -82,6 +82,20 @@ The workspace globs `crates/*`, so a new crate is just `members`-free.
   rung denies and what it does not, how egress is refused by default, and what the escape
   suite actually checks. `gitiup doctor --sandbox` says which of it is true on your
   machine.
+* [macOS](docs/macos.md) — the same question for the machine most people own: the ladder
+  there is `docker`/`podman` → `seatbelt` → opt-in `plain`, because Landlock, seccomp and
+  namespaces are Linux mechanisms and XNU's Seatbelt sandbox is what macOS has instead.
+  Running the tool inside a Linux container, running a job in Docker Desktop's VM, and
+  running it natively under a kernel-enforced profile are all real options; this page says
+  which one promises what, and what was observed on real hardware rather than reasoned
+  about.
+* [Running a workflow with `act`](docs/act.md) — the one part of Actions execution this
+  project does not re-implement: `gitiup run --engine act` hands the job to
+  [nektos/act](https://nektosact.com), which understands `uses:`, `services:` and the
+  expression language, and the attestation says `sandbox: act` because the containment
+  was act's and gitiup only launched it and read its log. What that engine refuses, and
+  why a policy has to name it, is the page; the decision is
+  [ADR-0006](docs/adr/0006-running-workflows-with-act.md).
 * [Provenance tiers](docs/provenance-tiers.md) — what `simulated`, `local` and `quorum`
   each claim, why simulation is the safe default, why a single run can never claim
   `quorum`, and what a policy — the draft file and the published one — may insist on.
@@ -239,6 +253,13 @@ matrix because docker is not installed. See
 attestation that says `tier: simulated` — and only runs the steps when given
 `--execute` inside a sandbox it could probe. See
 [provenance tiers](docs/provenance-tiers.md) for what each tier licenses you to believe.
+
+A workflow with more than one job is not a special case: name the job with
+`--job <id>` (or as a bare word), repeat `--job` to take several, or say `--all-jobs`
+for every run the workflow would produce — every job and every matrix arm. One
+attestation is one result, so several runs are several attestations: `--json` prints
+one canonical manifest per line, `--out` names a directory to write them in, and each
+run's manifest is byte-for-byte what running that job on its own produces.
 
 `gitiup digest` prints the `RunDigest` and `ResultDigest` of a run report — the same
 two numbers a third party recomputes from the signed attestation, from the same

@@ -24,7 +24,10 @@
 use std::path::PathBuf;
 
 use gitiup_sandbox::backend::{self, Sandbox};
+#[cfg(target_os = "linux")]
 use gitiup_sandbox::backends::inprocess::Landlock;
+#[cfg(target_os = "macos")]
+use gitiup_sandbox::backends::seatbelt::Seatbelt;
 use gitiup_sandbox::escape::{self, Outcome};
 use gitiup_sandbox::spec::{Limits, Spec};
 
@@ -127,6 +130,7 @@ fn the_available_backends_deny_every_escape() {
 /// The in-process backend is the one every supported check must reach: it needs no
 /// runtime, no image and no privileged helper, so where the kernel allows it there is no
 /// excuse for an unobserved check.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_in_process_backend_observes_every_check_it_can() {
     let landlock = Landlock;
@@ -153,9 +157,97 @@ fn the_in_process_backend_observes_every_check_it_can() {
     }
 }
 
+/// The macOS in-process backend: same rule, same suite, and the one check a Seatbelt
+/// profile may honestly be unable to express is *named* as unchecked rather than
+/// quietly passed. Everything else must be observed, or the rung is not offered.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_in_process_backend_observes_every_check_it_can() {
+    let seatbelt = Seatbelt;
+    if seatbelt.probe().is_err() {
+        println!("seatbelt is not usable here; nothing to observe");
+        return;
+    }
+    let results = run(&seatbelt);
+    report("seatbelt", &results);
+    let observed: Vec<&str> = results
+        .iter()
+        .filter(|(_, outcome)| outcome.checked() && !outcome.escaped())
+        .map(|(check, _)| *check)
+        .collect();
+    for needed in ["fs-write-outside", "tcp-egress", "fork-bomb"] {
+        assert!(
+            observed.contains(&needed),
+            "`{needed}` was not denied or was not attempted: {:?}",
+            results
+                .iter()
+                .map(|(check, outcome)| (check, outcome.state()))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Tracing is the one the profile may not be able to express on a given macOS
+    // release; whichever way it went, it must not have been silently assumed.
+    let ptrace = results
+        .iter()
+        .find(|(check, _)| *check == "ptrace")
+        .map(|(_, outcome)| outcome.state());
+    assert!(
+        ptrace.is_some(),
+        "the ptrace check must be reported, even when it could not be attempted"
+    );
+}
+
+/// The workspace is not writable, on the platform's own in-process rung: the same
+/// read-only-workspace claim, checked the same way, on a kernel with no Landlock.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_workspace_is_readable_but_not_writable() {
+    let seatbelt = Seatbelt;
+    if seatbelt.probe().is_err() {
+        println!("seatbelt is not usable here; nothing to observe");
+        return;
+    }
+    let spec = spec();
+    let program = escape::stage_canary(&spec).expect("the canary stages into the scratch");
+    let launch = seatbelt.plan(&spec, &backend::Env::new()).unwrap();
+    let run = |target: PathBuf| {
+        let mut command = backend::command(
+            &seatbelt,
+            &spec,
+            &launch,
+            &[
+                program.display().to_string(),
+                "fs".to_string(),
+                target.display().to_string(),
+            ],
+            &backend::Env::new(),
+            &spec.workspace,
+        )
+        .expect("the confined command builds");
+        command.output().expect("the confined canary runs")
+    };
+
+    let outside = spec.workspace.join("written-by-the-job");
+    let output = run(outside.clone());
+    assert!(
+        !outside.exists(),
+        "a confined job wrote to the read-only workspace: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let inside = spec.scratch.join("written-by-the-job");
+    let output = run(inside.clone());
+    assert!(
+        inside.exists(),
+        "the scratch must be writable, or nothing can build: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// A write to the workspace — which the job is *allowed* to read but not write — must
 /// also fail. This is the check that distinguishes a real confinement from a scratch
 /// directory someone called a sandbox.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_workspace_is_readable_but_not_writable() {
     let landlock = Landlock;

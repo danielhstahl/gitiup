@@ -26,7 +26,7 @@ use gitiup_attest::Result;
 
 use crate::backend::{Env, Kind, Launch, Sandbox, UNSANDBOXED_BANNER};
 use crate::egress::Egress;
-use crate::linux;
+use crate::limits;
 use crate::probe::Probe;
 use crate::spec::Enforcement;
 use crate::spec::Spec;
@@ -110,7 +110,7 @@ impl Sandbox for Plain {
         let scratch_bytes = spec.scratch_bytes;
         unsafe {
             command.pre_exec(move || {
-                linux::apply_limits(
+                limits::apply_limits(
                     limits.cpu_seconds,
                     limits.address_bytes,
                     limits.processes,

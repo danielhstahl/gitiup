@@ -27,10 +27,13 @@ machines with different keys.
 
 ## Before you start
 
-* **Linux** for the parts that run a job. Sandboxing is kernel-enforced (Landlock,
-  bubblewrap, a container runtime); elsewhere `--execute` is refused and the only tier on
-  offer is `simulated`, which is a plan and not evidence. See
-  [the sandbox](sandbox.md) for what is available where you are.
+* **Linux, or a Linux container, for the parts that run a job.** Sandboxing is
+  kernel-enforced (Landlock, bubblewrap, a container runtime). On macOS there is a
+  kernel-enforced rung too — a container in the desktop app's VM, or `seatbelt`, the XNU
+  sandbox — and the page about which to use is [macOS](macos.md). On a machine where
+  nothing probes clean, `--execute` is refused and the only tier on offer is `simulated`,
+  which is a plan and not evidence. `gitiup doctor --sandbox` says which of these you are
+  on; see [the sandbox](sandbox.md) for what each rung denies.
 * **`git`** (2.28 or newer) on `PATH`. The store here is a bare repository and the
   plain-git host drives your `git`.
 * **Rust 1.88+** to build.
@@ -198,14 +201,20 @@ sandbox        landlock
 …
 tier           local
 normalisation  v0
+checked      1 step planned…
+re-hashed    the manifest's own canonical bytes re-parse…
+sandbox      landlock was probed immediately before the first step…
+logs         hashed as normalised text…
+next         gitiup verify attestation build.attestation.json asks whether these bytes may be…
 wrote        build.attestation.json
 ```
 
 Use whatever backend `gitiup doctor --sandbox` names as active — `--sandbox docker`,
 `--sandbox bwrap`, `--sandbox unshare`. `landlock` is used here because it needs no
-runtime. `gitiup run --sandboxes` lists what this build offers and why each of the
-others is not available on this machine; `none` is refused, because an unconfined run
-earns no tier.
+runtime; on a Mac the rung that needs no runtime is `seatbelt`, or run the whole page
+inside a Linux container ([macOS](macos.md) says which to pick and why). `gitiup run
+--sandboxes` lists what this build offers and why each of the others is not available on
+this machine; `none` is refused, because an unconfined run earns no tier.
 
 Now the tier moved to `local`, and the two elided lines are the point of the whole tool:
 
@@ -217,6 +226,64 @@ Now the tier moved to `local`, and the two elided lines are the point of the who
 
 Confusing the two is the most common way to decide reproducibility "does not work".
 [Provable CI output](provable-output.md) is the long version.
+
+The lines before `wrote` are the command accounting for itself: what ran, that the
+bytes a stranger will read re-hash to the two numbers above, which sandbox was probed
+before the first step, and what was hashed in place of the log text you cannot see. They
+are claims, not decoration: a manifest that did not re-hash to the digests it printed
+would exit 8 rather than print them.
+
+## 6b. When a step fails
+
+A failed run is the run you most need to read, and an attestation carries the **digest**
+of every step's stdout and stderr and never the text — so the terminal is the only place
+that text will ever exist. Write a workflow whose first step fails, and run it:
+
+```console
+$ cat > .github/workflows/failing.yml <<'YAML'
+on: push
+jobs:
+  build:
+    steps:
+      - name: Compile
+        run: |
+          echo "error: the thing does not fit in the thing" 1>&2
+          exit 3
+      - name: Later
+        run: echo never runs
+YAML
+$ gitiup run -w .github/workflows/failing.yml --execute --sandbox landlock  # exit 10
+FAILED       job `build` step 1 'Compile' — exit 3
+log          step 1 'Compile' stderr —…
+  | error: the thing does not fit in the thing
+note         the attestation carries the digest of every stream above and none of the text:…
+ran job build in landlock
+   1. Compile — exit 3 · FAILED
+   2. Later — skipped (an earlier step failed)
+…
+gitiup: job `build` step 1: 'Compile' exited 3
+hint: exit 10 is the step's own verdict, not a refusal by gitiup:…
+$ rm .github/workflows/failing.yml
+```
+
+Three things happened there, each aimed at a different reader:
+
+* the failing step's own stdout and stderr are on the screen. A step that wrote nothing
+  says so; a stream too long to print says where it was cut, because the digest covers
+  all of it. `--logs all` prints every step's output — the only way to see the warning
+  printed three steps before the death — and `--logs none` prints none of it;
+* where an exit code has a reading, it is given: `exit 127` names the program that was
+  missing *and* the PATH a step is actually given, a signal is named, a write the sandbox
+  refused is called that instead of a mystery. Where no reading exists, nothing is
+  invented and the log is the answer;
+* the command **exits 10**, so a script does not have to read prose to learn the tests
+  failed. It is not a 6: nothing was refused, every step reported, and the attestation
+  records the failure honestly — it is still worth filing, because a quorum agrees on
+  what happened, not on green ticks.
+
+A skipped step is shown as skipped rather than as `exit 0`, which is the other way a
+failure goes unnoticed: the steps after the one that died did not run, and saying so is
+the difference between a report and a green tick that was never earned.
 
 ## 7. A key, so the proof is somebody's
 
@@ -509,6 +576,7 @@ anything can be judged.
 | 7 | a signature that does not verify | `verify`, `key`, `identity` |
 | 8 | digest mismatch: the bytes are not what their own name says, a rerun diverged | `verify`, `digest`, `normalise --compare` |
 | 9 | attempts exhausted: the quorum ran out of escalations, and asking again is what just ran | `quorum retry` |
+| 10 | a step in the run failed: the run happened, every step reported, and the step said no | `run --execute` |
 
 `6` and `9` are the pair worth remembering: 6 says *something about the evidence or the
 policy would have to change*, 9 says *there is nothing left to retry*. A caller that
@@ -546,5 +614,6 @@ retried on 6 loops forever, which is what the cap exists to prevent.
 | how a policy is signed, published and resolved | [the published policy](policy.md) |
 | how to run a job so its bytes come out the same twice | [reproducibility](reproducibility.md), [the run report](run-report.md) |
 | what the sandbox does and does not isolate | [the sandbox](sandbox.md) |
+| what any of this is allowed to do on a Mac | [macOS](macos.md) |
 | how a change is stored, and what a merge records | [contributing without a forge](changes.md), [ADR-0003](adr/0003-change-record-format-and-merge-semantics.md) |
 | where the decisions that several tickets depend on are kept | [the ADR index](adr/README.md) |

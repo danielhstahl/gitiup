@@ -153,7 +153,15 @@ mod tests {
     #[test]
     fn an_empty_policy_means_any_real_backend() {
         let policy = Policy::default();
-        assert!(allows(&policy, "landlock"));
+        // The in-process rung of this OS: a name the build does not have is refused
+        // above, and on a Mac `landlock` is exactly such a name.
+        let in_process = if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "landlock"
+        };
+        assert!(allows(&policy, in_process));
+        assert!(allows(&policy, "docker"));
         assert!(
             !allows(&policy, "plain"),
             "nothing is not a backend in this sense"

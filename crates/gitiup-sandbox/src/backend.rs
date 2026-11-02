@@ -26,6 +26,7 @@ use gitiup_attest::{Error, ErrorKind, Result};
 use serde::Serialize;
 
 use crate::backends;
+use crate::platform::{OS, Platform};
 use crate::probe::Probe;
 use crate::spec::{Enforcement, Purpose, Spec};
 
@@ -81,6 +82,37 @@ pub struct Launch {
     /// Set when the backend passes environment as *arguments* (`docker -e`), in which
     /// case the wrapper's own environment is deliberately empty.
     pub env_as_args: bool,
+    /// Where in [`prefix`](Self::prefix) the `-e` arguments go, when
+    /// [`env_as_args`](Self::env_as_args) is set: an index into `prefix`, before which
+    /// they are inserted. `None` means "at the end of the prefix", which is right for a
+    /// wrapper that takes options up to its `separator`.
+    ///
+    /// It is not right for a container runtime, and the difference is not cosmetic:
+    /// `docker run` stops reading its own options at the image name and hands everything
+    /// after it to the container as *the command to run*. `docker run img -e K=V /bin/sh
+    /// s.sh` therefore starts a container whose argv is `["-e", "K=V", "/bin/sh",
+    /// "s.sh"]`, and the job dies at once with
+    ///
+    /// ```text
+    /// exec: "-e": executable file not found in $PATH
+    /// ```
+    ///
+    /// — exit 126 or 127, from a container that did start, in a sandbox that did work,
+    /// with a message that names neither the environment nor the image. A backend whose
+    /// options must precede a positional argument sets this to the index of that
+    /// argument.
+    pub env_at: Option<usize>,
+    /// Environment the **wrapper program itself** needs, as opposed to the job's.
+    ///
+    /// A container runtime is a CLI with its own expectations: it has to find its
+    /// binary's siblings (`docker-credential-osxkeychain`), its config
+    /// (`~/.docker/config.json`), and sometimes a daemon that is only reachable at an
+    /// endpoint named by `$DOCKER_HOST` or a rootless socket under `$XDG_RUNTIME_DIR`.
+    /// Clearing the environment is right for the *job* and wrong for the *CLI*, and
+    /// the two are separate processes' worth of environment: the job's arrives as `-e`
+    /// arguments, so whatever is set here never reaches the container. Left empty by
+    /// backends that are not a separate CLI.
+    pub wrapper_env: Env,
     /// The working directory inside the confinement, when it differs from the host
     /// path (`/workspace` in a container).
     pub cwd: Option<PathBuf>,
@@ -96,15 +128,20 @@ impl Launch {
         Launch::default()
     }
 
-    /// The full argv to spawn: wrapper, its `-e` style environment, the separator,
-    /// then the job's own command.
+    /// The full argv to spawn: wrapper, its `-e` style environment at
+    /// [`env_at`](Self::env_at), the separator, then the job's own command.
     pub fn argv(&self, command: &[String], caller_env: &Env) -> Vec<String> {
         let mut argv = self.prefix.clone();
         if self.env_as_args {
-            for (key, value) in caller_env.iter().chain(self.env.iter()) {
-                argv.push("-e".to_string());
-                argv.push(format!("{key}={value}"));
-            }
+            let given: Vec<String> = caller_env
+                .iter()
+                .chain(self.env.iter())
+                .flat_map(|(key, value)| ["-e".to_string(), format!("{key}={value}")])
+                .collect();
+            // Spliced, not appended: an option that has to sit in front of a positional
+            // argument (a container's `-e` before its image) cannot be added afterwards.
+            let at = self.env_at.unwrap_or(argv.len()).min(argv.len());
+            argv.splice(at..at, given);
         }
         argv.extend(self.separator.iter().cloned());
         argv.extend(command.iter().cloned());
@@ -190,9 +227,20 @@ pub struct Backend {
     pub serves_quorum: bool,
     /// What it guarantees (available) or why it is not (unavailable). Printed verbatim.
     pub note: String,
+    /// What to change to make it available, when the probe could name an action.
+    ///
+    /// `None` when the note already is the instruction ("no `docker` binary on PATH")
+    /// or when there is nothing to do; `Some` when there is a command to type.
+    pub fix: Option<String>,
     /// The probe properties that were watched, when available.
     pub observed: Vec<String>,
     /// The probe properties that could not be watched, when available.
+    ///
+    /// Carried as `name — note`, not as a bare name: "`ptrace`: unchecked" tells a
+    /// reviewer that a hole exists, and the note is the whole of what they can act on
+    /// ("no trace denial is expressible on this macOS" versus "the image has no canary
+    /// binary" are different jobs). The names alone are still available from
+    /// [`Probe::unverified`].
     pub unchecked: Vec<String>,
 }
 
@@ -210,15 +258,21 @@ impl Backend {
                 opt_in: sandbox.opt_in_only(),
                 serves_quorum: sandbox.serves_quorum(),
                 note: sandbox.guarantees().to_string(),
+                fix: if probe.fixes().is_empty() {
+                    None
+                } else {
+                    Some(probe.fixes().join(" · "))
+                },
                 observed: probe
                     .observed()
                     .iter()
                     .map(|name| name.to_string())
                     .collect(),
                 unchecked: probe
-                    .unverified()
+                    .properties
                     .iter()
-                    .map(|name| name.to_string())
+                    .filter(|property| property.observed == crate::probe::Observed::Skipped)
+                    .map(|property| format!("{} — {}", property.name, property.note))
                     .collect(),
             },
             Err(error) => Backend {
@@ -229,6 +283,7 @@ impl Backend {
                 opt_in: sandbox.opt_in_only(),
                 serves_quorum: sandbox.serves_quorum(),
                 note: error.detail().to_string(),
+                fix: fix_of(&error).map(str::to_string),
                 observed: Vec::new(),
                 unchecked: Vec::new(),
             },
@@ -259,19 +314,45 @@ impl Backend {
 /// The backends, in the order they should be preferred: strongest isolation first, and
 /// the one that isolates nothing last.
 ///
-/// Containers lead because they are the only rung that also isolates *reads* and
-/// gives the job a filesystem of its own. Landlock is the interesting one for a
-/// machine with no container runtime: it needs no daemon, no root and no setup, and it
-/// is enforced by the same kernel that runs the job.
+/// The list is **per-OS**, because the mechanisms are: a macOS kernel has neither
+/// Landlock nor namespaces, and a Linux kernel has no Seatbelt. What is the same on
+/// every OS is how a rung earns its place — a probe that observes a denial — and that
+/// containers lead both ladders because a container is the only rung that also
+/// isolates *reads* and gives the job a filesystem of its own.
+///
+/// The in-process rung is the interesting one on a machine with no container runtime:
+/// Landlock on Linux (no daemon, no root, no setup), Seatbelt on macOS (no daemon, no
+/// root, in every macOS release). See [docs/macos.md](../../../docs/macos.md) for what
+/// a Mac can and cannot promise.
 pub fn backends() -> Vec<Box<dyn Sandbox>> {
-    vec![
+    // Containers first, on every OS: they are the strongest rung that exists
+    // everywhere, and on macOS they are the only rung whose kernel is not this kernel.
+    let mut rungs: Vec<Box<dyn Sandbox>> = vec![
         Box::new(backends::container::Container::docker()),
         Box::new(backends::container::Container::podman()),
-        Box::new(backends::bwrap::Bubblewrap),
-        Box::new(backends::inprocess::Landlock),
-        Box::new(backends::unshare::Unshare),
-        Box::new(backends::plain::Plain),
-    ]
+    ];
+    match Platform::survey().os {
+        #[cfg(target_os = "linux")]
+        OS::Linux => {
+            rungs.push(Box::new(backends::bwrap::Bubblewrap));
+            rungs.push(Box::new(backends::inprocess::Landlock));
+            rungs.push(Box::new(backends::unshare::Unshare));
+        }
+        #[cfg(target_os = "macos")]
+        OS::MacOS => {
+            rungs.push(Box::new(backends::seatbelt::Seatbelt));
+        }
+        // Every OS gets the container rungs above and the opt-in rung below, and
+        // nothing in between that its kernel cannot provide.
+        _ => {}
+    }
+    rungs.push(Box::new(backends::plain::Plain));
+    rungs
+}
+
+/// The ladder this OS has, as a sentence: `docker, podman, bwrap, landlock, unshare, plain`.
+pub fn ladder() -> String {
+    implemented().join(", ")
 }
 
 /// The names of every backend this build can run, in preference order.
@@ -329,6 +410,7 @@ pub fn open(name: &str) -> Result<Box<dyn Sandbox>> {
     let name = match name.as_str() {
         "shell" | "host" | "plain" => PLAIN.to_string(),
         "bubblewrap" | "bwrap" => "bwrap".to_string(),
+        "sandbox-exec" | "sandbox_exec" | "apple" | "darwin" | "seatbelt" => "seatbelt".to_string(),
         other => other.to_string(),
     };
     backends()
@@ -345,6 +427,21 @@ pub fn open(name: &str) -> Result<Box<dyn Sandbox>> {
                 implemented().join(", ")
             ))
         })
+}
+
+/// The action a probe's refusal named, if it named one.
+///
+/// Every refusal from a probe carries a hint, and most of them carry the generic one
+/// that just says "ask doctor". This is `None` for those, so a report prints `fix:`
+/// only where there is an action to take (`docker pull alpine:3.20`) rather than
+/// sending the reader to the report they are already reading.
+pub fn fix_of(error: &Error) -> Option<&str> {
+    let hint = error.hint()?;
+    if hint == crate::probe::GENERIC_FIX || hint.is_empty() {
+        None
+    } else {
+        Some(hint)
+    }
 }
 
 /// Every backend, probed, in preference order.
@@ -412,8 +509,8 @@ pub fn admit(backend: &dyn Sandbox, spec: &Spec) -> Result<Admitted> {
         .with_hint(match spec.purpose {
             Purpose::Quorum => concat!(
                 "serve quorum jobs from a backend that denies egress in the kernel (docker or ",
-                "podman with --network=none, bwrap, unshare, or landlock on Landlock ABI 4+), ",
-                "and keep the default-deny egress policy for quorum rounds",
+                "podman with --network=none, bwrap, unshare, landlock on Landlock ABI 4+, or ",
+                "seatbelt on macOS), and keep the default-deny egress policy for quorum rounds",
             )
             .to_string(),
             Purpose::Local => "raise the isolation".to_string(),
@@ -473,7 +570,9 @@ pub fn admit(backend: &dyn Sandbox, spec: &Spec) -> Result<Admitted> {
 ///
 /// The environment is *cleared* first, always. A confined job that inherits the
 /// runner's environment inherits its tokens, and then the attestation describes a run
-/// nobody else could repeat.
+/// nobody else could repeat. The one exception is [`Launch::wrapper_env`]: a wrapper
+/// that cannot find its own daemon or credential helper does not confine anything, it
+/// fails — and those variables are the wrapper's, never the job's.
 pub fn command(
     backend: &dyn Sandbox,
     spec: &Spec,
@@ -493,6 +592,11 @@ pub fn command(
     let mut command = Command::new(&full[0]);
     command.args(&full[1..]);
     command.env_clear();
+    // The wrapper's own environment goes first and is only ever what the wrapper needs
+    // to find its daemon; the job's environment is still exactly `env`.
+    for (key, value) in launch.wrapper_env.iter() {
+        command.env(key, value);
+    }
     if !launch.env_as_args {
         for (key, value) in env.iter().chain(launch.env.iter()) {
             command.env(key, value);
@@ -538,12 +642,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_preference_order_is_containers_then_namespaces_then_syscalls_then_nothing() {
+    fn the_preference_order_is_containers_then_the_platform_rung_then_nothing() {
         let names = implemented();
+        // The ladder is per-OS because the mechanisms are; every OS starts with the
+        // container rungs and ends with the one that isolates nothing.
+        let expected: &[&str] = if cfg!(target_os = "linux") {
+            &["docker", "podman", "bwrap", "landlock", "unshare", "plain"]
+        } else if cfg!(target_os = "macos") {
+            &["docker", "podman", "seatbelt", "plain"]
+        } else {
+            &["docker", "podman", "plain"]
+        };
+        assert_eq!(names, expected, "this OS's ladder");
         assert_eq!(
-            names,
-            vec!["docker", "podman", "bwrap", "landlock", "unshare", "plain"],
-            "the order in the ticket is the order on the machine"
+            names.first().copied(),
+            Some("docker"),
+            "a container is the strongest rung on every OS this tool runs on"
         );
         let backends = backends();
         assert_eq!(
@@ -553,6 +667,22 @@ mod tests {
         );
         assert!(backends.last().unwrap().opt_in_only());
         assert!(!backends.last().unwrap().serves_quorum());
+    }
+
+    #[test]
+    fn every_backend_in_the_ladder_answers_the_three_questions() {
+        // Cheap and structural: a rung that names itself "", claims nothing, or has no
+        // kind would print a doctor line nobody can read.
+        for candidate in backends() {
+            assert!(!candidate.name().is_empty());
+            assert!(candidate.guarantees().len() > 40, "{}", candidate.name());
+            assert!(
+                !candidate.guarantees().contains("sandboxed"),
+                "{}",
+                candidate.name()
+            );
+            let _ = candidate.kind().as_str();
+        }
     }
 
     #[test]
@@ -570,6 +700,14 @@ mod tests {
         assert_eq!(open(" UNSHARE ").unwrap().name(), "unshare");
         assert_eq!(open("shell").unwrap().name(), PLAIN);
         assert_eq!(open("bubblewrap").unwrap().name(), "bwrap");
+        // The platform rungs are only openable on the platform that has them: asking a
+        // Linux box for `seatbelt` is the same class of mistake as asking it for a
+        // syscall its kernel has never heard of.
+        if cfg!(target_os = "macos") {
+            assert_eq!(open("sandbox-exec").unwrap().name(), "seatbelt");
+        } else {
+            assert!(open("seatbelt").is_err(), "{} on this OS", ladder());
+        }
     }
 
     #[test]
@@ -602,6 +740,93 @@ mod tests {
         );
         assert_eq!(argv.last().unwrap(), "/bin/true");
         assert!(!argv.iter().any(|argument| argument == "--"));
+    }
+
+    #[test]
+    fn a_wrappers_options_can_be_closed_by_a_positional_argument() {
+        // `docker run` is the wrapper that does this: the image is a positional argument
+        // that ends option parsing, so `-e` after it is the job's argv and not a flag.
+        // The launch has to know that, because the environment is built here and not by
+        // the backend that knows its own grammar.
+        let launch = Launch {
+            prefix: vec!["docker".into(), "run".into(), "--rm".into(), "img".into()],
+            env_as_args: true,
+            env_at: Some(3),
+            ..Launch::default()
+        };
+        let mut env = Env::new();
+        env.insert("K".to_string(), "V".to_string());
+        let argv = launch.argv(&["/bin/true".to_string()], &env);
+        assert_eq!(
+            argv,
+            vec![
+                "docker".to_string(),
+                "run".to_string(),
+                "--rm".to_string(),
+                "-e".to_string(),
+                "K=V".to_string(),
+                "img".to_string(),
+                "/bin/true".to_string()
+            ]
+        );
+        // No position, and the old append behaviour stands: a wrapper that takes options
+        // up to its separator wants them at the end.
+        let appended = Launch {
+            env_as_args: true,
+            env_at: None,
+            ..launch
+        };
+        let argv = appended.argv(&["/bin/true".to_string()], &env);
+        assert_eq!(argv.last(), Some(&"/bin/true".to_string()));
+        assert!(
+            argv.iter().position(|a| a == "img").unwrap()
+                < argv.iter().position(|a| a == "-e").unwrap(),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_wrappers_environment_is_not_the_jobs() {
+        // Two processes' worth of environment, and mixing them is the bug that made a
+        // missing image look like a keychain fault: the runtime's CLI needs a PATH and
+        // a HOME of its own, and the job must still be given nothing but what it was
+        // handed.
+        let spec = Spec::new("/tmp/work", "/tmp/scratch");
+        let launch = Launch {
+            prefix: vec!["docker".into(), "run".into(), "img".into()],
+            env_as_args: true,
+            wrapper_env: Env::from([
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("HOME".to_string(), "/home/runner".to_string()),
+            ]),
+            ..Launch::default()
+        };
+        let mut job = Env::new();
+        job.insert("TOKEN".to_string(), "s3cret".to_string());
+        let command = command(
+            &backends::plain::Plain,
+            &spec,
+            &launch,
+            &["/bin/true".to_string()],
+            &job,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        let given: Vec<String> = command
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(given.contains(&"PATH".to_string()), "{given:?}");
+        assert!(
+            !given.contains(&"TOKEN".to_string()),
+            "the job's environment travels as arguments: {given:?}"
+        );
+        assert!(
+            command
+                .get_args()
+                .any(|argument| argument == "TOKEN=s3cret"),
+            "and the job still gets exactly what it was handed"
+        );
     }
 
     #[test]

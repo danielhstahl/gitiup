@@ -24,13 +24,19 @@
 //!
 //! | backend | what does the work | filesystem | egress, default-deny | egress, allowlist | needs |
 //!|---------|--------------------|------------|----------------------|-------------------|-------|
-//!| `docker`, `podman` | a container runtime | its own; workspace bind-mounted read-only | `--network=none`: **kernel** | proxy, **audited** | runtime + local image |
-//!| `bwrap` | mount/pid/net namespaces | rebuilt; workspace read-only | no route: **kernel** | proxy, **audited** | `bubblewrap` package |
+//!| `docker`, `podman` | a container runtime | its own, out of the image — the host's `/usr`, `/bin` and `/etc` are never mounted over it; workspace bind-mounted read-only | `--network=none`: **kernel** | proxy, **audited** | runtime + local image |
+//!| `bwrap` | mount/pid/net namespaces | rebuilt from binds of the **host's** directories (its `/usr` and `/bin` are the job's); workspace read-only | no route: **kernel** | proxy, **audited** | `bubblewrap` package |
 //!| `landlock` | Landlock + seccomp in the child | writes refused outside the scratch | no TCP rights: **kernel** (ABI 4+) | only the proxy's port: **kernel** (ABI 4+) | Linux ≥ 5.13 with Landlock |
+//!| `seatbelt` | an XNU kernel sandbox profile, applied by `sandbox-exec` | writes outside the scratch refused, *and* the credential directories too | `deny network*`: **kernel** | the proxy's address only: **kernel** | macOS with `sandbox-exec` (every release so far) |
 //!| `unshare` | user + net namespaces | *not isolated* | no route: **kernel** | no effect: deny-all only | `unshare(1)`, userns allowed |
 //!| `plain` | nothing | not isolated | **nothing** | **nothing** | opt-in, and refuses quorum jobs |
 //!
-//! The order is the preference order ([`backend::backends`]), and the last rung is the
+//! The order is the preference order ([`backend::backends`]), which is **per-OS**: the
+//! Linux ladder is the table above, and the macOS ladder is
+//! `docker`, `podman`, `seatbelt`, `plain` — Seatbelt (`sandbox-exec`) being the only
+//! in-process confinement XNU offers an unprivileged process. Both ladders are probed
+//! the same way, and [docs/macos.md](../../../docs/macos.md) is the prose about why
+//! they differ and what to do on a Mac. The last rung is the
 //! one the ticket insists exists: a plain process is better than nothing *for your own
 //! build* and is never acceptable for someone else's, so it is opt-in only, it prints
 //! [`UNSANDBOXED_BANNER`](backend::UNSANDBOXED_BANNER) with every probe, and
@@ -74,10 +80,15 @@
 //! use gitiup_sandbox::{backend, egress, spec};
 //!
 //! // The vocabulary is public and stable, because the names end up in signed digests.
-//! assert_eq!(
-//!     backend::implemented(),
-//!     vec!["docker", "podman", "bwrap", "landlock", "unshare", "plain"]
-//! );
+//! // The ladder is per-OS: each OS is offered the rungs its kernel actually has.
+//! let expected: &[&str] = if cfg!(target_os = "linux") {
+//!     &["docker", "podman", "bwrap", "landlock", "unshare", "plain"]
+//! } else if cfg!(target_os = "macos") {
+//!     &["docker", "podman", "seatbelt", "plain"]
+//! } else {
+//!     &["docker", "podman", "plain"]
+//! };
+//! assert_eq!(backend::implemented(), expected);
 //!
 //! // Asking for "no sandbox" is a refusal with an alternative, not a silent downgrade.
 //! let err = backend::open("none").unwrap_err();
@@ -106,7 +117,13 @@ pub mod doctor;
 pub mod egress;
 pub mod escape;
 pub mod kernel;
+/// The POSIX half of confinement: rlimits, the uid drop, the confined-spawn seam.
+pub mod limits;
+/// The Linux syscalls the in-process backend is made of. Compiled only where they exist.
+#[cfg(target_os = "linux")]
 pub mod linux;
+pub mod mounts;
+pub mod platform;
 pub mod policy;
 pub mod probe;
 pub mod spec;

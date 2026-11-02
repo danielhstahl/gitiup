@@ -2,16 +2,64 @@
 //!
 //! A container is the only backend here that gives the job a filesystem of its own, so
 //! a write that succeeds inside it is not a write to your disk at all. That is worth
-//! preferring when it is available — and it comes with two debts this module pays out
+//! preferring when it is available — and it comes with four debts this module pays out
 //! loud rather than quiet:
 //!
-//! * **the image has to be there.** With egress denied (the default) the runtime cannot
-//!   pull it, so a missing image is reported as an unverified property with
-//!   instructions, not a surprise halfway through a build.
+//! * **the image has to be there, and gitiup never pulls one for you.** A job's
+//!   network is denied by default, a tag that moves between runs is not a reproducible
+//!   input, and a pull in the middle of a run is the runtime making a decision the
+//!   operator should have made — so every `run` carries `--pull never`, and a missing
+//!   image is a refusal that names the command (`docker pull alpine:3.20`) rather than
+//!   a surprise halfway through a build. `gitiup doctor --sandbox` says the same thing
+//!   before you find out by running something.
 //! * **what the job sees must be what it gets.** Workspace and scratch are bind-mounted
 //!   at *their own absolute paths* so the paths in the job's environment stay true
 //!   inside the container. A sandbox that silently relocated the workspace would
-//!   produce logs that match nothing.
+//!   produce logs that match nothing. That rule has a consequence the runtime makes
+//!   unavoidable: mounts are keyed by destination, so a tree named twice (the checkout
+//!   is on the read list because every workspace is, and on the write list because a
+//!   build writes where it is checked out) is two mounts at one address, and the
+//!   runtime refuses the container with `Duplicate mount point: '/work'`. The mounts
+//!   are therefore worked out by [`crate::mounts`] before any argv exists, and a
+//!   collision the tool cannot resolve is gitiup's own refusal, naming both grants.
+//!
+//! * **the image's filesystem is the job's filesystem, so the host's is not mounted
+//!   over it.** This is the third debt, and the one giti-ej2 paid: the read list every
+//!   backend needs on the host (`/usr`, `/bin`, `/lib`, `/etc`, and on a Mac
+//!   `/Applications`, `/Library`, `/opt/local`) was handed to `docker -v` along with
+//!   the workspace, so the container got a read-only copy of *this* machine's toolchain
+//!   on top of the one its image was built for. On Linux that meant a musl image
+//!   quietly given a glibc `/usr` and a `/bin/sh` that was not busybox; on macOS it was
+//!   worse, because the desktop app only mounts directories it has agreed to share and
+//!   refuses the ones it has not — `Mounts denied: the path /Library is not shared
+//!   from the host`, `exit 125` — and the paths it does share arrived read-only, so a
+//!   job that wrote where its image keeps its own files was told the filesystem is
+//!   read-only. A container run therefore mounts the trees the spec **named** and
+//!   nothing implicit ([`crate::mounts::SystemDirs::JobOwnsThem`]): the checkout, the
+//!   scratch, and whatever an operator names because the image does not carry it. What
+//!   is in the image is what the job has, and the plan says so.
+//!
+//! The runtime's *own* CLI is a separate matter from the job it starts. The job gets
+//! an environment built from nothing; the CLI has to find its config, its credential
+//! helper and (on macOS or rootless podman) a daemon that is only reachable at an
+//! endpoint named by the environment. Clearing the environment for both is what turns
+//! "that image is not here" into `error getting credentials - err: exit status 1`, a
+//! message about a keychain when the fact was about an image, so [`Launch::wrapper_env`]
+//! hands the CLI exactly the variables it needs and nothing else.
+//!
+//! The fourth debt is the plainest and was the last to be paid: **`docker run` stops
+//! reading its own options at the image**, and hands everything after the image to the
+//! container as its command. The job's environment travels as `-e` arguments, so
+//! building them after the image asks the container to exec a program called `-e`:
+//!
+//! ```text
+//! exec: "-e": executable file not found in $PATH
+//! ```
+//!
+//! — exit 126/127 from a container that started fine, under a sandbox that had passed
+//! every canary, with a message that blames neither the environment nor the caller. The
+//! image is therefore appended last, and [`Launch::env_at`] says where the `-e` pairs go
+//! in front of it.
 //!
 //! Egress: `--network=none` whenever the job asks for nothing, which is
 //! kernel-enforced. When the job names registries, the container gets the runtime's
@@ -20,6 +68,18 @@
 //! its author ignores `HTTP_PROXY`. That is why a quorum job with an allowlist is
 //! refused on this backend and accepted on `landlock`, where the kernel refuses every
 //! port except the proxy's.
+//!
+//! # On macOS this rung is a different animal, and a better one
+//!
+//! There is no container runtime in Darwin; `docker` and `podman` on a Mac talk to a
+//! Linux VM the desktop app manages. That makes the isolation **stronger** than the
+//! same command on Linux — the job cannot touch this kernel at all, because it is a
+//! different kernel — and it makes the mounts a contract of their own, because only the
+//! directories the app has agreed to *share* exist inside the VM. A path outside that
+//! list mounts as an empty directory, silently, and the job cannot find its own
+//! checkout. That is why `probe` checks `mount_probe` (can a container read a file
+//! the host just wrote?) before it believes anything about the write checks, and why
+//! [`plan`](crate::backend::Sandbox::plan) puts the file-sharing warning in the notes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -30,6 +90,8 @@ use crate::backend::{Env, Kind, Launch, Sandbox};
 use crate::egress::Egress;
 use crate::escape::Witness;
 use crate::kernel::Kernel;
+use crate::mounts::{self, Plan};
+use crate::platform::{OS, Platform};
 use crate::probe::Probe;
 use crate::spec::Enforcement;
 use crate::spec::Spec;
@@ -40,6 +102,54 @@ use crate::spec::Spec;
 /// exists so `gitiup doctor --sandbox` has something to try, not so a volunteer trusts
 /// it. Set `GITIUP_SANDBOX_IMAGE` to a digest-pinned image for real work.
 pub const DEFAULT_IMAGE: &str = "alpine:3.20";
+
+/// The environment variable that names the job's image.
+pub const IMAGE_ENV: &str = "GITIUP_SANDBOX_IMAGE";
+
+/// The environment the runtime's **own CLI** needs, and nothing more.
+///
+/// Not the job's environment — that is built from nothing and passed as `-e` arguments
+/// (see [`Launch::env_as_args`]). These are the variables the `docker`/`podman`
+/// *program* cannot work without:
+///
+/// * `PATH`, `HOME`, `USER`, `LOGNAME` — where its credential helpers live
+///   (`docker-credential-osxkeychain`, `docker-credential-desktop`) and where its
+///   config is (`~/.docker/config.json`). Without them a pull of a public image fails
+///   with `error getting credentials - err: exit status 1`, which reads like a keychain
+///   fault and is really a stripped environment.
+/// * `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `TMPDIR` — rootless podman keeps its socket
+///   and its store under these.
+/// * `DOCKER_*`, `CONTAINER_*` — which daemon to talk to at all. On macOS the desktop
+///   app's endpoint is sometimes only in `DOCKER_HOST`, and a rootless podman is
+///   reachable only through `CONTAINER_HOST`.
+pub const CLI_ENV: [&str; 14] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_API_VERSION",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+];
+
+/// [`CLI_ENV`] as it actually is on this machine, missing entries omitted.
+pub fn cli_env() -> Env {
+    CLI_ENV
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
 
 /// The `docker` or `podman` backend.
 #[derive(Debug, Clone, Copy)]
@@ -66,18 +176,60 @@ impl Container {
 
     /// The image this run would use.
     pub fn image(&self) -> String {
-        std::env::var("GITIUP_SANDBOX_IMAGE")
+        std::env::var(IMAGE_ENV)
             .ok()
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| DEFAULT_IMAGE.to_string())
     }
 
+    /// The command that would put the job's image where this runtime can see it.
+    ///
+    /// Spelled out rather than described because the person reading the refusal has
+    /// two seconds of work to do, not a paragraph to parse.
+    pub fn pull_command(&self) -> String {
+        format!("{} pull {}", self.runtime, self.image())
+    }
+
+    /// Whether the image is already in the runtime's local store.
+    ///
+    /// `None` means "could not tell" (no binary, no daemon, an unexpected answer);
+    /// callers must not turn that into "missing", because the fix for an unreachable
+    /// daemon is not `pull`.
+    pub fn image_present(&self) -> Option<bool> {
+        self.exec(
+            &[
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Id}}".to_string(),
+                self.image(),
+            ],
+            &[],
+        )
+        .ok()
+        .map(|output| output.status.success())
+    }
+
     /// The `run` arguments that implement the baseline policy for one job.
-    fn run_args(&self, spec: &Spec) -> Vec<String> {
+    ///
+    /// `mounts` is [`Container::mounts`] for the same spec, resolved once by the caller.
+    ///
+    /// **The image is not in here.** `docker run` stops reading options at the image and
+    /// gives everything after it to the container as its command, so the image has to be
+    /// the last thing before the job — which is why [`plan`] appends it and hands
+    /// [`Launch::env_at`] the index it occupies: the `-e` arguments belong in front of
+    /// it, and after it they are a program called `-e` that the job is asked to exec.
+    fn run_args(&self, spec: &Spec, mounts: &Plan) -> Vec<String> {
         let mut args = vec![
             "run".to_string(),
             "--rm".to_string(),
+            // The image is an input, not something to go and fetch: see the module
+            // doc. `--pull never` also keeps a missing image from turning into the
+            // runtime's own network error, which on macOS is the credential-helper
+            // message rather than anything about the image.
+            "--pull".to_string(),
+            "never".to_string(),
             // Shows up in `docker ps`, which is where someone looks when a job does not
             // finish.
             "--name".to_string(),
@@ -108,24 +260,50 @@ impl Container {
         args.push(format!("{}:{}", unsafe { libc::getuid() }, unsafe {
             libc::getgid()
         }));
-        for path in spec.read_paths() {
-            if path.exists() {
-                args.push("-v".to_string());
-                args.push(format!("{}:{}:ro", path.display(), path.display()));
+        // Every mount, read-only first, at its own cleaned destination, and exactly one
+        // per destination — see [`crate::mounts`]. A read-only mount whose host
+        // directory is not there is skipped rather than fatal: a container asked for a
+        // workspace that does not exist is a confusing mount error instead of a refusal
+        // that says so, and `/lib64` on a merged-usr distro is nobody's emergency.
+        for mount in &mounts.mounts {
+            if !mount.writable && !mount.source.exists() {
+                continue;
             }
-        }
-        for path in spec.write_paths() {
             args.push("-v".to_string());
-            args.push(format!("{}:{}:rw", path.display(), path.display()));
+            args.push(mount.volume_arg());
         }
         // The one place the scratch cap is enforced exactly rather than by
         // `RLIMIT_FSIZE`: a sized tmpfs.
         args.push("--tmpfs".to_string());
         args.push(format!("/tmp:rw,noexec,nosuid,size={}", spec.scratch_bytes));
         args.push("-w".to_string());
-        args.push(spec.workspace.display().to_string());
-        args.push(self.image());
+        // The working directory is the workspace *as it is mounted*, which is its
+        // cleaned destination — the string the job's own paths have to match.
+        args.push(mounts::clean(&spec.workspace));
         args
+    }
+
+    /// The mounts this runtime will be asked to make for one spec, clashes already
+    /// resolved or refused.
+    ///
+    /// The runtime keeps one mount per destination and refuses a container that puts
+    /// two there — `Duplicate mount point: '/work'` — which is a thing a workflow step
+    /// asks for by default, because its checkout is both readable and writable
+    /// (giti-0xi). [`crate::mounts`] is what makes that a decision gitiup makes and
+    /// explains rather than a daemon's error message; `gitiup doctor --sandbox` says the
+    /// same thing before a job finds it out.
+    ///
+    /// The other thing decided here is whose system directories the job gets, and the
+    /// answer is the image's ([`mounts::SystemDirs::JobOwnsThem`], giti-ej2): mounting
+    /// the host's `/usr`, `/bin` and `/etc` read-only over the image's buries the
+    /// toolchain the image was built for, and on macOS gets the container refused for
+    /// paths the desktop app does not share. Only the trees the spec named are mounted.
+    pub fn mounts(&self, spec: &Spec) -> Result<Plan> {
+        mounts::plan(
+            spec,
+            &mounts::TMPFS_DESTINATIONS,
+            mounts::SystemDirs::JobOwnsThem,
+        )
     }
 
     /// The baseline flags for a probe container: the same policy, no mounts.
@@ -133,6 +311,8 @@ impl Container {
         vec![
             "run".to_string(),
             "--rm".to_string(),
+            "--pull".to_string(),
+            "never".to_string(),
             "--network".to_string(),
             "none".to_string(),
             "--cap-drop".to_string(),
@@ -158,6 +338,10 @@ impl Container {
     }
 
     /// Run one short command with the runtime, for probing.
+    ///
+    /// The environment is cleared and then refilled with [`cli_env`]: the probe must not
+    /// learn anything about the caller's environment, but the CLI it is talking to
+    /// still has to find its own daemon and credential helpers.
     fn exec(&self, extra: &[String], command: &[String]) -> std::io::Result<std::process::Output> {
         let binary = self
             .binary()
@@ -168,8 +352,98 @@ impl Container {
         Command::new(&program[0])
             .args(&program[1..])
             .env_clear()
+            .envs(cli_env())
             .stdin(std::process::Stdio::null())
             .output()
+    }
+
+    /// Whether a container from the job's image actually **runs**, and says so.
+    ///
+    /// Every canary below asks for a *non*-event — the write that did not land, the
+    /// connection that did not arrive — and a container that never started produces the
+    /// very same non-event. Without this check an image the runtime cannot boot (wrong
+    /// architecture on Apple silicon, no `/bin/sh` in a `FROM scratch` image, a
+    /// seccomp profile that refuses the start) would be reported as a sandbox that
+    /// denies everything, which is the most expensive lie a probe can tell.
+    fn start_probe(&self) -> std::result::Result<(), String> {
+        let marker = format!("gitiup-alive-{}", std::process::id());
+        let command = format!("printf '%s' '{marker}'");
+        let output = self.exec(
+            &self.probe_args(),
+            &["/bin/sh".to_string(), "-c".to_string(), command],
+        );
+        match output {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).contains(marker.as_str()) => {
+                Ok(())
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(format!(
+                    "a `{runtime} run` of `{image}` printed nothing, so no canary could be \
+                     believed: {}",
+                    if stderr.is_empty() {
+                        format!(
+                            "it exited {} with nothing on stderr",
+                            output
+                                .status
+                                .code()
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "on a signal".to_string())
+                        )
+                    } else {
+                        stderr
+                    },
+                    runtime = self.runtime,
+                    image = self.image()
+                ))
+            }
+            Err(why) => Err(format!(
+                "`{runtime} run` of `{image}` could not be started: {why}",
+                runtime = self.runtime,
+                image = self.image()
+            )),
+        }
+    }
+
+    /// Whether a container can actually see a host directory it was given.
+    ///
+    /// This is the check that matters on macOS and is a formality on Linux. A
+    /// container runtime on macOS runs inside a VM, and only the directories the
+    /// desktop app has agreed to *share* exist in it: bind-mount a path that is not
+    /// shared and the runtime does not complain — it mounts an empty directory, and the
+    /// job quietly cannot find its own checkout. Worse, the write-outside check below
+    /// becomes vacuous, because a write to a host path that the VM cannot see was never
+    /// a write to the host at all. So this writes a file, mounts its directory
+    /// read-only, and asks a container to read it back: an observation, not a config
+    /// read.
+    fn mount_probe(&self) -> Option<String> {
+        let directory = std::env::temp_dir();
+        let marker = directory.join(format!("gitiup-mount-probe-{}", std::process::id()));
+        let secret = format!("gitiup-visible-{}", std::process::id());
+        if std::fs::write(&marker, &secret).is_err() {
+            return None;
+        }
+        // The mount goes before the image, which `probe_args` puts last.
+        let mut args = self.probe_args();
+        let image = args.pop();
+        args.push("-v".to_string());
+        args.push(format!(
+            "{}:{}:ro",
+            directory.display(),
+            directory.display()
+        ));
+        if let Some(image) = image {
+            args.push(image);
+        }
+        let command = format!("cat '{}' 2>/dev/null || true", marker.display());
+        let read = self.exec(&args, &["/bin/sh".to_string(), "-c".to_string(), command]);
+        let _ = std::fs::remove_file(&marker);
+        match read {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).contains(&secret) => {
+                Some(directory.display().to_string())
+            }
+            _ => None,
+        }
     }
 
     /// The host path a probe container would have to escape to, and whether it managed
@@ -224,9 +498,10 @@ impl Sandbox for Container {
     fn guarantees(&self) -> &'static str {
         "the job runs in a container with no capabilities, no new privileges, its own \
          pid namespace and its own filesystem; the workspace is bind-mounted read-only \
-         and only the scratch and a size-capped /tmp are writable; egress is \
-         --network=none unless the job named registries, in which case the proxy policy \
-         is audited rather than kernel-enforced"
+         and only the scratch and a size-capped /tmp are writable; the image, not the \
+         host, provides /usr, /bin, /lib and /etc, so the host's system directories are \
+         never mounted; egress is --network=none unless the job named registries, in \
+         which case the proxy policy is audited rather than kernel-enforced"
     }
 
     fn probe(&self) -> Result<Probe> {
@@ -247,6 +522,7 @@ impl Sandbox for Container {
         match Command::new(&binary)
             .args(["version", "--format", "{{.Server.Version}}"])
             .env_clear()
+            .envs(cli_env())
             .output()
         {
             Ok(output) if output.status.success() => probe.observed(
@@ -257,47 +533,136 @@ impl Sandbox for Container {
                     String::from_utf8_lossy(&output.stdout).trim()
                 ),
             ),
-            Ok(output) => probe.failed(
-                "daemon",
-                format!(
-                    "`{} version` failed: {}",
-                    self.runtime,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ),
-            Err(why) => probe.failed(
-                "daemon",
-                format!("`{}` could not be run: {why}", binary.display()),
-            ),
+            Ok(output) => {
+                probe.failed(
+                    "daemon",
+                    format!(
+                        "`{} version` failed: {}",
+                        self.runtime,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                );
+                // Nothing below this line can be answered by a runtime whose daemon is
+                // not answering, and asking it about the image would turn a daemon
+                // fault into a `docker pull` suggestion.
+                return probe.finish();
+            }
+            Err(why) => {
+                probe.failed(
+                    "daemon",
+                    format!("`{}` could not be run: {why}", binary.display()),
+                );
+                return probe.finish();
+            }
         }
 
         let image = self.image();
-        let present = self
-            .exec(
-                &["image".to_string(), "inspect".to_string(), image.clone()],
-                &[],
-            )
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if !present {
-            probe.skipped(
-                "image",
-                format!(
-                    "`{image}` is not present locally, and with egress denied it cannot be \
-                     pulled: load it, or set GITIUP_SANDBOX_IMAGE to an image you have",
-                ),
-            );
-            probe.skipped("fs-write-outside", "no local image to run the canary in");
-            probe.skipped("tcp-egress", "no local image to run the canary in");
-            probe.skipped("ptrace", "no local image to run the canary in");
-            return probe.finish();
+        // Asked of the runtime itself rather than inferred: "I have alpine:3.20" means
+        // something different to this daemon, to a remote daemon, and to a machine with
+        // two architectures of the same tag.
+        match self.image_present() {
+            Some(true) => probe.observed("image", format!("`{image}` is present locally")),
+            Some(false) => {
+                probe.fix(format!(
+                    "put the image where the runtime can see it first: `{}` — gitiup will \
+                     not pull it during a run; or set {IMAGE_ENV} to an image that is \
+                     already here",
+                    self.pull_command()
+                ));
+                probe.failed(
+                    "image",
+                    format!(
+                        "`{image}` is not present locally in `{}`, and gitiup does not pull \
+                         an image while running a job: the job's network is denied by \
+                         default, and an image that can move between runs is not the \
+                         reproducible input a report is supposed to describe",
+                        self.runtime
+                    ),
+                );
+                probe.skipped("fs-write-outside", "no local image to run the canary in");
+                probe.skipped("tcp-egress", "no local image to run the canary in");
+                probe.skipped("ptrace", "no local image to run the canary in");
+                return probe.finish();
+            }
+            // The daemon answered `version` and not `image inspect`, which is odd. The
+            // honest answer is "I could not ask", and a backend that cannot ask about
+            // the one thing every canary runs in is not offered as a sandbox.
+            None => {
+                probe.failed(
+                    "image",
+                    format!(
+                        "`{runtime} image inspect {image}` could not be run, so `{image}` \
+                         is neither confirmed nor absent, and no canary could be run in it",
+                        runtime = self.runtime
+                    ),
+                );
+                return probe.finish();
+            }
         }
-        probe.observed("image", format!("`{image}` is present locally"));
+
+        match self.start_probe() {
+            Ok(()) => probe.observed(
+                "container-starts",
+                format!("a container from `{image}` ran and printed what it was asked to"),
+            ),
+            Err(why) => {
+                probe.fix(format!(
+                    "an image the runtime cannot boot confines nothing: see what \
+                     `{runtime} run --rm --pull never {image} /bin/sh -c true` says — an \
+                     amd64-only image will not start an arm64 job (pull it again on this \
+                     machine's own architecture, or point {IMAGE_ENV} at one that can), and \
+                     a `FROM scratch` image has no /bin/sh for the canary to use",
+                    runtime = self.runtime
+                ));
+                probe.failed("container-starts", why);
+                return probe.finish();
+            }
+        }
+
+        // Can a container see what the host put in a directory? Everything the
+        // write check below can claim depends on the answer, and on macOS it is not a
+        // formality: an unshared path mounts as an empty directory, without a word of
+        // complaint from the runtime.
+        let visible = self.mount_probe();
+        match &visible {
+            Some(directory) => probe.observed(
+                "mount-visibility",
+                format!("a read-only mount of {directory} was readable inside the container"),
+            ),
+            None => {
+                // Not a refusal — a container backend that cannot see a host directory
+                // can still run a job that needs nothing — but it is the one failure on
+                // a Mac with a two-minute fix, so it is printed as a warning with that
+                // fix rather than buried in the list of unchecked properties.
+                probe.fix(
+                    "if a job needs files from this machine, add their directories to the \
+                     runtime's file-sharing list (Docker Desktop: Settings → Resources → \
+                     File sharing), or run gitiup inside the VM, where mounts are not \
+                     involved at all (docs/macos.md)",
+                );
+                probe.skipped(
+                    "mount-visibility",
+                    "a container could not read a file the host just wrote into a directory it was \
+                     given as `-v`: the job would not find its own checkout. On macOS this means \
+                     the directory is not in the runtime's file-sharing list (Docker Desktop: \
+                     Settings → Resources → File sharing); or run gitiup inside the VM, where \
+                     mounts are not involved at all (docs/macos.md)",
+                );
+            }
+        }
 
         if self.fs_probe() {
             probe.failed(
                 "fs-write-outside",
                 "a container wrote to a host path that was never mounted",
+            );
+        } else if visible.is_none() {
+            // Not "denied": the write cannot land on a host the VM cannot see, so the
+            // check observed nothing about isolation and says so.
+            probe.skipped(
+                "fs-write-outside",
+                "the runtime could not see a host directory at all, so a write that did not \
+                 arrive is a fact about file sharing and not about the sandbox",
             );
         } else {
             probe.observed(
@@ -348,16 +713,37 @@ impl Sandbox for Container {
             )
         })?;
         let mut prefix = vec![binary.display().to_string()];
-        prefix.extend(self.run_args(spec));
+        let mounts = self.mounts(spec)?;
+        prefix.extend(self.run_args(spec, &mounts));
+        // The image is the last option and the first thing the container sees: the `-e`
+        // arguments for the job have to be inserted in front of it, not after it, or the
+        // runtime hands them to the job as its own argv and the step dies trying to exec
+        // a program called `-e` (see [`Launch::env_at`]).
+        let env_at = prefix.len();
+        prefix.push(self.image());
         let mut launch = Launch {
             prefix,
             env_as_args: true,
+            env_at: Some(env_at),
+            wrapper_env: cli_env(),
             cwd: Some(spec.workspace.clone()),
             wall_clock: spec.limits.wall_clock,
             ..Launch::default()
         };
         launch.env.extend(spec.egress.proxy_env());
-        launch.notes.push(format!("image {}", self.image()));
+        launch.notes.push(format!(
+            "image {}: expected to be here already; gitiup never pulls during a run \
+             (`{}` if it is not, `gitiup doctor --sandbox` checks)",
+            self.image(),
+            self.pull_command()
+        ));
+        launch.notes.push(format!(
+            "that image is the job's toolchain, not this machine's: its /bin/sh, git and \
+             compiler are the image's, and the host's are deliberately not mounted — a \
+             step that fails with `not found` is asking for a tool the image does not \
+             carry, so build it into {IMAGE_ENV} (a job that cannot pull during a run \
+             cannot install one either) or name the directory to mount"
+        ));
         launch.notes.push(if spec.egress.is_denied() {
             "network none: nothing can be reached".to_string()
         } else {
@@ -369,28 +755,37 @@ impl Sandbox for Container {
                     .unwrap_or_else(|| "no proxy".to_string())
             )
         });
-        launch.notes.push(format!(
-            "read-only mounts: {}",
-            path_list(&spec.read_paths())
-        ));
-        launch.notes.push(format!(
-            "writable mounts: {}",
-            path_list(&spec.write_paths())
-        ));
+        // The mount notes are the *resolved* mounts, not the spec's wish list: a
+        // reviewer who reads "read-only mounts: /work" about a checkout that is
+        // mounted read-write has been told something false.
+        launch
+            .notes
+            .push(format!("read-only mounts: {}", mounts.list(false)));
+        launch
+            .notes
+            .push(format!("writable mounts: {}", mounts.list(true)));
+        for note in &mounts.notes {
+            launch.notes.push(format!("mount points: {note}"));
+        }
+        if Platform::survey().os == OS::MacOS {
+            // The one thing about a container on macOS that has bitten everyone: the
+            // job runs in the desktop app's Linux VM, and a path the app has not
+            // agreed to share mounts as an empty directory with no warning at all —
+            // or, for a path the runtime can tell is on the host and was not shared,
+            // is refused outright (`exit 125`). This is the second reason the host's
+            // system directories are not mounted: most of them are not shared.
+            launch.notes.push(
+                "this container runs in the runtime's Linux VM: every mounted path above must \
+                 be in the desktop app's file-sharing list, or the job will find an empty \
+                 directory where its checkout should be (or the runtime will refuse the run \
+                 with `Mounts denied`); the mounts above are only the job's own trees, which \
+                 is why a checkout under a shared directory is what works here (docs/macos.md)"
+                    .to_string(),
+            );
+        }
         let _ = env;
         Ok(launch)
     }
-}
-
-fn path_list(paths: &[PathBuf]) -> String {
-    if paths.is_empty() {
-        return "(none)".to_string();
-    }
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
@@ -406,7 +801,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let scratch = workspace.path().join(".scratch");
         std::fs::create_dir_all(&scratch).unwrap();
-        let args = backend.run_args(&Spec::new(workspace.path(), &scratch));
+        let args = args_for(&backend, &Spec::new(workspace.path(), &scratch));
         let text = args.join(" ");
         assert!(text.contains("--cap-drop ALL"), "{text}");
         assert!(text.contains("no-new-privileges"), "{text}");
@@ -435,8 +830,7 @@ mod tests {
         let backend = Container::podman();
         let denied = Spec::new("/work", "/work/.scratch");
         assert!(
-            backend
-                .run_args(&denied)
+            args_for(&backend, &denied)
                 .join(" ")
                 .contains("--network none")
         );
@@ -447,13 +841,175 @@ mod tests {
         let allowed =
             Spec::new("/work", "/work/.scratch").with_egress(Egress::allow_registries().unwrap());
         assert!(
-            backend
-                .run_args(&allowed)
+            args_for(&backend, &allowed)
                 .join(" ")
                 .contains("--network bridge"),
             "{allowed:?}"
         );
         assert_eq!(backend.enforcement(&allowed.egress), Enforcement::Audited);
+    }
+
+    /// The shape `gitiup run --execute` gives every step: the checkout writable as well
+    /// as the scratch (see `gitiup_run::sandbox::spec_for`).
+    fn step(workspace: &str, scratch: &str) -> Spec {
+        Spec::new(workspace, scratch).with_writable(workspace)
+    }
+
+    /// The `run` arguments a spec produces, with the mounts resolved the way `plan`
+    /// resolves them — which is the whole point: the refusal and the argv come from the
+    /// same one computation. The image is appended as `plan` appends it, so what the
+    /// tests read is the option list the runtime will actually be handed.
+    fn args_for(backend: &Container, spec: &Spec) -> Vec<String> {
+        let mounts = backend
+            .mounts(spec)
+            .expect("the mounts for this spec resolve");
+        let mut args = backend.run_args(spec, &mounts);
+        args.push(backend.image());
+        args
+    }
+
+    #[test]
+    fn a_checkout_named_readable_and_writable_is_mounted_once() {
+        // giti-0xi, and the reason this file does not build `-v` arguments from the two
+        // grant lists any more. The checkout is on the read list because every workspace
+        // is and on the write list because a build writes where it is checked out, so the
+        // two loops each emitted a mount for `/work`, and the runtime answered
+        // `Duplicate mount point: '/work'` — naming neither grant, on every OS.
+        let args = args_for(&Container::docker(), &step("/work", "/work/.scratch")).join(" ");
+        assert_eq!(args.matches("-v /work:").count(), 1, "{args}");
+        assert!(args.contains("/work:/work:rw"), "{args}");
+        assert!(
+            !args.contains("/work:/work:ro"),
+            "the writable grant won, so the read-only one must not still be there: {args}"
+        );
+        // The scratch inside the checkout is a nested mount, not a clash, and is still
+        // there and still writable.
+        assert!(args.contains("/work/.scratch:/work/.scratch:rw"), "{args}");
+        // And the job's working directory is the mount the job can actually see.
+        assert!(args.contains("-w /work "), "{args}");
+    }
+
+    #[test]
+    fn a_scratch_that_is_tmp_itself_is_refused_before_the_runtime_sees_it() {
+        // The other way to meet `Duplicate mount point`: the scratch is /tmp (TMPDIR is
+        // /tmp in a great many containers) and gitiup also mounts a size-capped tmpfs
+        // there. The cap is the point of the tmpfs, so the scratch moves, not the tmpfs.
+        let err = Container::docker()
+            .mounts(&Spec::new("/work", "/tmp"))
+            .unwrap_err();
+        assert!(err.detail().contains("/tmp"), "{err}");
+        assert!(err.hint().unwrap().contains("/tmp/gitiup-scratch"), "{err}");
+        // A scratch inside /tmp keeps its cap and its mount.
+        let args = args_for(
+            &Container::docker(),
+            &Spec::new("/work", "/tmp/gitiup-scratch"),
+        )
+        .join(" ");
+        assert!(
+            args.contains("/tmp/gitiup-scratch:/tmp/gitiup-scratch:rw"),
+            "{args}"
+        );
+        assert!(
+            args.contains("--tmpfs /tmp:rw,noexec,nosuid,size="),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn the_hosts_system_directories_are_never_mounted_into_the_job() {
+        // giti-ej2, and the shape of the thing that went wrong: the per-OS system list
+        // was mounted into the container alongside the workspace, so the job's `/usr`,
+        // `/bin` and `/etc` became read-only copies of the *host's*. On a Mac the desktop
+        // app does not even share `/Library`, `/Applications` or `/opt/local`, and the
+        // daemon refused the container (`exit 125`) rather than explain itself.
+        let backend = Container::docker();
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = workspace.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        for spec in [
+            Spec::new(workspace.path(), &scratch),
+            step(
+                &workspace.path().display().to_string(),
+                &scratch.display().to_string(),
+            ),
+        ] {
+            let text = args_for(&backend, &spec).join(" ");
+            for system in crate::platform::system_read_only() {
+                assert!(
+                    !text.contains(&format!("-v {system}:{system}:")),
+                    "`{system}` is the image's own directory: {text}"
+                );
+            }
+            // The job's own trees are all that is mounted, and they are still there.
+            let w = workspace.path().display().to_string();
+            let s = scratch.display().to_string();
+            assert!(text.contains(&format!("-v {s}:{s}:rw")), "{text}");
+            assert!(
+                text.contains(&format!("-v {w}:{w}:")),
+                "the checkout is mounted: {text}"
+            );
+        }
+        // And the guarantees sentence — the one that lands beside a signed report — says
+        // where the job's toolchain comes from, because "its own filesystem" on its own
+        // is exactly the phrase a reader could take the wrong way.
+        assert!(
+            Container::docker()
+                .guarantees()
+                .contains("not the host, provides /usr"),
+            "{}",
+            Container::docker().guarantees()
+        );
+    }
+
+    #[test]
+    fn a_tree_the_operator_names_is_mounted_into_the_container() {
+        // "Nothing implicit" is not "nothing but the checkout": a toolchain the image
+        // does not carry is mounted when someone names it, because they are the one who
+        // knows the job needs it. (Real directories: a read-only mount whose source is
+        // not there is skipped rather than fatal, so a made-up path would prove nothing.)
+        let backend = Container::docker();
+        let outside = tempfile::tempdir().unwrap();
+        let toolchain = outside.path().join("toolchain");
+        let cargo = outside.path().join("cargo-bin");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        std::fs::create_dir_all(&cargo).unwrap();
+        let spec = Spec::new("/work", "/work/.scratch")
+            .with_read_path(&toolchain)
+            .with_tool(cargo.join("cargo"));
+        let text = args_for(&backend, &spec).join(" ");
+        let t = toolchain.display().to_string();
+        let c = cargo.display().to_string();
+        assert!(text.contains(&format!("-v {t}:{t}:ro")), "{text}");
+        assert!(text.contains(&format!("-v {c}:{c}:ro")), "{text}");
+    }
+
+    #[test]
+    fn run_args_stop_at_the_image_leaving_room_for_the_environment() {
+        // The image ends the runtime's options and starts the job's argv, so `-e` after
+        // it is not an option at all: the container starts and immediately tries to exec
+        // a program called `-e` (`exec: "-e": executable file not found in $PATH`), in a
+        // sandbox that passed every canary. `plan` puts them there; this says the option
+        // list it builds leaves exactly that room. (The argv as a whole, with a runtime
+        // that enforces the contract, is `tests/container_environment.rs`.)
+        let backend = Container::docker();
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = workspace.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let spec = step(
+            &workspace.path().display().to_string(),
+            &scratch.display().to_string(),
+        );
+        let mounts = backend.mounts(&spec).unwrap();
+        let options = backend.run_args(&spec, &mounts);
+        assert!(
+            !options.iter().any(|arg| arg == &backend.image()),
+            "the image is appended by plan, after the -e arguments: {options:?}"
+        );
+        assert_eq!(
+            options.last().map(|arg| arg.as_str()),
+            Some(mounts::clean(&spec.workspace).as_str()),
+            "the last option is the working directory, so the image goes right after it: {options:?}"
+        );
     }
 
     #[test]
@@ -484,9 +1040,66 @@ mod tests {
         );
         unsafe { std::env::remove_var("GITIUP_SANDBOX_IMAGE") };
         assert_eq!(Container::docker().image(), DEFAULT_IMAGE.to_string());
+        // The command a refusal prints has to be the command the runtime understands,
+        // with the image the refusal named — a person copies it out of the message.
+        assert_eq!(
+            Container::docker().pull_command(),
+            format!("docker pull {DEFAULT_IMAGE}")
+        );
+        assert_eq!(
+            Container::podman().pull_command(),
+            format!("podman pull {DEFAULT_IMAGE}")
+        );
         unsafe { std::env::set_var("GITIUP_SANDBOX_IMAGE", "example.com/img@sha256:aaa") };
         assert!(Container::docker().image().contains('@'));
+        assert_eq!(
+            Container::docker().pull_command(),
+            "docker pull example.com/img@sha256:aaa"
+        );
         unsafe { std::env::remove_var("GITIUP_SANDBOX_IMAGE") };
+    }
+
+    #[test]
+    fn neither_a_job_nor_a_probe_is_allowed_to_pull_on_the_way_past() {
+        // `--pull never` is what makes "the image moved between the two runs" a thing
+        // this tool cannot do, and what keeps a missing image a gitiup message rather
+        // than the runtime's own network error.
+        let backend = Container::docker();
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = workspace.path().join(".scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(
+            args_for(&backend, &Spec::new(workspace.path(), &scratch))
+                .join(" ")
+                .contains("--pull never"),
+            "a job never pulls"
+        );
+        assert!(
+            backend.probe_args().join(" ").contains("--pull never"),
+            "a probe never pulls either"
+        );
+    }
+
+    #[test]
+    fn the_cli_environment_is_an_allowlist_not_a_copy() {
+        // The Mac's `error getting credentials` was a stripped environment, and the
+        // obvious over-correction is to hand the runtime the whole thing — which hands
+        // it the runner's tokens too.
+        unsafe { std::env::set_var("GITIUP_TOKEN_SENTINEL", "hunter2") };
+        let given = cli_env();
+        unsafe { std::env::remove_var("GITIUP_TOKEN_SENTINEL") };
+        if std::env::var_os("PATH").is_some() {
+            assert!(given.contains_key("PATH"), "the CLI must find its helpers");
+        }
+        assert!(
+            !given.contains_key("GITIUP_TOKEN_SENTINEL"),
+            "{:?}",
+            given.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !given.contains_key(IMAGE_ENV),
+            "the image goes on the command line, not in the CLI's environment"
+        );
     }
 
     #[test]

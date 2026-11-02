@@ -26,7 +26,9 @@ use crate::tree::{Kind, Source};
 pub const GUIDES: &[&str] = &[
     "quickstart",
     "sandbox",
+    "macos",
     "environment",
+    "act",
     "run-report",
     "provable-output",
     "reproducibility",

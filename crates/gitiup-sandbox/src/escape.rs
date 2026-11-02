@@ -222,7 +222,7 @@ fn run_confined(
         let hint = if why.kind() == std::io::ErrorKind::PermissionDenied {
             spec.canary
                 .as_ref()
-                .and_then(|program| crate::backends::inprocess::exec_grant_hint(spec, program))
+                .and_then(|program| exec_grant_hint(spec, program))
                 .map(|hint| format!(" — {hint}"))
                 .unwrap_or_else(|| {
                     " — the sandbox refused to start the canary although its path is                      granted: a filesystem that accepts Landlock grants but does not                      honour them (a workspace bind-mounted from a host, some FUSE mounts)                      looks exactly like this. `escape::stage_canary` is the way to tell                      the two apart, and `escape::all` uses it."
@@ -262,6 +262,22 @@ fn run_confined(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Explain a confined child that would not start because the program it was pointed at
+/// is under no path the sandbox grants.
+///
+/// Only the Linux in-process backend can produce that failure (its rules are per-tree
+/// and `execve` is refused); on the other backends the answer is `None` and the generic
+/// hint stands.
+#[cfg(target_os = "linux")]
+fn exec_grant_hint(spec: &Spec, program: &Path) -> Option<String> {
+    crate::backends::inprocess::exec_grant_hint(spec, program)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exec_grant_hint(_spec: &Spec, _program: &Path) -> Option<String> {
+    None
 }
 
 /// The canary program to use, if there is one, staged where a confined process may
@@ -450,7 +466,7 @@ pub fn ptrace_escape(backend: &dyn Sandbox, spec: &Spec) -> Result<Outcome> {
 /// # Why the "how many were already running" number is taken outside
 ///
 /// The limit is installed as *"this uid's process count right now, plus the slack the job
-/// asked for"* — [`nproc_floor`](crate::linux::nproc_floor) — so that is the only count
+/// asked for"* — [`nproc_floor`](crate::limits::nproc_floor) — so that is the only count
 /// the reading of the cap can honestly be compared against. The count a *confined*
 /// process takes is frequently smaller, and always in the same direction: a pid
 /// namespace (`bwrap`, `docker`, `podman`, `unshare`) hides every host process, and a
@@ -496,7 +512,7 @@ pub fn fork_bomb(backend: &dyn Sandbox, spec: &Spec) -> Result<Outcome> {
     // The count the cap was built from. The canary's own reading is kept in `inside`
     // and printed, but it can only ever be too small to subtract — see the module note.
     let inside = running;
-    let outside = crate::linux::current_nproc();
+    let outside = crate::limits::current_nproc();
     if let Some(refusal) = cap_is_as_asked(cap, inside, outside, spec.limits.processes) {
         return Ok(Outcome::Escaped(format!(
             "{refusal} ({counted} of {FORK_ATTEMPT} children started)"

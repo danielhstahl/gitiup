@@ -329,11 +329,18 @@ fn the_sandbox_vocabulary_is_honest_about_what_exists() {
 
     // Every rung of the ladder is a name that opens, and each one states what it
     // denies. "Not built into this build" is no longer an honest answer for docker or
-    // landlock: both are implemented, and whether either works is a question for the
-    // probe, not for a list in a source file.
+    // the platform's in-process rung: both are implemented, and whether either works is
+    // a question for the probe, not for a list in a source file.
     let ladder = sandbox::implemented();
+    // The in-process rung of *this* OS: Landlock where the kernel has it, Seatbelt where
+    // XNU has its own, and neither is a name the other machine should be given.
+    let in_process = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "landlock"
+    };
     assert!(
-        ladder.iter().any(|name| name == "landlock"),
+        ladder.iter().any(|name| name == in_process),
         "the in-process rung must be offered: {ladder:?}"
     );
     for name in &ladder {
@@ -357,7 +364,12 @@ fn the_sandbox_vocabulary_is_honest_about_what_exists() {
     );
 
     // `open` is case-insensitive because flags are typed by people.
-    assert_eq!(sandbox::open(" LANDLOCK ").unwrap().name(), "landlock");
+    assert_eq!(
+        sandbox::open(&format!(" {in_process} ").to_uppercase())
+            .unwrap()
+            .name(),
+        in_process
+    );
 
     // Detection reports the truth about this machine, and says why when it is no.
     let backends = sandbox::detect();
@@ -423,13 +435,79 @@ fn a_step_writes_in_its_workspace_and_scratch_only() {
     );
     // And the ladder agrees about where the writable tree is, for the rung that
     // enforces it in the kernel rather than by a mount.
-    let landlock = sandbox::open("landlock").unwrap();
+    let in_process = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "landlock"
+    };
+    let rung = sandbox::open(in_process).unwrap();
     assert!(
-        landlock.guarantees().contains("Reads are NOT isolated")
-            || landlock.guarantees().contains("nothing"),
+        rung.guarantees().contains("NOT isolated") || rung.guarantees().contains("nothing"),
         "{}",
-        landlock.guarantees()
+        rung.guarantees()
     );
+}
+
+/// `gitiup doctor --sandbox` reports the mount plan of "the shape a step runs in"
+/// ([`gitiup_sandbox::doctor::step_spec`]), which it cannot import from here — the
+/// sandbox crate does not depend on the runner. This is the other half of that deal: the
+/// shape it duplicates has to be the shape a step actually gets, or the report describes
+/// a run nobody does — and the mount clash it exists to catch (giti-0xi: the checkout
+/// readable *and* writable, `Duplicate mount point: '/work'`) would be caught in a shape
+/// no step is in.
+#[test]
+fn the_shape_the_sandbox_doctor_checks_is_the_shape_a_step_runs_in() {
+    use gitiup_sandbox::{doctor, mounts};
+
+    let step = sandbox::spec_for(Path::new("/work"), Path::new("/work/.scratch"));
+    let checked = doctor::step_spec();
+
+    // Both name the checkout twice: once as the workspace every backend mounts
+    // read-only, once as a writable tree. That is the collision, and it must be present
+    // in the shape the doctor checks rather than only in this one.
+    for spec in [&step, &checked] {
+        assert!(
+            spec.write_paths().contains(&spec.workspace),
+            "the checkout is writable: {:?}",
+            spec.write_paths()
+        );
+        assert!(
+            spec.read_paths().contains(&spec.workspace),
+            "the checkout is readable: {:?}",
+            spec.read_paths()
+        );
+    }
+
+    // And the two shapes resolve to the same number of mounts and the same number of
+    // resolutions — the paths differ (a temp directory there, a checkout here), the
+    // structure may not. In **both** mount worlds: a container's job has a root of its
+    // own and mounts fewer trees than a namespace's, which is granted the host's system
+    // directories (giti-ej2), and the shapes have to agree whichever one a step lands in.
+    for (reserved, system) in [
+        (&[][..], gitiup_sandbox::mounts::SystemDirs::JobOwnsThem),
+        (&[][..], gitiup_sandbox::mounts::SystemDirs::Hosts),
+    ] {
+        let planned = |spec: &gitiup_sandbox::spec::Spec| {
+            mounts::plan(spec, reserved, system).expect("a step's spec is mountable")
+        };
+        let (a, b) = (planned(&step), planned(&checked));
+        assert_eq!(
+            a.mounts.len(),
+            b.mounts.len(),
+            "{} vs {}",
+            a.list(true),
+            b.list(true)
+        );
+        assert_eq!(a.writable().len(), b.writable().len());
+        assert_eq!(a.read_only().len(), b.read_only().len());
+        assert_eq!(
+            a.notes.len(),
+            b.notes.len(),
+            "the same shape resolves the same number of clashes: {:?} vs {:?}",
+            a.notes,
+            b.notes
+        );
+    }
 }
 
 #[test]
@@ -495,4 +573,154 @@ fn a_job_that_needs_a_service_container_is_refused_rather_than_run_alone() {
     assert!(err.detail().contains("postgres"), "{err}");
     assert!(err.hint().unwrap().contains("--execute"), "{err}");
     std::fs::remove_dir_all(&workspace).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// giti-bh2 — reading a step's failure, which is the only reading a caller gets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_program_is_named_and_the_path_it_missed_is_named_with_it() {
+    // `sh` and `bash` word the same refusal differently; both have to give the same
+    // answer, because the answer is the fix.
+    for stderr in [
+        "sh: 1: cargo: not found\n",
+        "bash: line 1: cargo: command not found\n",
+        "/tmp/step-1.sh: 1: cargo: not found\n",
+    ] {
+        let why = gitiup_run::diagnose(127, stderr).expect("a 127 always has a reading");
+        assert!(why.cause.contains("`cargo`"), "{why}");
+        assert!(why.cause.contains("127"), "{why}");
+        let hint = why.hint.expect("a PATH hint");
+        assert!(hint.contains("/usr/bin:/bin:/usr/local/bin"), "{hint}");
+    }
+
+    // A path that is not there is a different mistake, and gets a different fix.
+    let why = gitiup_run::diagnose(127, "sh: 1: ./deploy.sh: not found\n").unwrap();
+    assert!(why.cause.contains("./deploy.sh"), "{why}");
+    assert!(why.hint.unwrap().contains("--workdir"), "path hint");
+}
+
+#[test]
+fn a_signal_is_read_as_the_signal_it_was() {
+    let why = gitiup_run::diagnose(137, "").unwrap();
+    assert!(why.cause.contains("SIGKILL"), "{why}");
+    assert!(
+        why.hint.unwrap().contains("out-of-memory"),
+        "the usual cause"
+    );
+
+    let why = gitiup_run::diagnose(159, "").unwrap();
+    assert!(why.cause.contains("SIGSYS"), "{why}");
+    assert!(
+        why.hint.unwrap().contains("seccomp"),
+        "that is the sandbox talking"
+    );
+
+    // No exit code at all: the signal took the process that would have reported it.
+    let why = gitiup_run::diagnose(-1, "").unwrap();
+    assert!(why.cause.contains("no exit code"), "{why}");
+}
+
+#[test]
+fn what_the_sandbox_refused_is_said_to_be_the_sandbox() {
+    let why = gitiup_run::diagnose(
+        1,
+        "cp: cannot create '/etc/passwd': Read-only file system\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("read-only"), "{why}");
+    assert!(why.hint.unwrap().contains("scratch"), "the writable roots");
+
+    let why = gitiup_run::diagnose(1, "ptrace: Operation not permitted\n").unwrap();
+    assert!(why.cause.contains("sandbox"), "{why}");
+
+    // Egress is deny-all, so a step that fetches has to be told that is the design and
+    // not a network outage on the machine.
+    let why =
+        gitiup_run::diagnose(4, "curl: (7) Failed to connect: Network is unreachable\n").unwrap();
+    assert!(why.cause.contains("network"), "{why}");
+    assert!(
+        why.hint.as_deref().unwrap_or("").contains("deny-all"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_runtime_that_refused_the_container_is_not_read_as_the_jobs_verdict() {
+    // The sentence that got a Mac user blaming their own folders: a container that never
+    // started, diagnosed as a sandbox refusing a write, because exit 125 was not read as
+    // "the runtime said no". The daemon's own words are the whole of the answer, so the
+    // diagnosis has to carry them rather than invent a sandbox denial.
+    let why = gitiup_run::diagnose(
+        125,
+        "Mounts denied: \nThe path /Library is not shared from the host and is not known to Docker.\n",
+    )
+    .expect("a refusal by the runtime has a reading");
+    assert!(why.cause.contains("runtime"), "{why}");
+    assert!(why.cause.contains("not shared from the host"), "{why}");
+    assert!(
+        !why.cause.contains("read-only"),
+        "the container never started, so no write of the job's was refused: {why}"
+    );
+    assert!(
+        why.hint.unwrap().contains("doctor"),
+        "and where to see what this machine's runtime will share"
+    );
+
+    // Two other daemon sentences, whichever exit code they arrive with.
+    let why = gitiup_run::diagnose(
+        125,
+        "Error response from daemon: Duplicate mount point: '/work'\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("Duplicate mount point"), "{why}");
+    let why = gitiup_run::diagnose(
+        1,
+        "Unable to find image 'alpine:3.20' locally\nError: No such image: alpine:3.20\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("No such image"), "{why}");
+
+    // A 125 with nothing to say is still not the job's verdict.
+    let why = gitiup_run::diagnose(125, "").unwrap();
+    assert!(why.cause.contains("never started"), "{why}");
+
+    // And the denial that *is* the sandbox's — a write the job made, in a container that
+    // started and ran it — still reads as the sandbox's.
+    let why = gitiup_run::diagnose(
+        1,
+        "cp: cannot create '/etc/passwd': Read-only file system\n",
+    )
+    .unwrap();
+    assert!(why.cause.contains("read-only"), "{why}");
+}
+
+#[test]
+fn a_plain_program_exit_with_a_plain_message_gets_no_invention() {
+    // The claim this function has to be able to refuse to make: 1 from a test runner is
+    // the test runner's verdict, and a guess about the caller's code is noise.
+    assert!(
+        gitiup_run::diagnose(1, "---- expected: 4\n++++ actual: 5\n").is_none(),
+        "a failing assertion is the log's story, not this function's"
+    );
+}
+
+#[test]
+fn an_excerpt_keeps_the_end_and_says_what_it_dropped() {
+    let text = format!("{}\nthe reason is at the end\n", "chatter\n".repeat(500));
+    let cut = gitiup_run::excerpt(&text);
+    assert!(
+        cut.contains("the reason is at the end"),
+        "the tail survives"
+    );
+    assert!(cut.contains("earlier lines"), "the cut is admitted: {cut}");
+    assert!(
+        cut.lines().count() <= gitiup_run::exec::MAX_DISPLAY_LINES + 1,
+        "an excerpt is bounded"
+    );
+
+    // A short stream is the stream: no marker, no rewriting.
+    assert_eq!(gitiup_run::excerpt("one line\n"), "one line\n");
+    assert_eq!(gitiup_run::excerpt("   \n"), "");
 }

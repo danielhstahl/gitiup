@@ -20,10 +20,11 @@ that probed.
 
 | backend    | what does the isolating | what it denies | what it does **not** deny |
 |------------|-------------------------|----------------|---------------------------|
-| `docker`   | a container runtime     | writes outside the mounts, all egress (`--network=none`), every capability, setuid, new privileges; resources via `--memory`/`--pids-limit` | reads of what is mounted in; a job that can reach the docker socket (it never can) |
+| `docker`   | a container runtime     | writes outside the mounts, all egress (`--network=none`), every capability, setuid, new privileges; resources via `--memory`/`--pids-limit` | reads of what is mounted in; a job that can reach the docker socket (it never can). Its **own** filesystem is the point: the image, not the host, provides `/usr`, `/bin`, `/lib` and `/etc` |
 | `podman`   | as `docker`, rootless where possible | as `docker` | as `docker` |
 | `bwrap`    | `bubblewrap` namespaces | the filesystem except the binds (workspace read-only, scratch read-write, `/proc`, sized `/tmp`), all egress unless an allowlist was asked for, `--dev-bind /` never | nothing outside the namespaces, but the user namespace means root inside is not root outside |
 | `landlock` | Landlock + seccomp + rlimits applied to the child before `execve` | writes outside the scratch, every TCP port the job was not given (ABI 4+), `ptrace`/`process_vm_readv`, `mount`/`unshare`/`setns`/module loading/`open_by_handle_at`, the privilege syscalls, installing a seccomp filter of one's own, core dumps, cpu/address/process/file rlimits | **reads** — anything the runner's uid can read is readable; the process table is still this machine's |
+| `seatbelt` | an XNU kernel sandbox profile, applied by `sandbox-exec` at `execve` | writes outside the scratch *and* a list of credential trees (`~/.ssh`, the keychains, the gitiup keystore), every socket the job was not given, cpu/process/file rlimits applied in the child | reads outside that credential list, Mach and IOKit, anything a profile cannot express — and the kernel is still this machine's |
 | `unshare`  | `unshare(1)` user + network namespaces | all egress (only a down `lo` exists), the host's uids | the filesystem: the mount namespace is not unshared, so the workspace and everything else reachable stays writable |
 | `plain`    | nothing | only the rlimits and the core-dump ban | everything else; it is the rung that says "I am not a sandbox" out loud |
 
@@ -40,6 +41,23 @@ this user's network and no confinement at all.
 …
 ```
 
+The ladder is **per-OS**, because the mechanisms are: `bwrap`, `landlock` and `unshare`
+are Linux mechanisms, and the macOS ladder is `docker`, `podman`, `seatbelt`, `plain`.
+A rung the OS cannot provide is not offered at all — asking a Mac for `--sandbox
+landlock` is refused with the list of what exists — and [macOS](macos.md) is the page
+about what a Mac can promise, why the container rungs lead both ladders, and what a
+`seatbelt` attestation is worth.
+
+### The `act` engine is not a rung
+
+`gitiup run --engine act` hands a job to [nektos/act](https://nektosact.com) and attests
+what act reported. It is listed under *engines*, never here: no rung of the ladder is
+built by somebody else's flags, and the name that lands in a report has to be a name this
+build can open and probe. An act run therefore says `sandbox: act` — a name that is not
+in any list above, that a policy has to accept by naming it, and that no quorum policy can
+list at all. [Running a workflow with `act`](act.md) says what it does promise;
+[ADR-0006](adr/0006-running-workflows-with-act.md) is the decision.
+
 ## What a step may touch
 
 `gitiup run --execute` runs each step under one spec
@@ -47,11 +65,22 @@ this user's network and no confinement at all.
 
 * **writable:** the checkout, and the scratch directory the step's script and output
   files were staged in. Everything else is read-only or invisible, depending on rung.
+* **mounted once:** the checkout is on both lists, and a container keys its mounts by
+  destination — two mounts at one destination is `Duplicate mount point: '/work'` and a
+  refused run. So the mounts are worked out before the command line is built, one mount
+  per destination, writable winning over read-only and the resolution printed
+  ([`mounts`](../crates/gitiup-sandbox/src/mounts.rs), [`macOS`](macos.md#duplicate-mount-point-work)).
 * **readable:** the system directories every build needs (`/usr`, `/bin`, `/lib`,
-  `/etc`, …) plus the workspace. Granting the tool directory is explicit
-  (`Spec::with_tool`) rather than guessed, because a confined process cannot execute a
-  program it has no execute right on — the failure to grant it looks like `EACCES` on
-  `execve`, which is why `Spec::tool_dirs` exists.
+  `/etc`, …) plus the workspace — **for a job that runs on this machine's filesystem**.
+  A container is the exception, and it is the one place the distinction saves the run:
+  its job has a root filesystem of its own, out of the image, so the host's are not
+  mounted ([`SystemDirs`](../crates/gitiup-sandbox/src/mounts.rs)). Binding them in was
+  a read-only copy of one OS laid over the toolchain the image was built for, and on a
+  Mac a `Mounts denied` refusal for paths the desktop app does not share
+  ([`macOS`](macos.md#a-write-was-refused-because-the-filesystem-is-read-only)).
+  Granting a tool directory is explicit (`Spec::with_tool`) rather than guessed, because
+  a confined process cannot execute a program it has no execute right on — the failure
+  to grant it looks like `EACCES` on `execve`, which is why `Spec::tool_dirs` exists.
 * **egress:** none. No host, no port, no DNS. A job that needs the network needs an
   explicit allowlist, and the allowlist comes with a loopback proxy and an
   allowlist-only resolver
@@ -64,6 +93,13 @@ this user's network and no confinement at all.
 * **resources:** cpu seconds, address space, processes (an `RLIMIT_NPROC` computed as
   "what this uid is already running, plus the slack the job asked for"), file size, no
   core dumps, and a wall-clock deadline enforced by the runner.
+
+All of that is decided before the first step, and said there too: `gitiup run --execute`
+prints the confinement's own sentences on stderr — the mounts it will ask for and in which
+mode, where the job's `/usr` comes from, what the network may do — before anything is
+spawned, because a mount a runtime will not make and a tool an image does not carry both
+look like a broken build from the inside
+([`macOS`](macos.md#exec--e-executable-file-not-found-in-path)).
 
 ## Probes, refusals, and `doctor`
 
@@ -89,10 +125,23 @@ A probe that fails is a refusal with `exit 6`, raised **before** anything is spa
 $ gitiup run --execute --sandbox docker      # no docker on this host
 gitiup: sandbox: the `docker` sandbox is not usable here: runtime failed — no `docker` binary on PATH
 hint: … `gitiup doctor --sandbox` says what to change about this machine
+$ gitiup run --execute --sandbox docker      # docker, but the job's image is not in it
+gitiup: sandbox: the `docker` sandbox is not usable here: image failed — `alpine:3.20` is not
+        present locally in `docker`, and gitiup does not pull an image while running a job …
+hint: put the image where the runtime can see it first: `docker pull alpine:3.20` …
 $ gitiup run --execute --sandbox none
 gitiup: sandbox: `--sandbox none` asks for an unconfined execution
 hint: an unconfined run may not attest as `local` …
 ```
+
+The middle one is worth dwelling on, because a container's image is an **input**. Every
+`docker`/`podman` run carries `--pull never`: the job's network is denied, an image that
+can move between runs is not something a report should be quiet about, and a runtime that
+fetches an image mid-job is a tool making the operator's decision. So the image is
+pulled by whoever set `GITIUP_SANDBOX_IMAGE`, and `gitiup doctor --sandbox` and
+`gitiup run --sandboxes` both say so — with the command, not just the fact.
+([docs/macos.md](macos.md) is the longer version, including the
+`error getting credentials` message a missing image used to turn into.)
 
 A policy may name the rungs it will accept
 (`Policy::allowed_sandboxes`, narrowed by

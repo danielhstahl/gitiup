@@ -16,6 +16,8 @@ use serde::Serialize;
 use crate::backend::{self, Backend};
 use crate::egress::Egress;
 use crate::kernel::{Availability, Kernel};
+use crate::mounts::{self, BWRAP_DESTINATIONS, TMPFS_DESTINATIONS, WITHHELD_SYSTEM_DIRS};
+use crate::platform::OS;
 use crate::spec::{Enforcement, Spec};
 
 /// How a line should be read.
@@ -119,7 +121,7 @@ pub fn survey() -> Report {
         "kernel",
         format!(
             "{} — uid {}{}; {} processes already owned by this uid",
-            kernel.kernel,
+            kernel.platform.describe(),
             kernel.uid,
             if kernel.euid == 0 {
                 " (effective root)"
@@ -129,6 +131,7 @@ pub fn survey() -> Report {
             kernel.processes_of_uid
         ),
     ));
+    checks.push(Check::info("ladder", backend::ladder()));
     if kernel.euid != 0 {
         checks.push(Check::warn(
             "unprivileged uid",
@@ -151,7 +154,7 @@ pub fn survey() -> Report {
                 }
             ),
         )),
-        None => {
+        None if kernel.os() == OS::Linux => {
             let lsm = if kernel.lsm.is_empty() {
                 "unknown".to_string()
             } else {
@@ -162,6 +165,19 @@ pub fn survey() -> Report {
                 format!("the {} kernel has no Landlock (lsm: {lsm})", kernel.kernel),
                 "use a kernel with `CONFIG_SECURITY_LANDLOCK=y` (Linux 5.13+, `landlock` listed in \
                  /sys/kernel/security/lsm), or rely on the docker/podman/bwrap/unshare backends",
+            ));
+        }
+        None => {
+            // Not a refusal: there is no Landlock to want on a machine whose kernel is
+            // not Linux, and a FAIL line here would send someone to recompile a kernel
+            // they do not have. The rung that does the same job on this OS is a backend
+            // line below, and docs/macos.md says what it promises.
+            checks.push(Check::info(
+                "landlock",
+                format!(
+                    "not applicable: Landlock is a Linux mechanism and this is {}",
+                    kernel.platform.sysname
+                ),
             ));
         }
     }
@@ -178,11 +194,9 @@ pub fn survey() -> Report {
              refuses seccomp(2), so run gitiup with a profile that allows it, or use a \
              container backend where the runtime does the filtering",
         )),
-        Availability::Unknown(why) => checks.push(Check::warn(
-            "seccomp",
-            format!("could not be established: {why}"),
-            "check /proc/sys/kernel/seccomp/actions_avail",
-        )),
+        Availability::Unknown(why) => {
+            checks.push(Check::info("seccomp", format!("not applicable: {why}")))
+        }
     }
 
     match &kernel.user_namespaces {
@@ -200,7 +214,7 @@ pub fn survey() -> Report {
         )),
         Availability::Unknown(why) => checks.push(Check::info(
             "user namespaces",
-            format!("not established: {why}"),
+            format!("not applicable: {why}"),
         )),
     }
 
@@ -240,10 +254,19 @@ pub fn survey() -> Report {
 
     for candidate in &backends {
         checks.push(match (candidate.available, candidate.opt_in) {
-            (true, false) => Check::ok(
-                &format!("backend {}", candidate.name),
-                format!("{} — {}", candidate.enforcement.label(), candidate.note),
-            ),
+            (true, false) => match &candidate.fix {
+                // Available, and it still wants something: an operator should see the
+                // asking, even though the backend was not refused.
+                Some(fix) => Check::warn(
+                    &format!("backend {}", candidate.name),
+                    format!("{} — {}", candidate.enforcement.label(), candidate.note),
+                    fix.clone(),
+                ),
+                None => Check::ok(
+                    &format!("backend {}", candidate.name),
+                    format!("{} — {}", candidate.enforcement.label(), candidate.note),
+                ),
+            },
             (true, true) => Check::warn(
                 &format!("backend {}", candidate.name),
                 format!("available only as an explicit opt-in: {}", candidate.note),
@@ -252,10 +275,21 @@ pub fn survey() -> Report {
                     active.as_deref().unwrap_or("a real backend")
                 ),
             ),
-            (false, _) => Check::info(
-                &format!("backend {}", candidate.name),
-                candidate.note.clone(),
-            ),
+            (false, _) => match &candidate.fix {
+                // The line that pays for the report: not "docker is unusable" but the
+                // command that changes that, because a person reading this has a job
+                // to run. "Install the runtime" needs no second line, which is why an
+                // absent binary stays an `info` with its note and no `fix:`.
+                Some(fix) => Check::warn(
+                    &format!("backend {}", candidate.name),
+                    candidate.note.clone(),
+                    fix.clone(),
+                ),
+                None => Check::info(
+                    &format!("backend {}", candidate.name),
+                    candidate.note.clone(),
+                ),
+            },
         });
     }
 
@@ -270,6 +304,20 @@ pub fn survey() -> Report {
             deny.enforcement_label_on(active.as_deref()),
         ),
     ));
+
+    if kernel.os() == OS::MacOS {
+        checks.push(Check::info(
+            "macOS",
+            format!(
+                "the in-process rung on this OS is Seatbelt ({}); the container rungs run the \
+                 job inside the Docker/podman Linux VM rather than in this kernel, which is \
+                 the rung that isolates reads as well as writes — docs/macos.md compares them",
+                active.as_deref().unwrap_or("none probed clean")
+            ),
+        ));
+    }
+
+    checks.push(mount_points(kernel.os()));
 
     let may_serve_jobs = backends
         .iter()
@@ -366,6 +414,103 @@ pub fn probe_spec() -> Spec {
     Spec::new(&scratch, scratch.join("scratch"))
 }
 
+/// The spec shape a workflow step actually gets: **the checkout writable as well as the
+/// scratch**, because a build writes where it is checked out.
+///
+/// This is the shape in which the read-only and the writable grants meet, so it is the
+/// shape every mount clash is checked against. Duplicated from
+/// [`gitiup_run::sandbox::spec_for`] rather than imported — the sandbox crate does not
+/// depend on the runner — and pinned by a test in `gitiup-run` that asserts the two
+/// produce the same grants, so the report cannot describe a shape no step ever runs.
+pub fn step_spec() -> Spec {
+    let probe = probe_spec();
+    let workspace = probe.workspace.clone();
+    probe.with_writable(workspace)
+}
+
+/// The mount-point line, which is the line giti-0xi asked for.
+///
+/// A container keeps one mount per destination and refuses the whole run when two want
+/// one — `Duplicate mount point: '/work'` — and the step shape names its checkout twice,
+/// so that error was reachable by anyone who ran a workflow with `--sandbox docker`, and
+/// named neither of the grants that caused it. [`crate::mounts`] resolves it before any
+/// argv exists; this line is the same resolution, reported before anything is planned,
+/// and says which collisions gitiup cannot resolve and therefore refuses.
+///
+/// It is checked in both mount worlds, because they grant different sets: a container's
+/// job has a root of its own and is mounted only the trees the spec named (giti-ej2), a
+/// namespace's job runs on this filesystem and is granted the host's system directories
+/// too. A clash hiding in either is a refused run.
+fn mount_points(os: OS) -> Check {
+    let mut resolved: Vec<String> = Vec::new();
+    // Two counts, because the two worlds grant different sets and a reader needs to know
+    // which number they are looking at: the namespace-backed one is the wider (it is
+    // granted this machine's system directories), the container's is the short list of
+    // trees the spec named.
+    let mut count = 0usize;
+    let mut container_count = 0usize;
+    for (shape, spec) in [("a probe's", probe_spec()), ("a step's", step_spec())] {
+        for (reserved, system, is_container) in [
+            (
+                &TMPFS_DESTINATIONS[..],
+                mounts::SystemDirs::JobOwnsThem,
+                true,
+            ),
+            (&BWRAP_DESTINATIONS[..], mounts::SystemDirs::Hosts, false),
+        ] {
+            match mounts::plan(&spec, reserved, system) {
+                Ok(plan) => {
+                    count = count.max(plan.mounts.len());
+                    if is_container {
+                        container_count = container_count.max(plan.mounts.len());
+                    }
+                    // The container's resolutions are the ones that read as findings, and
+                    // the standing "the image is the job's /usr" statement is not one — it
+                    // is said in its own words below rather than repeated here.
+                    if is_container {
+                        resolved.extend(
+                            plan.notes
+                                .iter()
+                                .filter(|note| !note.contains(WITHHELD_SYSTEM_DIRS))
+                                .cloned(),
+                        );
+                    }
+                }
+                Err(why) => {
+                    return Check::fail(
+                        "mount points",
+                        format!(
+                            "the spec shape of {shape} run cannot be mounted: {}",
+                            why.detail()
+                        ),
+                        why.hint()
+                            .unwrap_or("name a different scratch or workspace directory")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let mut detail = format!(
+        "{count} mounts for a namespace-backed workflow step, each at its own destination: \
+         a container keys its mounts by destination and refuses a run that puts two there \
+         (`Duplicate mount point: '<path>'`, which names neither of the grants that \
+         collided), so a tree named twice is mounted once and the scratch cap keeps /tmp to \
+         itself — a container run asks for {container_count} only, because the image and \
+         not the host provides its /usr, /bin, /lib and /etc"
+    );
+    if !resolved.is_empty() {
+        detail.push_str(&format!(" — {}", resolved.join("; ")));
+    }
+    if os == OS::MacOS {
+        detail.push_str(
+            " — note that on macOS /tmp, /var and /etc are symlinks into /private, so one \
+             directory can be spelled two ways; the host is asked, not the spelling",
+        );
+    }
+    Check::ok("mount points", detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +559,62 @@ mod tests {
         assert!(value["backends"].is_array());
     }
 
+    /// The line the ticket asked for: an unavailable backend that could name an action
+    /// is a warning carrying that action, printed under the line it belongs to — not a
+    /// paragraph a person has to read for the command inside it.
+    #[test]
+    fn a_backend_that_named_an_action_prints_it_as_a_fix() {
+        let mut report = survey();
+        report.checks.push(Check::warn(
+            "backend docker",
+            "`alpine:3.20` is not present locally",
+            "put the image where the runtime can see it first: `docker pull alpine:3.20`",
+        ));
+        let text = report.text();
+        assert!(
+            text.contains(
+                "fix: put the image where the runtime can see it first: `docker pull alpine:3.20`"
+            ),
+            "{text}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert!(
+            value["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|check| check["fix"]
+                    .as_str()
+                    .is_some_and(|fix| fix.contains("docker pull"))),
+            "the same action in the report a script reads: {}",
+            report.json()
+        );
+    }
+
+    /// The invariant behind that line, whatever this machine happens to be missing: a
+    /// backend that offered an action must be the warning that shows it.
+    #[test]
+    fn every_offered_action_is_shown() {
+        let report = survey();
+        for candidate in &report.backends {
+            let Some(fix) = &candidate.fix else {
+                continue;
+            };
+            let line = report
+                .checks
+                .iter()
+                .find(|check| check.name == format!("backend {}", candidate.name))
+                .expect("every backend gets a line");
+            assert_eq!(
+                line.fix.as_deref(),
+                Some(fix.as_str()),
+                "`{}` offered an action that the report dropped",
+                candidate.name
+            );
+            assert_eq!(line.status, Status::Warn, "{line:?}");
+        }
+    }
+
     #[test]
     fn the_plain_backend_is_reported_as_opt_in_never_as_active() {
         let report = survey();
@@ -425,5 +626,71 @@ mod tests {
         assert!(!plain.serves_quorum);
         assert!(plain.opt_in);
         assert_ne!(report.active.as_deref(), Some(crate::backend::PLAIN));
+    }
+
+    /// giti-0xi, in the shape the runner actually uses. The checkout is on the read list
+    /// because every workspace is and on the write list because a build writes where it
+    /// is checked out; handed to a container as two `-v` arguments, the runtime refused
+    /// the run with `Duplicate mount point: '/work'` and named neither grant.
+    #[test]
+    fn the_shape_a_step_runs_in_mounts_its_checkout_once() {
+        let plan = mounts::plan(
+            &step_spec(),
+            &TMPFS_DESTINATIONS,
+            mounts::SystemDirs::JobOwnsThem,
+        )
+        .expect("a step must be mountable");
+        let checkout = plan
+            .mounts
+            .iter()
+            .filter(|mount| mount.source == step_spec().workspace)
+            .collect::<Vec<_>>();
+        assert_eq!(checkout.len(), 1, "one destination, one mount: {plan:?}");
+        assert!(checkout[0].writable, "the step's checkout is writable");
+        for mount in &plan.mounts {
+            let same = plan
+                .mounts
+                .iter()
+                .filter(|other| other.destination == mount.destination)
+                .count();
+            assert_eq!(
+                same,
+                1,
+                "{} wanted twice: {plan:?}",
+                mount.destination.display()
+            );
+        }
+    }
+
+    /// The line the ticket asked for: "if this is unavoidable, `gitiup doctor` should say
+    /// so" — so the report carries the mount policy, and carries it as a fact rather
+    /// than as a complaint with no action in it.
+    #[test]
+    fn the_report_says_what_happens_when_two_mounts_want_one_address() {
+        let report = survey();
+        let line = report
+            .checks
+            .iter()
+            .find(|check| check.name == "mount points")
+            .expect("the report looks at mount points");
+        assert!(
+            line.detail.contains("Duplicate mount point") || line.detail.contains("mount once"),
+            "{line:?}"
+        );
+        assert!(
+            !matches!(line.status, Status::Warn | Status::Fail) || line.fix.is_some(),
+            "{line:?}"
+        );
+        assert!(report.text().contains("mount points"), "{}", report.text());
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert!(
+            value["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|check| check["name"] == "mount points"),
+            "{}",
+            report.json()
+        );
     }
 }

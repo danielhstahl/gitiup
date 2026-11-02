@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! gitiup run [OPTIONS] [JOB]            plan a workflow job (nothing is run)
+//! gitiup run --job <id> / --all-jobs   name the jobs to plan; several jobs are several
+//!                                      attestations, never one about two runs
 //! gitiup run --execute --sandbox <name> run it for real, and attest as `local`
 //! gitiup env [OPTIONS]                  this machine's environment fingerprint, and
 //!                                      whether a policy would accept it
@@ -73,6 +75,7 @@
 //!| 7 | a signature that does not verify |
 //!| 8 | digest mismatch: `--expect` did not match, or an attestation that is not the bytes it claims |
 //!| 9 | the attempt cap is exhausted (`quorum retry`): terminal, and asking again is what has run out — see `gitiup help` |
+//!| 10 | a step in the run failed (`gitiup run --execute`): the run happened, every step reported, and the step said no — see `gitiup run --help` |
 
 // Bolted to the forge adapter, and bolted out with it: with `--no-default-features` the
 // forge half of `migrate` is compiled out (see `migrate.rs`), and the argument parsing,
@@ -118,6 +121,9 @@ USAGE:
 
 COMMANDS:
     run [OPTIONS] [JOB]            plan a workflow job; --execute to run it
+                                   (--job <id> / --all-jobs when the workflow has more
+                                   than one job: one attestation per run). A step that
+                                   fails prints its own output and exits 10
     env [OPTIONS]                  this machine's environment fingerprint, and whether
                                    a policy requirement accepts it
     doctor --sandbox [--json]      report the isolation this machine actually provides
@@ -219,6 +225,13 @@ Exit codes for `run`, `digest`, `env` and `normalise`: 0 ok · 2 usage · 3 I/O 
 8 digest mismatch or divergence (ADR-0001 D7: 6 refused/unsupported, 8 digest
 mismatch — the codes `gitiup verify attestation` uses too, plus 7 for a signature
 that does not verify).
+
+`gitiup run --execute` adds exit 10, and it is the step's own answer rather than
+another judgement by this tool: the run happened, every step reported what it did, and
+one of them failed. The attestation says the same thing and is still worth filing — a
+quorum agrees on what happened, not on green ticks — but a caller that branches on the
+exit code must not have to read prose to learn the tests failed. `gitiup run --help`
+says what `run` prints about the failing step and its output before it exits.
 
 `key` and `identity` keep the same table and add one code: 7, a signature that does
 not verify — a claim whose self-signature is broken is a different event from a
@@ -390,6 +403,20 @@ impl CliError {
     fn refused(message: impl Into<String>, hint: impl Into<String>) -> CliError {
         CliError {
             code: 6,
+            message: message.into(),
+            hint: Some(hint.into()),
+            quiet: false,
+        }
+    }
+
+    /// 10 — a step in the run failed. Neither a refusal nor a fault of this command:
+    /// the run happened, every step reported, the attestation records the failure
+    /// honestly, and the exit code is the *step's* verdict carried out to the caller
+    /// that has to branch on it. Not `0`, which would make "the tests failed" and "the
+    /// tests passed" one number to a script.
+    fn step_failed(message: impl Into<String>, hint: impl Into<String>) -> CliError {
+        CliError {
+            code: 10,
             message: message.into(),
             hint: Some(hint.into()),
             quiet: false,
@@ -571,6 +598,13 @@ mod tests {
                 "exit code {code} is missing from the usage text"
             );
         }
+        // Exit 10 is the one code the usage text has to spell out rather than list:
+        // it is the answer a `gitiup run --execute` caller branches on, and a bare 10
+        // in a table tells a scripter nothing about which command gives it.
+        assert!(
+            USAGE.contains("exit 10") && USAGE.contains("one of them failed"),
+            "exit 10 must be tied to `gitiup run --execute` in the usage text"
+        );
         assert!(USAGE.contains("digest"));
         assert!(
             USAGE.contains("run [OPTIONS] [JOB]"),
