@@ -1001,10 +1001,10 @@ fn choose_sandbox(options: &Options) -> Result<String, CliError> {
 /// When a workflow has several jobs and nothing was named, the library's refusal names
 /// `--job`; this command has one more answer than the library does, so it adds it.
 fn offer_all_jobs(workflow: &Workflow, mut error: CliError) -> CliError {
-    if workflow.jobs.len() > 1 {
-        if let Some(hint) = error.hint.as_mut() {
-            hint.push_str(" — or pass --all-jobs to run every one of them, one attestation each");
-        }
+    if workflow.jobs.len() > 1
+        && let Some(hint) = error.hint.as_mut()
+    {
+        hint.push_str(" — or pass --all-jobs to run every one of them, one attestation each");
     }
     error
 }
@@ -1351,16 +1351,16 @@ pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
         || std::env::var_os(POLICY_PATH_ENV).is_some();
     if gated {
         let policy = load_policy(options.policy.as_deref())?;
-        if let Some(requirement) = policy.environment_requirement() {
-            if outcomes.iter().any(|outcome| !outcome.executed) {
-                let (_, skipped) = plan_view(requirement);
-                if !skipped.is_empty() {
-                    eprintln!(
-                        "note    a plan claims no {}; those parts of the environment \
+        if let Some(requirement) = policy.environment_requirement()
+            && outcomes.iter().any(|outcome| !outcome.executed)
+        {
+            let (_, skipped) = plan_view(requirement);
+            if !skipped.is_empty() {
+                eprintln!(
+                    "note    a plan claims no {}; those parts of the environment \
                          requirement were not checked",
-                        skipped.join(", ")
-                    );
-                }
+                    skipped.join(", ")
+                );
             }
         }
         for outcome in &outcomes {
